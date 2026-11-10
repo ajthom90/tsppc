@@ -43,6 +43,10 @@
  * seconds (an HTTP-date included: there is no wall clock here) uses the next
  * backoff delay instead.
  *
+ * Text from control reaches status only as printable ASCII (other bytes become
+ * '?'), and a login URL is accepted only if it is "https://" followed by bytes
+ * 0x21..0x7e; anything else fails the register like a bad response.
+ *
  * Tailnet Lock (a map with TKAInfo, or a register response carrying a
  * NodeKeySignature) and Debug.Exit move to FAILED, which is never retried;
  * only ts_sess_up leaves it.
@@ -204,8 +208,9 @@ void ts_sess_connected(ts_sess *s);
 void ts_sess_recv(ts_sess *s, const uint8_t *in, size_t n);
 /* The connection failed or closed (why is a short reason for status). */
 void ts_sess_disconnected(ts_sess *s, const char *why);
-/* Advance timers. now_ms is a monotonic clock in milliseconds; call at least
- * every second. */
+/* Advance timers. now_ms is a monotonic clock in milliseconds; call it once
+ * before any other call after init (the session's time starts at 0 until
+ * then), and then at least every second. */
 void ts_sess_tick(ts_sess *s, uint64_t now_ms);
 
 /* Log in and stay connected (also leaves FAILED and NEED_LOGIN; after a node

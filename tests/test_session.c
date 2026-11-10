@@ -814,6 +814,89 @@ static void test_self_expired(void)
     t_true("self expired: saved before it", F.saved.have_old_node && F.reqs_at_save == F.nreq - 1 &&
            memcmp(F.saved.old_node_priv, F.st.node_priv, 32) == 0);
     t_true("self expired: NEED_LOGIN with URL", ts_sess_login_url(S) && strcmp(ts_sess_login_url(S), URL1) == 0);
+    t_true("self expired: new key saved as not logged in", F.saved.have_login == 0);
+    {
+        /* A restart before the operator visits the URL registers again, with the
+         * key that last logged in as OldNodeKey, and does not map. */
+        ts_state saved = F.saved;
+        end();
+        fk_init(&F, S, HOSTINFO);
+        F.handler = h_std;
+        F.hold_followup = 1;
+        key_hex(oldk, F.st.node_priv);
+        F.st = saved;
+        fk_start(&F, HOSTINFO);
+        ts_sess_up(S);
+        fk_pump(&F);
+        snprintf(want, sizeof want, "\"OldNodeKey\":\"nodekey:%s\"", oldk);
+        t_true("self expired restart: first request is a register with the original OldNodeKey",
+               F.nreq >= 1 && strcmp(F.req[0].path, "/machine/register") == 0 && has(F.req[0].body, want));
+        t_true("self expired restart: no map", maps() == 0);
+    }
+    end();
+}
+
+/* A login URL is shown to the operator: only https and printable ASCII. */
+static const char *g_bad_url;
+static void h_bad_url(fake *f, fk_req *r)
+{
+    char body[256];
+    if (strcmp(r->path, "/machine/register") != 0) return;
+    snprintf(body, sizeof body, "{\"AuthURL\":\"%s\"}", g_bad_url);
+    fk_reply(f, r, 200, body);
+}
+
+static void test_bad_auth_url(void)
+{
+    static const char *const bad[] = {
+        "https://login.example.test/a/\\u001b]2;x\\u0007", "http://login.example.test/a/b",
+        "https://login.example.test/a b", "https://login.example.test/\\u00e9", "https://",
+    };
+    size_t i;
+    for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        char label[80], st[512];
+        size_t k;
+        int clean = 1;
+        g_bad_url = bad[i];
+        begin(h_bad_url);
+        ts_sess_up(S);
+        fk_pump(&F);
+        ts_sess_status(S, st, sizeof st);
+        for (k = 0; st[k]; k++)
+            if ((unsigned char)st[k] < 0x20 || (unsigned char)st[k] > 0x7e) clean = 0;
+        snprintf(label, sizeof label, "bad auth url %u: refused, BACKOFF", (unsigned)i);
+        t_true(label, ts_sess_get_state(S) == TS_SESS_BACKOFF && ts_sess_login_url(S) == NULL);
+        snprintf(label, sizeof label, "bad auth url %u: reason in status, printable", (unsigned)i);
+        t_true(label, status_has("invalid login URL") && clean && !status_has("login.example.test"));
+        end();
+    }
+}
+
+/* Control's error texts reach status only as printable ASCII. */
+static void h_err_text(fake *f, fk_req *r)
+{
+    if (strcmp(r->path, "/machine/register") == 0)
+        fk_reply(f, r, 200, "{\"Error\":\"bad\\u001b[31mthing\\u0007\"}");
+}
+
+static void test_server_text_clean(void)
+{
+    char st[512];
+    size_t k;
+    int clean = 1;
+    begin(h_err_text);
+    ts_sess_up(S);
+    fk_pump(&F);
+    ts_sess_status(S, st, sizeof st);
+    for (k = 0; st[k]; k++)
+        if ((unsigned char)st[k] < 0x20 || (unsigned char)st[k] > 0x7e) clean = 0;
+    t_true("error text: shown without control bytes", clean && status_has("control: bad?[31mthing?"));
+    end();
+    begin(h_std);
+    F.hs_error = "no\x1b[2Jway";
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("handshake text: control bytes replaced", status_has("no?[2Jway"));
     end();
 }
 
@@ -967,6 +1050,8 @@ void test_session(void)
     test_tailnet_lock_register();
     test_rejected_message();
     test_self_expired();
+    test_bad_auth_url();
+    test_server_text_clean();
     test_sleep();
     test_window_update();
     test_save_failure();

@@ -221,8 +221,15 @@ static void send_register(ts_sess *s, int kind)
             return;
         }
         ts_state_clamp_key(k);
-        memcpy(s->st.old_node_priv, s->st.node_priv, 32);
-        s->st.have_old_node = 1;
+        /* The old key is the last one that completed a login (as upstream,
+         * which only replaces its key once a login completes): a key that
+         * never logged in does not displace it. The new key is not logged in
+         * until login_done saves have_login again, so a restart registers. */
+        if (s->st.have_login || !s->st.have_old_node) {
+            memcpy(s->st.old_node_priv, s->st.node_priv, 32);
+            s->st.have_old_node = 1;
+        }
+        s->st.have_login = 0;
         memcpy(s->st.node_priv, k, 32);
         ts_wipe(k, sizeof k);
         if (s->io->save_state(s->user, &s->st) != 0) {
@@ -450,6 +457,15 @@ static void logout_done(ts_sess *s)
      * this connection. */
 }
 
+/* A login URL we will show: "https://" and then printable ASCII, no spaces. */
+static int auth_url_ok(const char *u)
+{
+    if (strncmp(u, "https://", 8) != 0 || u[8] == 0) return 0;
+    for (; *u; u++)
+        if ((unsigned char)*u < 0x21 || (unsigned char)*u > 0x7e) return 0;
+    return 1;
+}
+
 static void reg_end(ts_sess *s, int error)
 {
     ts_reg_resp rr;
@@ -496,6 +512,11 @@ static void reg_end(ts_sess *s, int error)
         return;
     }
     if (rr.auth_url[0]) {
+        if (!auth_url_ok(rr.auth_url)) {
+            /* It is printed to the operator's terminal: no controls or escapes. */
+            fail(s, FAIL_RETRY_HERE, "control sent an invalid login URL");
+            return;
+        }
         if (kind == REG_FOLLOWUP) followup_ended(s);
         else s->reg_at = s->last_reg_send + s->fu_interval;
         memcpy(s->auth_url, rr.auth_url, sizeof s->auth_url);
