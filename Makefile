@@ -1,5 +1,6 @@
 # Targets: test (host), asan (host + sanitizers), ppc-test (PowerPC, build only
-# here; run the binary on a PowerPC Mac). GNU make 3.81 and /bin/sh compatible.
+# here; run the binary on a PowerPC Mac; also builds the tun_check driver check
+# tool, which tools/driver.sh runs). GNU make 3.81 and /bin/sh compatible.
 # New src/**/*.c files are picked up automatically.
 
 SHELL := /bin/sh
@@ -12,7 +13,7 @@ BSRCS   := $(shell find $(BEARSSL)/src -name '*.c' | sort)
 ifeq ($(TARGET),)
 .PHONY: test asan ppc-test clean
 test asan ppc-test:
-	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all
+	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all $(if $(filter ppc-test,$@),build/ppc-test/tun_check)
 	@./build/$@/test_all
 
 clean:
@@ -49,6 +50,11 @@ VOBJS   := $(patsubst %.c,$(VOBJDIR)/%.o,$(BSRCS))
 $(OBJDIR)/test_all: $(OBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(OBJS) $(VOBJS)
 
+CHECKOBJS := $(OBJDIR)/tools/tun_check.o $(OBJDIR)/src/core/bytes.o
+
+$(OBJDIR)/tun_check: $(CHECKOBJS)
+	$(CC) $(ARCH) -o $@ $(CHECKOBJS)
+
 $(OBJDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -57,5 +63,5 @@ $(VOBJDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(VFLAGS) -c -o $@ $<
 
--include $(OBJS:.o=.d)
+-include $(OBJS:.o=.d) $(CHECKOBJS:.o=.d)
 endif
