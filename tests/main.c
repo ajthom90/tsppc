@@ -7,6 +7,7 @@ void test_nacl(void);
 void test_encoding(void);
 void test_json(void);
 void test_hpack(void);
+void test_h2(void);
 
 int main(void)
 {
@@ -17,5 +18,6 @@ int main(void)
     test_encoding();
     test_json();
     test_hpack();
+    test_h2();
     return t_summary();
 }
