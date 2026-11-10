@@ -13,7 +13,22 @@ static int all_zero(const void *p, size_t n)
     return 1;
 }
 
+static void check(const uint8_t *data, size_t len);
+
+/* Run the input as is, and with its checksum recomputed so that mutations
+ * reach the structural checks behind the checksum. */
 static void target(const uint8_t *data, size_t len)
+{
+    check(data, len);
+    if (len == TS_STATE_FILE_LEN) {
+        uint8_t fixed[TS_STATE_FILE_LEN];
+        memcpy(fixed, data, len);
+        ts_blake2s(fixed + 136, fixed, 136);
+        check(fixed, len);
+    }
+}
+
+static void check(const uint8_t *data, size_t len)
 {
     ts_state s, t;
     uint8_t enc[TS_STATE_FILE_LEN];

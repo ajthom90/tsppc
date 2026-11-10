@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -15,7 +16,7 @@
 #include "../crypto/random.h"
 
 #ifndef O_NOFOLLOW
-#define O_NOFOLLOW 0
+#error "O_NOFOLLOW is required"
 #endif
 
 #define PATH_MAX_STATE 1024
@@ -90,8 +91,8 @@ int ts_state_parse(ts_state *s, const uint8_t *buf, size_t len)
 
 /* ---- Files --------------------------------------------------------------- */
 
-/* Check that st describes something we may trust: owned by us, no group or
- * other bits (dir), or exactly mode 0600 (file). */
+/* The directory must be owned by us, with no group or other bits, and not a
+ * symbolic link. */
 static int check_dir(const char *dir, char *err, size_t cap)
 {
     struct stat st;
@@ -119,6 +120,21 @@ static int check_dir(const char *dir, char *err, size_t cap)
     return 0;
 }
 
+/* Fix the mode of a directory we just created, without following a symbolic
+ * link planted in its place: open it O_NOFOLLOW, check it is the directory we
+ * made (ours), and fchmod the descriptor. */
+static int fix_new_dir_mode(const char *dir)
+{
+    struct stat st;
+    int fd = open(dir, O_RDONLY | O_NOFOLLOW);
+    int rc = -1;
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == geteuid())
+        rc = fchmod(fd, 0700);
+    close(fd);
+    return rc;
+}
+
 /* Make sure dir exists and is acceptable, creating it (0700) if absent. */
 static int ensure_dir(const char *dir, char *err, size_t cap)
 {
@@ -132,9 +148,22 @@ static int ensure_dir(const char *dir, char *err, size_t cap)
             seterr(err, cap, "cannot create state directory: %s", strerror(errno));
             return -1;
         }
-        (void)chmod(dir, 0700);   /* a restrictive umask must not leave it unusable */
+        /* A restrictive umask must not leave it unusable. */
+        if (fix_new_dir_mode(dir) != 0) {
+            seterr(err, cap, "cannot set state directory mode: %s", strerror(errno));
+            return -1;
+        }
     }
     return check_dir(dir, err, cap);
+}
+
+/* Flush to stable storage: F_FULLFSYNC where the system has it, else fsync. */
+static int full_sync(int fd)
+{
+#ifdef F_FULLFSYNC
+    if (fcntl(fd, F_FULLFSYNC) == 0) return 0;
+#endif
+    return fsync(fd);
 }
 
 static int fsync_dir(const char *dir)
@@ -142,7 +171,8 @@ static int fsync_dir(const char *dir)
     int fd = open(dir, O_RDONLY);
     int r;
     if (fd < 0) return -1;
-    r = fsync(fd);
+    r = full_sync(fd);
+    if (r != 0 && (errno == ENOTSUP || errno == EINVAL)) r = fsync(fd);
     close(fd);
     return r;
 }
@@ -167,7 +197,9 @@ static int file_path(char *out, size_t cap, const char *dir)
     return (n > 0 && (size_t)n < cap) ? 0 : -1;
 }
 
-int ts_state_save(const ts_state *s, const char *dir, char *err, size_t errcap)
+/* Write s to a temporary file in dir and install it: rename over any existing
+ * file, or, if exclusive, link() so that an existing file is never replaced. */
+static int save_impl(const ts_state *s, const char *dir, int exclusive, char *err, size_t errcap)
 {
     char tmpl[PATH_MAX_STATE], path[PATH_MAX_STATE];
     uint8_t buf[TS_STATE_FILE_LEN];
@@ -178,7 +210,7 @@ int ts_state_save(const ts_state *s, const char *dir, char *err, size_t errcap)
         seterr(err, errcap, "state path too long");
         return -1;
     }
-    n = snprintf(tmpl, sizeof tmpl, "%s/.state.XXXXXX", dir);
+    n = snprintf(tmpl, sizeof tmpl, "%s/%s", dir, TS_STATE_TMP_TEMPLATE);
     if (n <= 0 || (size_t)n >= sizeof tmpl) {
         seterr(err, errcap, "state path too long");
         return -1;
@@ -189,7 +221,7 @@ int ts_state_save(const ts_state *s, const char *dir, char *err, size_t errcap)
         return -1;
     }
     ts_state_encode(buf, s);
-    if (fchmod(fd, 0600) != 0 || write_all(fd, buf, sizeof buf) != 0 || fsync(fd) != 0) {
+    if (fchmod(fd, 0600) != 0 || write_all(fd, buf, sizeof buf) != 0 || full_sync(fd) != 0) {
         seterr(err, errcap, "cannot write state file: %s", strerror(errno));
         ts_wipe(buf, sizeof buf);
         close(fd);
@@ -202,16 +234,31 @@ int ts_state_save(const ts_state *s, const char *dir, char *err, size_t errcap)
         unlink(tmpl);
         return -1;
     }
-    if (rename(tmpl, path) != 0) {
+    if (exclusive) {
+        int r = link(tmpl, path);
+        int e = errno;
+        unlink(tmpl);
+        if (r != 0) {
+            if (e == EEXIST) seterr(err, errcap, "state file appeared while creating it; not overwriting it");
+            else seterr(err, errcap, "cannot install state file: %s", strerror(e));
+            return -1;
+        }
+    } else if (rename(tmpl, path) != 0) {
         seterr(err, errcap, "cannot install state file: %s", strerror(errno));
         unlink(tmpl);
         return -1;
     }
     if (fsync_dir(dir) != 0) {
-        seterr(err, errcap, "cannot sync state directory: %s", strerror(errno));
+        /* The file is installed but its directory entry may not be durable. */
+        seterr(err, errcap, "state file installed, but cannot sync state directory: %s", strerror(errno));
         return -1;
     }
     return 0;
+}
+
+int ts_state_save(const ts_state *s, const char *dir, char *err, size_t errcap)
+{
+    return save_impl(s, dir, 0, err, errcap);
 }
 
 /* Clamp as X25519 requires; the crypto module clamps again when it uses the key. */
@@ -222,6 +269,24 @@ static int new_key(uint8_t k[32])
     k[31] &= 127;
     k[31] |= 64;
     return 0;
+}
+
+/* Remove leftover temporary files from an interrupted save: regular files we
+ * own whose names start with the temporary prefix. */
+static void remove_stale_temps(const char *dir)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    char p[PATH_MAX_STATE];
+    struct stat st;
+    size_t plen = strlen(TS_STATE_TMP_PREFIX);
+    if (!d) return;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, TS_STATE_TMP_PREFIX, plen) != 0) continue;
+        if (snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= (int)sizeof p) continue;
+        if (lstat(p, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == geteuid()) unlink(p);
+    }
+    closedir(d);
 }
 
 int ts_state_load_or_create(ts_state *s, const char *dir, char *err, size_t errcap)
@@ -238,6 +303,7 @@ int ts_state_load_or_create(ts_state *s, const char *dir, char *err, size_t errc
         seterr(err, errcap, "state path too long");
         return -1;
     }
+    remove_stale_temps(dir);
 
     if (lstat(path, &lst) != 0) {
         if (errno != ENOENT) {
@@ -249,7 +315,7 @@ int ts_state_load_or_create(ts_state *s, const char *dir, char *err, size_t errc
             ts_wipe(s, sizeof *s);
             return -1;
         }
-        if (ts_state_save(s, dir, err, errcap) != 0) {
+        if (save_impl(s, dir, 1, err, errcap) != 0) {
             ts_wipe(s, sizeof *s);
             return -1;
         }
@@ -257,6 +323,10 @@ int ts_state_load_or_create(ts_state *s, const char *dir, char *err, size_t errc
     }
     if (S_ISLNK(lst.st_mode)) {
         seterr(err, errcap, "state file is a symbolic link, refusing it");
+        return -1;
+    }
+    if (!S_ISREG(lst.st_mode)) {
+        seterr(err, errcap, "state file is not a regular file, refusing it");
         return -1;
     }
     fd = open(path, O_RDONLY | O_NOFOLLOW);

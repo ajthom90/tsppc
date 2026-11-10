@@ -23,6 +23,11 @@ static int nonzero(const uint8_t *k)
     return 0;
 }
 
+static int clamped(const uint8_t *k)
+{
+    return (k[0] & 7) == 0 && (k[31] & 0x80) == 0 && (k[31] & 0x40) != 0;
+}
+
 static int count_entries(const char *dir)
 {
     DIR *d = opendir(dir);
@@ -93,8 +98,7 @@ static void test_create_load(void)
     t_true("store: no old node key", !a.have_old_node && !nonzero(a.old_node_priv));
     t_true("store: not logged in", !a.have_login);
     t_true("store: keys clamped",
-           (a.machine_priv[0] & 7) == 0 && (a.machine_priv[31] & 0x80) == 0 && (a.machine_priv[31] & 0x40) &&
-           (a.node_priv[0] & 7) == 0 && (a.disco_priv[0] & 7) == 0);
+           clamped(a.machine_priv) && clamped(a.node_priv) && clamped(a.disco_priv));
 
     t_true("store: dir exists", stat(dir, &st) == 0 && S_ISDIR(st.st_mode));
     t_true("store: dir mode 0700", (st.st_mode & 0777) == 0700);
@@ -172,10 +176,16 @@ static void test_corrupt(void)
         }
     }
 
-    /* Unknown version with a valid checksum is still an error, and save refuses nothing here. */
-    t_true("corrupt: trailing garbage rejected",
-           (memcpy(raw, orig, n), raw[n] = 0, write_file(file, raw, n + 1),
-            ts_state_load_or_create(&b, dir, err, sizeof err) != 0));
+    /* A valid image followed by an extra byte is rejected, and left alone. */
+    memcpy(raw, orig, n);
+    raw[n] = 0;
+    write_file(file, raw, n + 1);
+    t_true("corrupt: trailing byte rejected", ts_state_load_or_create(&b, dir, err, sizeof err) != 0);
+    {
+        uint8_t chk[512];
+        size_t m = read_file(file, chk, sizeof chk);
+        t_true("corrupt: trailing-byte file unchanged", m == n + 1 && !memcmp(chk, raw, n + 1));
+    }
     rm_tree(dir);
 }
 
@@ -240,15 +250,60 @@ static void test_perms(void)
     t_true("perms: err cap zero is safe", ts_state_load_or_create(&a, dir, NULL, 0) != 0);
 }
 
+static void test_stale_and_fifo(void)
+{
+    char dir[320], p[400], err[160];
+    ts_state a;
+    snprintf(dir, sizeof dir, "%s/s8", ROOT);
+    t_true("stale: create", ts_state_load_or_create(&a, dir, err, sizeof err) == 0);
+    path_in(p, sizeof p, dir, ".state.AbCdEf");
+    write_file(p, (const uint8_t *)"junk", 4);
+    path_in(p, sizeof p, dir, "other");
+    write_file(p, (const uint8_t *)"keep", 4);
+    t_true("stale: load ok", ts_state_load_or_create(&a, dir, err, sizeof err) == 0);
+    t_true("stale: temp removed, others kept", count_entries(dir) == 2);
+    unlink(p);
+    path_in(p, sizeof p, dir, TS_STATE_FILE);
+    unlink(p);
+    t_true("fifo: made", mkfifo(p, 0600) == 0);
+    t_true("fifo: refused without blocking", ts_state_load_or_create(&a, dir, err, sizeof err) != 0);
+    t_true("fifo: message", strstr(err, "regular") != NULL);
+    unlink(p);
+    rm_tree(dir);
+}
+
+/* Needs root: chown to another user. */
+static void test_wrong_owner(void)
+{
+    char dir[320], file[400], err[160];
+    ts_state a;
+    if (geteuid() != 0) {
+        printf("SKIP: wrong-owner tests need root\n");
+        return;
+    }
+    snprintf(dir, sizeof dir, "%s/s9", ROOT);
+    path_in(file, sizeof file, dir, TS_STATE_FILE);
+    t_true("owner: create", ts_state_load_or_create(&a, dir, err, sizeof err) == 0);
+    t_true("owner: chown dir", chown(dir, (uid_t)-2, (gid_t)-1) == 0);
+    t_true("owner: wrong-owner dir refused", ts_state_load_or_create(&a, dir, err, sizeof err) != 0);
+    t_true("owner: dir message", strstr(err, "wrong user") != NULL);
+    t_true("owner: save refused", ts_state_save(&a, dir, err, sizeof err) != 0);
+    t_true("owner: chown dir back", chown(dir, geteuid(), (gid_t)-1) == 0);
+    t_true("owner: chown file", chown(file, (uid_t)-2, (gid_t)-1) == 0);
+    t_true("owner: wrong-owner file refused", ts_state_load_or_create(&a, dir, err, sizeof err) != 0);
+    t_true("owner: file message", strstr(err, "wrong user") != NULL);
+    rm_tree(dir);
+}
+
 static void test_umask(void)
 {
     char dir[320], err[160];
     ts_state a;
     struct stat st;
-    mode_t old = umask(077);
+    mode_t old = umask(0277);   /* strips the owner bits: mkdir alone would give 0400 */
     snprintf(dir, sizeof dir, "%s/s7", ROOT);
     t_true("umask: create", ts_state_load_or_create(&a, dir, err, sizeof err) == 0);
-    t_true("umask: dir still 0700", stat(dir, &st) == 0 && (st.st_mode & 0777) == 0700);
+    t_true("umask: dir fixed to 0700", stat(dir, &st) == 0 && (st.st_mode & 0777) == 0700);
     umask(old);
     rm_tree(dir);
 }
@@ -308,6 +363,50 @@ static int find_str(const char *json, const char *key, char *out, size_t cap)
     }
     (void)depth_ok;
     return -1;
+}
+
+static void test_osversion_helpers(void)
+{
+    char v[32];
+    t_true("map: 8.11.0", ts_hostinfo_map_darwin("8.11.0", v, sizeof v) == 0 && !strcmp(v, "10.4.11"));
+    t_true("map: 9.8.0", ts_hostinfo_map_darwin("9.8.0", v, sizeof v) == 0 && !strcmp(v, "10.5.8"));
+    t_true("map: 10.8.0", ts_hostinfo_map_darwin("10.8.0", v, sizeof v) == 0 && !strcmp(v, "10.6.8"));
+    t_true("map: 8.0", ts_hostinfo_map_darwin("8.0", v, sizeof v) == 0 && !strcmp(v, "10.4.0"));
+    t_true("map: 7.9.0 out of range", ts_hostinfo_map_darwin("7.9.0", v, sizeof v) != 0 && v[0] == 0);
+    t_true("map: 11.0.0 out of range", ts_hostinfo_map_darwin("11.0.0", v, sizeof v) != 0);
+    t_true("map: junk", ts_hostinfo_map_darwin("9.x", v, sizeof v) != 0);
+    t_true("map: empty", ts_hostinfo_map_darwin("", v, sizeof v) != 0);
+    t_true("map: trailing junk", ts_hostinfo_map_darwin("9.8.0a", v, sizeof v) != 0);
+    t_true("map: huge", ts_hostinfo_map_darwin("99999999999999999999.1", v, sizeof v) != 0);
+    t_true("map: small cap", ts_hostinfo_map_darwin("9.8.0", v, 4) != 0);
+
+    {
+        const char *plist =
+            "<?xml version=\"1.0\"?>\n<dict>\n\t<key>ProductName</key>\n\t<string>Mac OS X</string>\n"
+            "\t<key>ProductUserVisibleVersion</key>\n\t<string>10.5.8</string>\n"
+            "\t<key>ProductVersion</key>\n\t<string>10.5.8</string>\n</dict>\n";
+        t_true("plist: parsed", ts_hostinfo_parse_plist_version(plist, strlen(plist), v, sizeof v) == 0 &&
+               !strcmp(v, "10.5.8"));
+    }
+    {
+        const char *p2 = "<key>ProductVersion</key><string>10.4.11</string>";
+        t_true("plist: compact", ts_hostinfo_parse_plist_version(p2, strlen(p2), v, sizeof v) == 0 &&
+               !strcmp(v, "10.4.11"));
+    }
+    {
+        const char *bad[] = {
+            "<key>ProductVersion</key><string>10.x</string>",
+            "<key>ProductVersion</key><string>10.5.8",
+            "<key>ProductVersion</key><integer>5</integer>",
+            "<key>ProductVersion</key><string></string>",
+            "<key>ProductVersion</key><string>1234567890123456789012345678901234567890</string>",
+            "<key>ProductName</key><string>10.5.8</string>",
+            "",
+        };
+        size_t i;
+        for (i = 0; i < sizeof bad / sizeof bad[0]; i++)
+            t_true("plist: bad rejected", ts_hostinfo_parse_plist_version(bad[i], strlen(bad[i]), v, sizeof v) != 0 && v[0] == 0);
+    }
 }
 
 static void test_hostinfo(void)
@@ -372,7 +471,10 @@ void test_store(void)
     test_corrupt();
     test_perms();
     test_umask();
+    test_stale_and_fifo();
+    test_wrong_owner();
     test_parse();
+    test_osversion_helpers();
     test_hostinfo();
     rm_tree(ROOT);
 }

@@ -22,6 +22,16 @@
  * 104 32  disco private key
  * 136 32  BLAKE2s-256 of bytes 0..135
  *
+ * The parent of the state directory must be trusted (for example /var/db, owned
+ * by root and not writable by others): only the final path component is checked
+ * for being a symbolic link.
+ *
+ * Creating the first state installs it with link(), so an existing file is never
+ * replaced; ts_state_save replaces with rename. In both, if the final directory
+ * fsync fails the file is already installed but may not be durable; an error is
+ * returned and the caller should treat the save as not confirmed. Load removes
+ * leftover ".state.*" temporary files (regular files we own) from a crashed save.
+ *
  * Private keys never appear in error messages. */
 
 #define TS_STATE_DIR "/var/db/tsppc"
@@ -29,10 +39,11 @@
 #define TS_STATE_FILE_LEN 168
 #define TS_STATE_VERSION 1
 
-#ifdef TS_TEST_HOOKS
-/* Test builds only: the TSPPC_STATE_DIR environment variable overrides
- * TS_STATE_DIR. Returns the directory the daemon should use. */
-#endif
+#define TS_STATE_TMP_PREFIX ".state."
+#define TS_STATE_TMP_TEMPLATE ".state.XXXXXX"
+
+/* The directory the daemon should use: TS_STATE_DIR. In builds with
+ * -DTS_TEST_HOOKS only, the TSPPC_STATE_DIR environment variable overrides it. */
 const char *ts_state_default_dir(void);
 
 typedef struct {

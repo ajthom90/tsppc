@@ -1,16 +1,17 @@
 #!/bin/sh
 # Build and run the PowerPC test binary on a VM.
-# Usage: TSPPC_SSH_CONFIG=<ssh config> [TSPPC_VM_USER=<login>] tools/vm-test.sh <leopard|tiger>
+# Usage: TSPPC_SSH_CONFIG=<ssh config> [TSPPC_VM_USER=<login>] tools/vm-test.sh <leopard|tiger|leopard-root>
 # leopard: copy the tree, build with make ppc-test CC=gcc-4.0, run the binary,
 #          then check the built objects with tools/check-ct.sh.
+# leopard-root: run the Leopard-built binary under sudo (after a leopard run).
 # tiger:   fetch the Leopard-built binary via the host, copy to Tiger, run it.
 set -u
 
 : "${TSPPC_SSH_CONFIG:?set TSPPC_SSH_CONFIG to the ssh config path}"
 HOSTNAME_ARG=${1:-}
 case "$HOSTNAME_ARG" in
-leopard|tiger) ;;
-*) echo "usage: $0 <leopard|tiger>" >&2; exit 2 ;;
+leopard|tiger|leopard-root) ;;
+*) echo "usage: $0 <leopard|tiger|leopard-root>" >&2; exit 2 ;;
 esac
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -32,6 +33,12 @@ vmssh() {
 }
 
 case "$HOSTNAME_ARG" in
+leopard-root)
+    # Run the binary built by a previous "leopard" run as root (passwordless sudo),
+    # for the tests that need to chown.
+    vmssh leopard 'cd "$HOME/tsppc" && sudo ./'$BIN
+    exit $?
+    ;;
 leopard)
     # Build the archive in a file first, so a tar failure is not hidden by a pipe.
     arc=$(mktemp -t tsppcsrc) || exit 1
