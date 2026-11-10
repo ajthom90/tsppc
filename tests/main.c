@@ -6,6 +6,7 @@ void test_aead(void);
 void test_nacl(void);
 void test_encoding(void);
 void test_json(void);
+void test_hpack(void);
 
 int main(void)
 {
@@ -15,5 +16,6 @@ int main(void)
     test_nacl();
     test_encoding();
     test_json();
+    test_hpack();
     return t_summary();
 }
