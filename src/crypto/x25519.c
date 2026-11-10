@@ -1,0 +1,32 @@
+#include "x25519.h"
+#include <string.h>
+#include <bearssl_ec.h>
+#include "../core/bytes.h"
+
+/* BearSSL takes the scalar in the order given here (RFC 7748 little-endian
+ * encoding is handled by the c25519 implementation, which also clamps). */
+
+int ts_x25519(uint8_t out[32], const uint8_t priv[32], const uint8_t pub[32])
+{
+    const br_ec_impl *ec = &br_ec_c25519_m31;
+    uint8_t acc = 0;
+    size_t i;
+
+    memcpy(out, pub, 32);
+    if (!ec->mul(out, 32, priv, 32, BR_EC_curve25519)) {
+        ts_wipe(out, 32);
+        return -1;
+    }
+    for (i = 0; i < 32; i++) acc |= out[i];
+    if (acc == 0) {
+        ts_wipe(out, 32);
+        return -1;
+    }
+    return 0;
+}
+
+void ts_x25519_public(uint8_t out[32], const uint8_t priv[32])
+{
+    const br_ec_impl *ec = &br_ec_c25519_m31;
+    ec->mulgen(out, priv, 32, BR_EC_curve25519);
+}
