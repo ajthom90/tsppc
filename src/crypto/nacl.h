@@ -4,7 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Plain one-time Poly1305 MAC (RFC 8439 section 2.5), constant time. */
+/* Plain one-time Poly1305 MAC (RFC 8439 section 2.5). NOT constant time on
+ * G3/G4: the PowerPC multiply instruction takes data-dependent time there. A
+ * constant-time PowerPC implementation is required before any network-facing
+ * use. */
 void ts_poly1305(uint8_t tag[16], const uint8_t key[32],
                  const uint8_t *msg, size_t len);
 

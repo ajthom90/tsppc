@@ -18,6 +18,39 @@ static void test_poly(void)
     t_unhex(key, "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b");
     ts_poly1305(tag, key, (const uint8_t *)m, strlen(m));
     t_hex("poly1305 rfc8439", tag, 16, "a8061dc1305136c6c22b8baf0c0127a9");
+    /* RFC 8439 appendix A.3, vectors 5 to 11: carry and reduction edge cases. */
+    static const struct { const char *key, *data, *tag; } v[] = {
+        /* #5 */ { "0200000000000000000000000000000000000000000000000000000000000000",
+          "ffffffffffffffffffffffffffffffff",
+          "03000000000000000000000000000000" },
+        /* #6 */ { "02000000000000000000000000000000ffffffffffffffffffffffffffffffff",
+          "02000000000000000000000000000000",
+          "03000000000000000000000000000000" },
+        /* #7 */ { "0100000000000000000000000000000000000000000000000000000000000000",
+          "fffffffffffffffffffffffffffffffff0ffffffffffffffffffffffffffffff11000000000000000000000000000000",
+          "05000000000000000000000000000000" },
+        /* #8 */ { "0100000000000000000000000000000000000000000000000000000000000000",
+          "fffffffffffffffffffffffffffffffffbfefefefefefefefefefefefefefefe01010101010101010101010101010101",
+          "00000000000000000000000000000000" },
+        /* #9 */ { "0200000000000000000000000000000000000000000000000000000000000000",
+          "fdffffffffffffffffffffffffffffff",
+          "faffffffffffffffffffffffffffffff" },
+        /* #10 */ { "0100000000000000040000000000000000000000000000000000000000000000",
+          "e33594d7505e43b900000000000000003394d7505e4379cd01000000000000000000000000000000000000000000000001000000000000000000000000000000",
+          "14000000000000005500000000000000" },
+        /* #11 */ { "0100000000000000040000000000000000000000000000000000000000000000",
+          "e33594d7505e43b900000000000000003394d7505e4379cd010000000000000000000000000000000000000000000000",
+          "13000000000000000000000000000000" },
+    };
+    size_t i;
+    for (i = 0; i < sizeof v / sizeof v[0]; i++) {
+        uint8_t k2[32], d2[64], t2[16];
+        size_t n = strlen(v[i].data) / 2;
+        t_unhex(k2, v[i].key);
+        t_unhex(d2, v[i].data);
+        ts_poly1305(t2, k2, d2, n);
+        t_hex("poly1305 a.3 vector", t2, 16, v[i].tag);
+    }
 }
 
 static void test_box(void)

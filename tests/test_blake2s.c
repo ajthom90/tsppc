@@ -41,13 +41,17 @@ void test_blake2s(void)
     ts_blake2s(out, s, 200);
     t_hex("blake2s long", out, 32, LONG_HEX);
 
-    ts_blake2s_init(&c, 16, key, 32);
+    t_true("init outlen 0", ts_blake2s_init(&c, 0, NULL, 0) == -1);
+    t_true("init outlen 33", ts_blake2s_init(&c, 33, NULL, 0) == -1);
+    t_true("init keylen 33", ts_blake2s_init(&c, 32, key, 33) == -1);
+    t_true("init keylen 32 ok", ts_blake2s_init(&c, 32, key, 32) == 0);
+    t_true("init ok", ts_blake2s_init(&c, 16, key, 32) == 0);
     ts_blake2s_update(&c, "abc", 3);
     ts_blake2s_final(&c, out);
     t_hex("blake2s keyed 16", out, 16, "61ba5f165c194692e09d12520cc4c74a");
 
     memset(key, 'k', 32);
-    ts_blake2s_init(&c, 16, key, 32);
+    if (ts_blake2s_init(&c, 16, key, 32) != 0) t_true("init", 0);
     ts_blake2s_update(&c, s, 200);
     ts_blake2s_final(&c, out);
     t_hex("blake2s keyed long", out, 16, "a74b2926087ee84d2ca3c8402d4e695b");
@@ -55,7 +59,7 @@ void test_blake2s(void)
     {
         int all = 1;
         for (k = 0; k <= 200; k++) {
-            ts_blake2s_init(&c, 32, NULL, 0);
+            if (ts_blake2s_init(&c, 32, NULL, 0) != 0) t_true("init", 0);
             ts_blake2s_update(&c, s, k);
             ts_blake2s_update(&c, s + k, 200 - k);
             ts_blake2s_final(&c, out);
@@ -63,7 +67,7 @@ void test_blake2s(void)
         }
         t_true("chunked", all);
     }
-    ts_blake2s_init(&c, 32, NULL, 0);
+    if (ts_blake2s_init(&c, 32, NULL, 0) != 0) t_true("init", 0);
     for (k = 0; k < 200; k++) ts_blake2s_update(&c, s + k, 1);
     ts_blake2s_final(&c, out);
     t_hex("chunked bytewise", out, 32, LONG_HEX);

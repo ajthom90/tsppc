@@ -1,4 +1,5 @@
 #include "kdf.h"
+#include <stdlib.h>
 #include <string.h>
 #include "blake2s.h"
 #include "../core/bytes.h"
@@ -17,13 +18,13 @@ void ts_hmac_blake2s(uint8_t out[32], const uint8_t *key, size_t keylen,
     else if (keylen > 0) memcpy(k, key, keylen);
 
     for (i = 0; i < BLOCK; i++) pad[i] = k[i] ^ 0x36;
-    ts_blake2s_init(&c, 32, NULL, 0);
+    if (ts_blake2s_init(&c, 32, NULL, 0) != 0) abort();   /* fixed valid parameters */
     ts_blake2s_update(&c, pad, BLOCK);
     ts_blake2s_update(&c, msg, msglen);
     ts_blake2s_final(&c, inner);
 
     for (i = 0; i < BLOCK; i++) pad[i] = k[i] ^ 0x5c;
-    ts_blake2s_init(&c, 32, NULL, 0);
+    if (ts_blake2s_init(&c, 32, NULL, 0) != 0) abort();   /* fixed valid parameters */
     ts_blake2s_update(&c, pad, BLOCK);
     ts_blake2s_update(&c, inner, 32);
     ts_blake2s_final(&c, out);

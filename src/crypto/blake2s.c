@@ -1,4 +1,5 @@
 #include "blake2s.h"
+#include <stdlib.h>
 #include <string.h>
 #include "../core/bytes.h"
 
@@ -69,10 +70,11 @@ static void add_count(ts_blake2s_ctx *c, uint32_t n)
     if (c->t[0] < n) c->t[1]++;
 }
 
-void ts_blake2s_init(ts_blake2s_ctx *c, size_t outlen, const uint8_t *key, size_t keylen)
+int ts_blake2s_init(ts_blake2s_ctx *c, size_t outlen, const uint8_t *key, size_t keylen)
 {
     int i;
 
+    if (outlen < 1 || outlen > 32 || keylen > 32) return -1;
     memset(c, 0, sizeof *c);
     for (i = 0; i < 8; i++) c->h[i] = IV[i];
     c->h[0] ^= 0x01010000u ^ ((uint32_t)keylen << 8) ^ (uint32_t)outlen;
@@ -84,6 +86,7 @@ void ts_blake2s_init(ts_blake2s_ctx *c, size_t outlen, const uint8_t *key, size_
         ts_blake2s_update(c, block, sizeof block);
         ts_wipe(block, sizeof block);
     }
+    return 0;
 }
 
 void ts_blake2s_update(ts_blake2s_ctx *c, const void *data, size_t len)
@@ -123,7 +126,7 @@ void ts_blake2s_final(ts_blake2s_ctx *c, uint8_t *out)
 void ts_blake2s(uint8_t out[32], const void *data, size_t len)
 {
     ts_blake2s_ctx c;
-    ts_blake2s_init(&c, 32, NULL, 0);
+    if (ts_blake2s_init(&c, 32, NULL, 0) != 0) abort();   /* fixed valid parameters */
     ts_blake2s_update(&c, data, len);
     ts_blake2s_final(&c, out);
 }

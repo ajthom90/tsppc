@@ -134,7 +134,12 @@ cmd_load() {
         clear_staging
         die "could not stage and load $kext"
     fi
-    wait_dev present || die "$DEV did not appear after kextload"
+    if ! wait_dev present; then
+        # The kext loaded but gave no device: do not leave it loaded.
+        kextunload -b "$BUNDLE_ID" >&2 || echo "driver.sh: kextunload failed; $BUNDLE_ID may still be loaded" >&2
+        clear_staging
+        die "$DEV did not appear after kextload"
+    fi
     echo "loaded $kext, $DEV present"
 }
 

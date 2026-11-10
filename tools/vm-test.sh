@@ -32,8 +32,20 @@ vmssh() {
 
 case "$HOSTNAME_ARG" in
 leopard)
-    ( cd "$ROOT" && COPYFILE_DISABLE=1 tar -cf - --exclude ./build --exclude ./spike --exclude ./.superpowers --exclude ./.git . ) |
-        vmssh leopard 'mkdir -p "$HOME/tsppc" && cd "$HOME/tsppc" && tar -xf -' || exit 1
+    # Build the archive in a file first, so a tar failure is not hidden by a pipe.
+    arc=$(mktemp -t tsppcsrc) || exit 1
+    trap 'rm -f "$arc"' EXIT
+    ( cd "$ROOT" && COPYFILE_DISABLE=1 tar -cf "$arc" --exclude ./build --exclude ./spike --exclude ./.superpowers --exclude ./.git . ) ||
+        { echo "vm-test.sh: tar failed" >&2; exit 1; }
+    # Remove the old sources first so files deleted on the host are not built.
+    # build/ is kept. The id file records what this tree was.
+    ID="$(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null || echo nogit)"
+    if [ -n "$(cd "$ROOT" && git status --porcelain --untracked-files=no -- src tests tools vendor Makefile 2>/dev/null)" ]; then
+        ID="$ID+modified"
+    fi
+    ID="$ID archive-cksum $(cksum <"$arc" | cut -d' ' -f1,2 | tr ' ' :)"
+    vmssh leopard 'mkdir -p "$HOME/tsppc" && cd "$HOME/tsppc" && rm -rf src tests tools vendor Makefile && tar -xf -' <"$arc" || exit 1
+    vmssh leopard 'mkdir -p "$HOME/tsppc/build/ppc-test" && echo '"'$ID'"' >"$HOME/tsppc/build/ppc-test/SOURCE_ID"' || exit 1
     vmssh leopard 'cd "$HOME/tsppc" && make ppc-test CC=gcc-4.0'
     exit $?
     ;;
@@ -41,6 +53,9 @@ tiger)
     tmp=$(mktemp -t tsppcbin) || exit 1
     trap 'rm -f "$tmp"' EXIT
     vmssh leopard 'cat "$HOME/tsppc/'$BIN'"' >"$tmp" || exit 1
+    echo "binary cksum: $(cksum <"$tmp" | cut -d' ' -f1,2)"
+    if command -v shasum >/dev/null 2>&1; then echo "binary sha256: $(shasum -a 256 <"$tmp" | cut -d' ' -f1)"; fi
+    echo "built from: $(vmssh leopard 'cat "$HOME/tsppc/build/ppc-test/SOURCE_ID"' 2>/dev/null || echo unknown)"
     vmssh tiger 'cat > "$HOME/test_all" && chmod +x "$HOME/test_all"' <"$tmp" || exit 1
     vmssh tiger '"$HOME/test_all"'
     exit $?

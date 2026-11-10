@@ -12,8 +12,9 @@ typedef struct {
     size_t   outlen;
 } ts_blake2s_ctx;
 
-/* outlen 1..32, keylen 0..32 (key may be NULL when keylen is 0). */
-void ts_blake2s_init(ts_blake2s_ctx *c, size_t outlen, const uint8_t *key, size_t keylen);
+/* outlen 1..32, keylen 0..32 (key may be NULL when keylen is 0). Returns 0,
+ * or -1 for a length out of range, in which case c is not used. */
+int ts_blake2s_init(ts_blake2s_ctx *c, size_t outlen, const uint8_t *key, size_t keylen);
 void ts_blake2s_update(ts_blake2s_ctx *c, const void *data, size_t len);
 /* Writes outlen bytes and wipes the context. */
 void ts_blake2s_final(ts_blake2s_ctx *c, uint8_t *out);
