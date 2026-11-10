@@ -109,10 +109,11 @@ REGISTRY  := $(OBJDIR)/registry.c
 
 $(REGISTRY): FORCE
 	@mkdir -p $(dir $@); { \
+	  echo '#include <stddef.h>'; echo '#include "tests/fuzz.h"'; \
 	  for n in $(FUZZNAMES); do echo "extern void ts_fuzz_$$n(void);"; done; \
 	  echo "const char *const ts_fuzz_names[] = { $(foreach n,$(FUZZNAMES),\"$(n)\",) 0 };"; \
 	  echo "void (*const ts_fuzz_funcs[])(void) = { $(foreach n,$(FUZZNAMES),ts_fuzz_$(n),) 0 };"; \
-	  echo "const unsigned long ts_fuzz_count = $(words $(FUZZNAMES));"; \
+	  echo "const size_t ts_fuzz_count = $(words $(FUZZNAMES));"; \
 	} >$@.new; \
 	if cmp -s $@.new $@; then rm -f $@.new; else mv $@.new $@; fi
 

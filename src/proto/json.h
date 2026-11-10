@@ -8,7 +8,9 @@
  * the buffer need not be NUL-terminated and must outlive the reader and any
  * token (tokens point into it). The grammar is checked strictly as tokens are
  * pulled: commas, colons, string escapes (including surrogate pairs), numbers
- * and nesting depth. Anything else is TS_JSON_ERROR, and the error is sticky. */
+ * and nesting depth. Strings must be valid UTF-8, and a \u0000 escape is
+ * refused: either makes ts_json_next return TS_JSON_ERROR, so the whole
+ * document is rejected. Anything else is TS_JSON_ERROR, and the error is sticky. */
 
 #define TS_JSON_MAX_DEPTH 32   /* 32 nested containers pass, 33 are an error */
 
@@ -54,8 +56,8 @@ int ts_json_skip(ts_json *j, const ts_json_tok *first);
 
 /* Decode a STRING or KEY token (escapes, surrogate pairs) to UTF-8 in out,
  * NUL-terminated. Returns the length excluding the NUL, or -1 if the token is
- * not a string, is invalid, contains \u0000, or does not fit in cap (including
- * the NUL). Never writes past cap. */
+ * not a string, is invalid, or does not fit in cap (including the NUL).
+ * Never writes past cap; on failure with cap > 0, out is set to "". */
 int ts_json_string(char *out, size_t cap, const ts_json_tok *t);
 
 /* Parse a NUMBER token that is a plain integer (no fraction or exponent) in

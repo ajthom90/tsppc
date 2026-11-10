@@ -48,6 +48,32 @@ static long scan_string(const char *s, size_t n, char *out, size_t cap)
         uint32_t cp;
         size_t need;
         if (c < 0x20) return -1;
+        if (c >= 0x80) {
+            /* Validate UTF-8: no overlongs, surrogates, > U+10FFFF, or truncation. */
+            size_t k, extra;
+            unsigned char lo = 0x80, hi = 0xbf;
+            if (c >= 0xc2 && c <= 0xdf) extra = 1;
+            else if (c >= 0xe0 && c <= 0xef) {
+                extra = 2;
+                if (c == 0xe0) lo = 0xa0;
+                if (c == 0xed) hi = 0x9f;
+            } else if (c >= 0xf0 && c <= 0xf4) {
+                extra = 3;
+                if (c == 0xf0) lo = 0x90;
+                if (c == 0xf4) hi = 0x8f;
+            } else return -1;
+            if (n - i < extra + 1) return -1;
+            for (k = 1; k <= extra; k++) {
+                unsigned char b = (unsigned char)s[i + k];
+                if (k == 1 ? (b < lo || b > hi) : (b < 0x80 || b > 0xbf)) return -1;
+            }
+            if (out) {
+                if (o + extra + 1 >= cap) return -1;
+                for (k = 0; k <= extra; k++) out[o + k] = s[i + k];
+            }
+            o += extra + 1; i += extra + 1;
+            continue;
+        }
         if (c != '\\') {
             if (out) { if (o + 1 >= cap) return -1; out[o] = (char)c; }
             o++; i++;
@@ -323,11 +349,14 @@ int ts_json_skip(ts_json *j, const ts_json_tok *first)
 int ts_json_string(char *out, size_t cap, const ts_json_tok *t)
 {
     long n;
-    if ((t->type != TS_JSON_STRING && t->type != TS_JSON_KEY) || cap == 0 ||
-        (t->raw == NULL && t->rawlen > 0))
+    if (cap == 0) return -1;
+    if ((t->type != TS_JSON_STRING && t->type != TS_JSON_KEY) ||
+        (t->raw == NULL && t->rawlen > 0)) {
+        out[0] = 0;
         return -1;
+    }
     n = scan_string(t->raw, t->rawlen, out, cap);
-    if (n < 0 || n > 0x7fffffffL) return -1;
+    if (n < 0 || n > 0x7fffffffL) { out[0] = 0; return -1; }
     return (int)n;
 }
 

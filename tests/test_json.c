@@ -86,6 +86,56 @@ static void test_strings(void)
     t_true("string on number", ts_json_string(out, sizeof out, &(ts_json_tok){ TS_JSON_NUMBER, "1", 1 }) == -1);
 }
 
+/* Decode a JSON string literal held in a C string into out; returns the result. */
+static int dec(const char *lit, char *out, size_t cap)
+{
+    ts_json j;
+    ts_json_tok t;
+    ts_json_init(&j, lit, strlen(lit));
+    if (ts_json_next(&j, &t) != TS_JSON_STRING) return -2;
+    return ts_json_string(out, cap, &t);
+}
+
+static void test_more_strings(void)
+{
+    char out[16];
+    t_true("U+07FF", dec("\"\\u07ff\"", out, sizeof out) == 2);
+    t_hex("U+07FF hex", (const uint8_t *)out, 2, "dfbf");
+    t_true("U+0800", dec("\"\\u0800\"", out, sizeof out) == 3);
+    t_hex("U+0800 hex", (const uint8_t *)out, 3, "e0a080");
+    t_true("U+FFFF", dec("\"\\uffff\"", out, sizeof out) == 3);
+    t_hex("U+FFFF hex", (const uint8_t *)out, 3, "efbfbf");
+    t_true("U+10000", dec("\"\\ud800\\udc00\"", out, sizeof out) == 4);
+    t_hex("U+10000 hex", (const uint8_t *)out, 4, "f0908080");
+    t_true("U+10FFFF", dec("\"\\udbff\\udfff\"", out, sizeof out) == 4);
+    t_hex("U+10FFFF hex", (const uint8_t *)out, 4, "f48fbfbf");
+    t_true("high high", bad("\"\\ud800\\ud800\""));
+    memset(out, 'x', sizeof out);
+    t_true("4-byte at cap 5", dec("\"\\ud83d\\ude00\"", out, 5) == 4 && out[4] == 0);
+    memset(out, 'x', sizeof out);
+    t_true("4-byte at cap 4", dec("\"\\ud83d\\ude00\"", out, 4) == -1 && out[0] == 0 && out[4] == 'x');
+    t_true("failure clears out", (out[0] = 'x', dec("\"abc\"", out, 3) == -1 && out[0] == 0));
+    t_true("nul escape is a document error", bad("\"a\\u0000b\"") && bad("{\"\\u0000\":1}"));
+
+    /* Raw UTF-8: valid forms pass through, invalid forms reject the document. */
+    t_true("raw 2-byte", dec("\"\xc3\xa9\"", out, sizeof out) == 2);
+    t_true("raw 3-byte", dec("\"\xe2\x82\xac\"", out, sizeof out) == 3);
+    t_true("raw 4-byte", dec("\"\xf0\x9f\x98\x80\"", out, sizeof out) == 4);
+    t_true("raw U+10FFFF", good("\"\xf4\x8f\xbf\xbf\""));
+    t_true("raw U+D7FF", good("\"\xed\x9f\xbf\""));
+    t_true("raw lowest 3-byte", good("\"\xe0\xa0\x80\"") && good("\"\xf0\x90\x80\x80\""));
+    t_true("overlong 2-byte", bad("\"\xc0\x80\"") && bad("\"\xc1\xbf\""));
+    t_true("overlong 3-byte", bad("\"\xe0\x80\x80\"") && bad("\"\xe0\x9f\xbf\""));
+    t_true("overlong 4-byte", bad("\"\xf0\x80\x80\x80\"") && bad("\"\xf0\x8f\xbf\xbf\""));
+    t_true("encoded surrogate", bad("\"\xed\xa0\x80\"") && bad("\"\xed\xbf\xbf\""));
+    t_true("above U+10FFFF", bad("\"\xf4\x90\x80\x80\"") && bad("\"\xf5\x80\x80\x80\""));
+    t_true("bad lead bytes", bad("\"\xf8\x88\x80\x80\x80\"") && bad("\"\xff\"") && bad("\"\xfe\""));
+    t_true("stray continuation", bad("\"\x80\"") && bad("\"\xbf\""));
+    t_true("truncated", bad("\"\xc3\"") && bad("\"\xe2\x82\"") && bad("\"\xf0\x9f\x98\"") && bad("\"\xe2\x82"));
+    t_true("bad continuation", bad("\"\xc3\x28\"") && bad("\"\xe2\x28\xa1\"") && bad("\"\xe2\x82\x28\""));
+    t_true("raw utf8 cap exact", dec("\"\xe2\x82\xac\"", out, 4) == 3 && dec("\"\xe2\x82\xac\"", out, 3) == -1);
+}
+
 static void test_int64(void)
 {
     ts_json_tok t;
@@ -165,6 +215,23 @@ static void test_errors(void)
     for (i = 0; i < 33; i++) deep[33 + i] = ']';
     deep[66] = 0;
     t_true("depth 33 error", bad(deep));
+    {
+        char od[33 * 5 + 2 + 33 + 1];
+        char *p = od;
+        for (i = 0; i < 32; i++) { memcpy(p, "{\"a\":", 5); p += 5; }
+        *p++ = '1';
+        for (i = 0; i < 32; i++) *p++ = '}';
+        *p = 0;
+        t_true("object depth 32 ok", good(od));
+        {
+            size_t l = strlen(od);
+            memmove(od + 5, od, l + 1);
+            memcpy(od, "{\"a\":", 5);
+            od[l + 5] = '}';
+            od[l + 6] = 0;
+        }
+        t_true("object depth 33 error", bad(od));
+    }
     for (i = 0; i < 40; i++) deep[i] = '[';
     deep[40] = 0;
     t_true("depth 40 unclosed error", bad(deep));
@@ -188,6 +255,7 @@ void test_json(void)
 {
     test_sequence();
     test_strings();
+    test_more_strings();
     test_int64();
     test_skip();
     test_errors();
