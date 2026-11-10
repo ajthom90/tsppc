@@ -685,7 +685,12 @@ static int apply_inner(ts_netmap *m, const char *json, size_t len, ctx *c)
 
     /* Commit. */
     if (got_ping) m->ping = ping;
-    if (keepalive) return 0;
+    if (keepalive) {
+        m->have_exit = 0;
+        m->exit_code = 0;
+        m->sleep_ms = 0;
+        return 0;
+    }
     if (have_node) {
         m->self = self;
         m->have_self = 1;
@@ -787,7 +792,7 @@ int ts_map_stream_feed(ts_map_stream *s, const uint8_t *in, size_t n)
             s->hdr_have = 0;
             want = ts_get_le32(s->hdr);
             if (want > TS_MAP_MSG_MAX) {
-                s->failed = 1;
+                s->failed = TS_MAP_STREAM_TOO_BIG;
                 return -1;
             }
             if (want == 0) {
@@ -809,7 +814,7 @@ int ts_map_stream_feed(ts_map_stream *s, const uint8_t *in, size_t n)
             if (nc > s->want) nc = s->want;
             nb = (uint8_t *)realloc(s->buf, nc);
             if (!nb) {
-                s->failed = 1;
+                s->failed = TS_MAP_STREAM_NOMEM;
                 return -1;
             }
             s->buf = nb;

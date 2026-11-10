@@ -257,6 +257,9 @@ static void test_keepalive_and_extras(void)
         "{\"PingRequest\":{\"URL\":\"https://ping.example.test/p/2\",\"Types\":\"c2n\"}}") == 0);
     t_true("ping types", m.ping.pending && !m.ping.url_is_noise && strcmp(m.ping.types, "c2n") == 0);
     m.ping.pending = 0;
+    t_unchanged("rejected message carrying a ping", &m,
+        "{\"PingRequest\":{\"URL\":\"https://ping.example.test/p/3\"},\"PeersRemoved\":[\"x\"]}");
+    t_true("rejected ping not stored", !m.ping.pending && strcmp(m.ping.url, "https://ping.example.test/p/2") == 0);
     t_true("ping without URL ignored",
            apply(&m, "{\"PingRequest\":{\"URLIsNoise\":true}}") == 0 && !m.ping.pending);
     {
@@ -273,9 +276,13 @@ static void test_keepalive_and_extras(void)
     t_true("debug", apply(&m, "{\"Debug\":{\"Exit\":0,\"SleepSeconds\":1.5,\"DisableLogTail\":true}}") == 0);
     t_true("debug exit 0 present", m.have_exit && m.exit_code == 0);
     t_true("debug sleep", m.sleep_ms == 1500);
-    t_true("debug keepalive keeps", apply(&m, "{\"KeepAlive\":true,\"Debug\":{\"Exit\":5}}") == 0
-           && m.have_exit && m.exit_code == 0);
+    t_true("debug ignored on keepalive", apply(&m, "{\"KeepAlive\":true,\"Debug\":{\"Exit\":5}}") == 0
+           && !m.have_exit && m.exit_code == 0 && m.sleep_ms == 0);
+    apply(&m, "{\"Debug\":{\"Exit\":0,\"SleepSeconds\":1.5}}");
     t_true("debug is per message", apply(&m, "{}") == 0 && !m.have_exit && m.sleep_ms == 0);
+    apply(&m, "{\"Debug\":{\"Exit\":4}}");
+    t_unchanged("rejected message keeps debug", &m, "{\"Debug\":{\"Exit\":9},\"PeersRemoved\":[\"x\"]}");
+    t_true("debug kept after rejection", m.have_exit && m.exit_code == 4);
     t_true("debug sleep clamped", apply(&m, "{\"Debug\":{\"SleepSeconds\":1e9}}") == 0
            && m.sleep_ms == TS_MAP_SLEEP_MAX_MS);
     t_true("debug sleep negative", apply(&m, "{\"Debug\":{\"SleepSeconds\":-3}}") == 0 && m.sleep_ms == 0);
@@ -406,6 +413,22 @@ static void on_msg(void *user, const char *data, size_t len)
     }
 }
 
+static int big_seen;
+
+static void on_big(void *user, const char *data, size_t len)
+{
+    size_t k;
+    int ok = 1;
+    (void)user;
+    if (big_seen == 0) {
+        ok = len == 100000;
+        for (k = 0; ok && k < len; k++) ok = data[k] == (char)('a' + k % 26);
+    } else {
+        ok = len == 2 && memcmp(data, "{}", 2) == 0;
+    }
+    if (ok) big_seen++;
+}
+
 static size_t frame(uint8_t *out, const char *s, size_t n)
 {
     out[0] = (uint8_t)n; out[1] = (uint8_t)(n >> 8); out[2] = (uint8_t)(n >> 16); out[3] = (uint8_t)(n >> 24);
@@ -467,8 +490,32 @@ static void test_stream(void)
     ts_map_stream_init(&s, on_msg, &whole);
     t_true("oversize length rejected", ts_map_stream_feed(&s, big, 4) == -1);
     t_true("oversize did not allocate", s.buf == NULL && s.cap == 0 && whole.count == 0);
+    t_true("oversize reason", s.failed == TS_MAP_STREAM_TOO_BIG);
     t_true("error is sticky", ts_map_stream_feed(&s, wire, n) == -1 && whole.count == 0);
     ts_map_stream_free(&s);
+
+    /* A large message fed in chunks grows the buffer, then frees it; a small
+     * message after it still arrives intact. */
+    {
+        size_t blen = 100000, off;
+        uint8_t *bw = (uint8_t *)malloc(blen + 4 + 4 + 2);
+        size_t k;
+        int ok = 1;
+        bw[0] = (uint8_t)blen; bw[1] = (uint8_t)(blen >> 8); bw[2] = (uint8_t)(blen >> 16); bw[3] = 0;
+        for (k = 0; k < blen; k++) bw[4 + k] = (uint8_t)('a' + k % 26);
+        frame(bw + 4 + blen, "{}", 2);
+        big_seen = 0;
+        ts_map_stream_init(&s, on_big, NULL);
+        for (off = 0; off < blen + 10 && ok; off += 3001) {
+            size_t c = blen + 10 - off < 3001 ? blen + 10 - off : 3001;
+            ok = ts_map_stream_feed(&s, bw + off, c) == 0;
+            if (off == 9 * 3001) t_true("buffer grows in steps", s.cap > 4096 && s.cap < blen);
+        }
+        t_true("large then small", ok && big_seen == 2);
+        t_true("large buffer freed, small one sized to its message", s.cap == 2);
+        ts_map_stream_free(&s);
+        free(bw);
+    }
 
     /* Exactly the maximum is accepted as a length; nothing is allocated before body bytes. */
     {

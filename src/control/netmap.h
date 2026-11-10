@@ -87,8 +87,10 @@ typedef struct {
     size_t npeers;
     int tka_enabled;            /* Tailnet Lock on (TKAInfo present, Disabled false) */
     ts_ping_req ping;
-    /* From the Debug object of the last successfully applied non-KeepAlive
-     * message; reset to 0 by every such message (a KeepAlive leaves them). */
+    /* The Debug request of the message just applied: every successful apply
+     * sets these from that message alone (0 when it has no Debug, and always
+     * 0 for a KeepAlive, whose Debug upstream ignores). A rejected message
+     * leaves them as they were. */
     int have_exit;              /* Debug.Exit present */
     int exit_code;              /* its value */
     uint32_t sleep_ms;          /* Debug.SleepSeconds, clamped to TS_MAP_SLEEP_MAX_MS; 0 if absent,
@@ -125,11 +127,15 @@ typedef struct {
     size_t have;                /* body bytes received */
     uint8_t *buf;
     size_t cap;
-    int failed;
+    int failed;                 /* 0, or why feed failed (sticky): */
 } ts_map_stream;
 
+#define TS_MAP_STREAM_TOO_BIG 1  /* a declared length over TS_MAP_MSG_MAX */
+#define TS_MAP_STREAM_NOMEM 2    /* the buffer could not grow */
+
 void ts_map_stream_init(ts_map_stream *s, void (*msg)(void *, const char *, size_t), void *user);
-/* 0, or -1 (length over TS_MAP_MSG_MAX, out of memory, or an earlier error).
+/* 0, or -1 (length over TS_MAP_MSG_MAX, out of memory, or an earlier error;
+ * s->failed says which).
  * Calls msg once per complete message, in order, from inside this call. */
 int ts_map_stream_feed(ts_map_stream *s, const uint8_t *in, size_t n);
 void ts_map_stream_free(ts_map_stream *s);
