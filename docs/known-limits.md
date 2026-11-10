@@ -36,21 +36,69 @@ The compiler can remove such forcing without changing any result, so tests
 cannot catch it. Other BearSSL objects are not part of that check. The `i31`
 code uses 31-bit words, so this reasoning does not cover it.
 
-## Requirements on the TLS client (control-session Task 6)
+## TLS client configuration (control-session Task 6)
 
-`ts_tls` wraps `br_ssl_client_context`, and BearSSL's client defaults are not
-all covered by the evidence above. `BR_LOMUL` is only set on ARM Cortex-M, and
-PowerPC here is not `BR_64`, so the defaults on PowerPC include the items below.
-Task 6 must handle each one:
+`ts_tls` (src/net/tls.c) wraps `br_ssl_client_context`, and BearSSL's client
+defaults are not all covered by the evidence above. `BR_LOMUL` is only set on
+ARM Cortex-M, and PowerPC here is not `BR_64`. `ts_tls_start` therefore sets
+every implementation by hand rather than calling `br_ssl_client_init_full`.
+The same configuration applies on every target. `test_tls_config` in
+tests/test_net.c checks the engine's settings and the ClientHello it sends.
 
-- **Poly1305:** the default is `br_poly1305_ctmul_run`. Set
-  `br_poly1305_ctmul32_run` explicitly on PowerPC.
-- **GCM:** the default GHASH is `br_ghash_ctmul`, which uses the unforced `MUL`.
-  Decide whether to allow GCM suites on PowerPC, and with which GHASH.
-- **Curves:** the default is `br_ec_all_m31`. P-256 ephemeral scalars go through
-  `ec_p256_m31`, and P-384 and P-521 go through `ec_prime_i31`, which uses
-  31-bit words. Decide which curves to allow.
-- **Check:** add `ec_p256_m31.o` to `tools/check-ct.sh`, with a reviewed
-  allowance for the one `mulli` in `p256_mulgen`. That `mulli` appears to scale
-  a public loop counter to a `Gwin` row (72 bytes per row). This is inferred
-  from the source and has not been traced in the object code.
+- **Poly1305:** `br_poly1305_ctmul32_run` is set explicitly, and ChaCha20 is
+  `br_chacha20_ct_run`, which has no multiplies.
+- **GCM and the rest:** none configured. Only TLS 1.2
+  `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` and
+  `ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` are offered. No GCM, CCM, CBC or
+  DES record code or block cipher is set, so `br_ghash_ctmul` never runs. If the
+  server stops offering ChaCha20 or X25519, the client fails with "server does
+  not offer TLS 1.2 with ChaCha20-Poly1305 and X25519". It does not fall back.
+- **Curves:** the engine's EC implementation is `br_ec_c25519_m31` alone. The
+  ClientHello advertises only X25519, and BearSSL rejects any other curve the
+  server picks (`ssl_hs_client.c` checks `supported_curves`). The ephemeral
+  secret therefore only goes through code that check-ct covers.
+- **Signatures:** the engine hands its own EC implementation to the ECDSA
+  verifier for the ServerKeyExchange signature, and X25519 has no ECDSA. So
+  `ts_tls` installs a small verifier that ignores that argument and calls
+  `br_ecdsa_i31_vrfy_asn1` with `br_ec_all_m31`. The X.509 engine uses the same
+  pair, and `br_rsa_i31_pkcs1_vrfy` for RSA. This reads the X25519-only rule as
+  "X25519 for key exchange". Signature checks use whatever curve the certificate
+  has. `ec_p256_m31` and `ec_prime_i31` (P-384, used by ISRG Root X2 and its
+  intermediates) and the i31 RSA code therefore only run on public values: a
+  public key, a public signature and a hash of public handshake messages. The
+  client never signs (no client certificates) and never does ECDHE on those
+  curves.
+- **Check:** `ec_p256_m31.o` is not added to `tools/check-ct.sh`. Constant time
+  matters only where a secret enters, and no secret reaches P-256, P-384 or the
+  i31 code. The `mulli` in `p256_mulgen` is therefore irrelevant, as are the
+  `i31` multiplies. If a later change makes any of them handle a secret, such as
+  ECDHE on P-256 or a client certificate, this decision must be revisited first.
+
+Live checks (`tools/keyfetch_check.c`) on the host, Leopard and Tiger negotiate
+`ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` over X25519 with
+controlplane.tailscale.com. Its chain is RSA and reaches ISRG Root X1. Against
+letsencrypt.org they negotiate `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` with
+a P-256 leaf that chains to ISRG Root X2. This exercises the ECDSA verifier and
+P-384.
+
+Other accepted limits of the TLS client:
+
+- **The X25519 stack residue above also applies to TLS.** BearSSL's ECDHE calls
+  the same `api_mul`, so each connection's ephemeral scalar, clamped, stays on
+  the stack until it is reused. It is ephemeral and protects only that
+  connection.
+- **Two roots only.** `src/net/anchors.c` holds ISRG Root X1 and X2, generated
+  by `tools/gen_anchors.py` with their SHA-256 fingerprints pinned. The control
+  server's chain today runs leaf, YR2, ISRG Root YR, then Root YR cross-signed
+  by X1. If Let's Encrypt stops serving that cross-signed certificate, the newer
+  roots must be added: extend `ROOTS` in the script, review the pins and
+  regenerate.
+- **SHA-256, SHA-384 and SHA-512 only.** A chain signed with SHA-1 or SHA-224 is
+  rejected.
+- **Clock.** Certificate validity uses `time()`. An expired or not-yet-valid
+  certificate, or any certificate error while the clock reads earlier than
+  `ts_build_time` (the day anchors.c was generated), is reported as "system
+  clock is wrong".
+- **No session resumption.** Every connection does a full handshake, including
+  the RSA-4096 or P-384 chain checks. On the emulated G4 that takes about a
+  second.

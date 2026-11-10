@@ -9,6 +9,7 @@ void test_json(void);
 void test_hpack(void);
 void test_h2(void);
 void test_noise(void);
+void test_net(void);
 
 int main(void)
 {
@@ -21,5 +22,6 @@ int main(void)
     test_hpack();
     test_h2();
     test_noise();
+    test_net();
     return t_summary();
 }

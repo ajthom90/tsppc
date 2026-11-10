@@ -3,8 +3,9 @@
 # fuzzing of every parser, ASan + UBSan, aborting on any fault; set
 # TS_FUZZ_ITERS to change the 200000 iterations per target), ppc-test
 # (PowerPC, build only here; run the binary on a PowerPC Mac; also builds the
-# tun_check driver check tool, which tools/driver.sh runs). GNU make 3.81 and
-# /bin/sh compatible.
+# tun_check driver check tool, which tools/driver.sh runs, and the
+# keyfetch_check live TLS check), keyfetch-check (host build of keyfetch_check).
+# GNU make 3.81 and /bin/sh compatible.
 # New src/**/*.c files are picked up automatically.
 
 SHELL := /bin/sh
@@ -15,10 +16,13 @@ ALLTESTS := $(wildcard tests/*.c)
 BSRCS   := $(shell find $(BEARSSL)/src -name '*.c' | sort)
 
 ifeq ($(TARGET),)
-.PHONY: test asan ct-test ppc-test fuzz clean
+.PHONY: test asan ct-test ppc-test fuzz keyfetch-check clean
 test asan ct-test ppc-test:
-	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all $(if $(filter ppc-test,$@),build/ppc-test/tun_check)
+	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all $(if $(filter ppc-test,$@),build/ppc-test/tun_check build/ppc-test/keyfetch_check)
 	@./build/$@/test_all
+
+keyfetch-check:
+	@$(MAKE) --no-print-directory TARGET=test build/test/keyfetch_check
 
 fuzz:
 	@$(MAKE) --no-print-directory TARGET=fuzz build/fuzz/fuzz_all
@@ -130,6 +134,11 @@ CHECKOBJS := $(OBJDIR)/tools/tun_check.o $(OBJDIR)/src/core/bytes.o
 $(OBJDIR)/tun_check: $(CHECKOBJS)
 	$(CC) $(ARCH) -o $@ $(CHECKOBJS)
 
+KFOBJS := $(OBJDIR)/tools/keyfetch_check.o $(patsubst %.c,$(OBJDIR)/%.o,$(SRCS))
+
+$(OBJDIR)/keyfetch_check: $(KFOBJS) $(VOBJS)
+	$(CC) $(ARCH) $(SAN) -o $@ $(KFOBJS) $(VOBJS)
+
 $(OBJDIR)/%.o: %.c $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -138,5 +147,5 @@ $(VOBJDIR)/%.o: %.c $(VFLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(VFLAGS) -c -o $@ $<
 
--include $(OBJS:.o=.d) $(CHECKOBJS:.o=.d)
+-include $(OBJS:.o=.d) $(CHECKOBJS:.o=.d) $(OBJDIR)/tools/keyfetch_check.d
 endif
