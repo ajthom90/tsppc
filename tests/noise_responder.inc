@@ -75,9 +75,10 @@ static int responder(r_session *out, uint8_t resp[51], const uint8_t init[101],
     uint8_t control_pub[32], eph_pub[32], k[32], none[1];
     const uint8_t *re = init + 5;
 
-    if (ts_get_be16(init) != 150 || init[2] != 1 || ts_get_be16(init + 3) != 96) return -1;
+    /* As upstream's server: the prologue uses the version the client sent. */
+    if (init[2] != 1 || ts_get_be16(init + 3) != 96) return -1;
     ts_x25519_public(control_pub, control_priv);
-    r_init(&s, 150, control_pub);
+    r_init(&s, ts_get_be16(init), control_pub);
 
     /* -> e, es, s, ss */
     r_mix_hash(&s, re, 32);

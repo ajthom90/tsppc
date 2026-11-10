@@ -70,11 +70,9 @@ static void test_handshake(void)
     ts_noise n;
     r_session rs;
     uint8_t init[TS_NOISE_INIT_LEN], resp[TS_NOISE_RESP_LEN], mpub[32];
-    char prologue[40];
 
     t_true("noise: constants", TS_NOISE_INIT_LEN == 101 && TS_NOISE_RESP_LEN == 51 &&
                                TS_NOISE_MAX_PLAIN == 4077 && TS_CAPVER == 150);
-    snprintf(prologue, sizeof prologue, "v%d", TS_CAPVER);
 
     t_true("noise: init ok", ts_noise_init(&n, init, MACHINE, CONTROL_PUB, TS_CAPVER) == 0);
     t_hex("noise: init header", init, 5, "0096010060");
@@ -91,10 +89,17 @@ static void test_handshake(void)
            all_zero(n.ck, 32) && all_zero(n.e_priv, 32) && all_zero(n.s_priv, 32));
     t_true("noise: response twice fails", ts_noise_read_response(&n, resp) == -1);
 
-    /* The init is bound to the version argument. */
+    /* The version argument drives both the header and the prologue: a v149
+     * handshake completes, and the same init relabelled v150 does not. */
     t_true("noise: init v149", ts_noise_init(&n, init, MACHINE, CONTROL_PUB, 149) == 0);
     t_hex("noise: init v149 header", init, 5, "0095010060");
-    t_true("noise: v150 responder rejects v149", responder(&rs, resp, init, CONTROL, R_EPH) == -1);
+    t_true("noise: v149 responder accepts", responder(&rs, resp, init, CONTROL, R_EPH) == 0);
+    t_true("noise: v149 response ok", ts_noise_read_response(&n, resp) == 0 &&
+                                      memcmp(n.tx_key, rs.c1, 32) == 0 &&
+                                      memcmp(n.rx_key, rs.c2, 32) == 0);
+    t_true("noise: init v149", ts_noise_init(&n, init, MACHINE, CONTROL_PUB, 149) == 0);
+    ts_put_be16(init, 150);
+    t_true("noise: relabelled version rejected", responder(&rs, resp, init, CONTROL, R_EPH) == -1);
 
     /* Two inits use fresh ephemerals. */
     {
@@ -391,7 +396,7 @@ static void test_upgrade(void)
         t_true("upgrade: long headers still pending",
                ts_upgrade_response(huge, TS_UPGRADE_HEADER_MAX - 1, &consumed) == 1);
         memcpy(huge + TS_UPGRADE_HEADER_MAX - 2, "\r\n", 2);
-        memcpy(huge + 16, "Upgrade: tailscale-control-protocol\r\nX: ", 41);
+        memcpy(huge + 16, "Upgrade: tailscale-control-protocol\r\nX: ", 40);
         memcpy(huge + TS_UPGRADE_HEADER_MAX - 4, "\r\n", 2);
         t_true("upgrade: headers of exactly the limit",
                ts_upgrade_response(huge, sizeof huge, &consumed) == 0 &&

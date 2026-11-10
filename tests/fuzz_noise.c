@@ -255,7 +255,7 @@ void ts_fuzz_noise(void)
                                "Upgrade: tailscale-control-protocol\r\n"
                                "Connection: upgrade\r\n\r\n\x02\x00\x30";
     static const char s_200[] = "\x03HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
-    static const char s_early[] = "\x04\xff\xff\xffTS\x00\x00\x00\x0b{\"a\":\"b\"} \x00\x00\x06\x04";
+    static const char s_early[] = "\x04\xff\xff\xffTS\x00\x00\x00\x0a{\"a\":\"b\"} \x00\x00\x06\x04";
     static const char s_h2[] = "\x04\x00\x00\x06\x04\x00\x00\x00\x00\x00";
     const uint8_t *seeds[8];
     size_t lens[8], at = 1;
