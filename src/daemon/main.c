@@ -12,7 +12,7 @@
  * daemon does; otherwise it waits for `tsppc up`.
  *
  * In builds with -DTS_TEST_HOOKS only, TSPPC_CONTROL ("host" or "host:port";
- * with a port every control connection goes there, without TLS),
+ * with a port every control connection goes there, with TLS if it is 443),
  * TSPPC_STATE_DIR and TSPPC_SOCKET override the defaults. */
 #include <errno.h>
 #include <fcntl.h>
@@ -81,6 +81,7 @@ static struct {
     ts_sess *sess;
     int want_up;
     int logout_req;
+    int logout_here;                /* logged out before the session existed */
 
     /* The control connection. */
     int cphase;
@@ -166,12 +167,8 @@ static int io_connect(void *user, const char *host, uint16_t port)
 {
     (void)user;
     conn_close();
-    D.port = port;
-    D.use_tls = port == 443;
-    if (D.port_override) {
-        D.port = D.port_override;
-        D.use_tls = 0;
-    }
+    D.port = D.port_override ? D.port_override : port;
+    D.use_tls = D.port == 443;
     snprintf(D.chost, sizeof D.chost, "%s", host);
     if (ts_resolve_start(&D.res, host) != 0) {
         logline("cannot start the DNS lookup for control");
@@ -381,7 +378,11 @@ static void conn_events(fd_set *r, fd_set *w, unsigned gen_at_select)
         } else if (FD_ISSET(D.fd, r)) {
             conn_read();
         }
-        if (D.gen == gen_at_select && FD_ISSET(D.fd, w)) conn_flush();
+        if (D.gen != gen_at_select || !FD_ISSET(D.fd, w)) return;
+        conn_flush();
+        /* TLS records may wait to be sent with nothing queued here (or while
+         * the session pauses reading): push them, or select spins. */
+        if (D.gen == gen_at_select && D.tls && ts_tls_step(D.tls) < 0) conn_fail(ts_tls_error(D.tls));
         return;
     default:
         return;
@@ -486,11 +487,40 @@ static void get_view(view *v)
                  (long)((ms < 0 ? 0 : ms + 999) / 1000));
         snprintf(v->problem, sizeof v->problem, "%s", D.kf_err);
     }
+    if (!D.sess && D.logout_here) {
+        size_t n = strlen(v->status);
+        snprintf(v->status + n, sizeof v->status - n,
+                 "; logged out here; control was not reached, so the old key stays registered there until it expires");
+    }
     /* The wall clock, for this check only: no correct clock is before the build. */
     if (time(NULL) < ts_build_time && !strstr(v->problem, "system clock is wrong")) {
         size_t n = strlen(v->problem);
         snprintf(v->problem + n, sizeof v->problem - n, "%ssystem clock is wrong", n ? "; " : "");
     }
+}
+
+/* Logout before the session exists (no control key yet, so control cannot be
+ * told): forget the login in the saved state now, as ts_sess_logout does when
+ * control is unreachable. */
+static void forget_login_here(void)
+{
+    uint8_t k[32];
+    char err[256];
+    if (!D.st.have_login && !D.st.have_old_node) return;
+    if (ts_random_bytes(k, 32) == 0) {
+        ts_state_clamp_key(k);
+        memcpy(D.st.node_priv, k, 32);
+        ts_wipe(k, sizeof k);
+    }
+    ts_wipe(D.st.old_node_priv, 32);
+    D.st.have_old_node = 0;
+    D.st.have_login = 0;
+    if (ts_state_save(&D.st, D.state_dir, err, sizeof err) != 0) {
+        logline("cannot save the node state: %s", err);
+        return;
+    }
+    D.logout_here = 1;
+    logline("logged out here; control was not reached (no control key yet)");
 }
 
 static int have_login(void)
@@ -568,6 +598,7 @@ static void do_request(client *c, ts_ipc_cmd cmd)
     case TS_IPC_UP:
         D.want_up = 1;
         D.logout_req = 0;
+        D.logout_here = 0;
         if (D.sess) ts_sess_up(D.sess);
         else if (!D.kf_active) {
             D.kf_backoff = 0;           /* an operator's request retries now */
@@ -580,6 +611,7 @@ static void do_request(client *c, ts_ipc_cmd cmd)
         D.want_up = 0;
         D.logout_req = 1;
         if (D.sess) ts_sess_logout(D.sess);
+        else forget_login_here();
         logline("logout requested");
         break;
     default:

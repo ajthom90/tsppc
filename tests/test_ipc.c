@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "../src/daemon/ipc.h"
+#include "../src/state/store.h"
 
 /* Where the Makefile put tsppcd and tsppc for this target. */
 #ifndef TS_BIN_DIR
@@ -309,6 +310,7 @@ static void raw_request(const char *sock, const char *req, size_t n, char *out, 
 static void test_daemon(void)
 {
     char statedir[128], sock[128], logpath[128], out[4096], longreq[100];
+    ts_state saved, after;
     struct stat sb;
     pid_t pid;
     int rc, i, idle[TS_IPC_MAX_CLIENTS];
@@ -326,6 +328,16 @@ static void test_daemon(void)
     snprintf(sock, sizeof sock, "%s/sock", tmpdir);
     snprintf(logpath, sizeof logpath, "%s/log", tmpdir);
     setenv("TSPPC_SOCKET", sock, 1);
+
+    /* A saved login with an old key, for the logout check below. */
+    {
+        char err[256];
+        rc = ts_state_load_or_create(&saved, statedir, err, sizeof err);
+        saved.have_login = 1;
+        saved.have_old_node = 1;
+        memset(saved.old_node_priv, 0x42, 32);
+        t_true("daemon: saved login written", rc == 0 && ts_state_save(&saved, statedir, err, sizeof err) == 0);
+    }
 
     /* A path held by a regular file: refused, file kept. */
     rc = open(sock, O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -379,6 +391,20 @@ static void test_daemon(void)
         t_true("daemon: a silent client is closed after the timeout",
                mono_ms() - t0 >= TS_IPC_CLIENT_TIMEOUT_MS - 1000 && mono_ms() - t0 < TS_IPC_CLIENT_TIMEOUT_MS + 20000);
         if (fd >= 0) close(fd);
+    }
+
+    /* Logout while control cannot be reached (no control key): the login is
+     * forgotten here at once, and the CLI says control was not reached. */
+    raw_request(sock, "status\n", 7, out, sizeof out);
+    t_true("daemon: saved login shown", strstr(out, "\nlogin yes\n") != NULL);
+    rc = run_cli("logout", out, sizeof out);
+    t_true("daemon: logout without control succeeds", rc == 0 && strstr(out, "not reached") != NULL);
+    {
+        char err[256];
+        t_true("daemon: logout cleared the saved state",
+               ts_state_load_or_create(&after, statedir, err, sizeof err) == 0 && !after.have_login &&
+               !after.have_old_node && memcmp(after.node_priv, saved.node_priv, 32) != 0 &&
+               memcmp(after.machine_priv, saved.machine_priv, 32) == 0);
     }
 
     kill(pid, SIGTERM);

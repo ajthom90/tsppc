@@ -231,7 +231,9 @@ static int cmd_logout(void)
     for (;;) {
         field(&r, "login", login, sizeof login);
         if (strcmp(login, "no") == 0) {
-            printf("Logged out.\n");
+            field(&r, "status", status, sizeof status);
+            if (strstr(status, "not reached")) printf("%s\n", status);
+            else printf("Logged out.\n");
             return 0;
         }
         if (time(NULL) > until) {
