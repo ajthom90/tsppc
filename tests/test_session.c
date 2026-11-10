@@ -473,6 +473,46 @@ static void test_logout_not_logged_in(void)
     end();
 }
 
+/* The refresh of a saved login is answered with an AuthURL. */
+static void h_refresh_url(fake *f, fk_req *r)
+{
+    if (strcmp(r->path, "/machine/register") == 0) {
+        if (is_logout(r)) fk_reply(f, r, 200, "{}");
+        else if (!is_followup(r)) fk_reply(f, r, 200, "{\"AuthURL\":\"" URL2 "\"}");
+    }
+}
+
+/* Logged in on disk, the refresh needs a login (NEED_LOGIN), then logout: the
+ * saved key is still expired at control and the saved login is cleared. */
+static void test_logout_after_refresh_url(void)
+{
+    char nk[65], want[128];
+    uint8_t before[32];
+    fk_req *r;
+    fk_init(&F, S, HOSTINFO);
+    F.handler = h_refresh_url;
+    F.st.have_login = 1;
+    fk_start(&F, HOSTINFO);
+    memcpy(before, F.st.node_priv, 32);
+    key_hex(nk, before);
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("refresh url logout: NEED_LOGIN", ts_sess_get_state(S) == TS_SESS_NEED_LOGIN &&
+           ts_sess_login_url(S) != NULL);
+    ts_sess_logout(S);
+    fk_pump(&F);
+    r = fk_last(&F, "/machine/register");
+    t_true("refresh url logout: logout register sent", r && is_logout(r));
+    if (r) {
+        snprintf(want, sizeof want, "\"NodeKey\":\"nodekey:%s\"", nk);
+        t_true("refresh url logout: persisted key expired", has(r->body, want));
+    }
+    t_true("refresh url logout: login cleared and saved", F.nsave >= 1 && F.saved.have_login == 0 &&
+           !F.saved.have_old_node && memcmp(F.saved.node_priv, before, 32) != 0);
+    t_true("refresh url logout: IDLE, no URL", ts_sess_get_state(S) == TS_SESS_IDLE && ts_sess_login_url(S) == NULL);
+    end();
+}
+
 /* Approval arrives through the map. */
 static void h_unauth(fake *f, fk_req *r)
 {
@@ -1168,6 +1208,7 @@ void test_session(void)
     test_logout_not_logged_in();
     test_send_failure();
     test_refresh_on_start();
+    test_logout_after_refresh_url();
     test_followup_expired_loop();
     test_up_during_logout();
     test_approval();

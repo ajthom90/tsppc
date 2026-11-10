@@ -229,7 +229,10 @@ void ts_sess_tick(ts_sess *s, uint64_t now_ms);
 void ts_sess_up(ts_sess *s);
 /* Tell control to expire the current node key (register with Expiry in the far
  * past), then forget the login: a fresh node key, have_login cleared and saved,
- * IDLE. */
+ * IDLE. This happens whenever the session is logged in or the saved state
+ * holds a login (have_login), even in NEED_LOGIN after the refresh at start
+ * was answered with a login URL; until control answers, the logout is retried
+ * like any request. With neither, nothing is sent and the session goes IDLE. */
 void ts_sess_logout(ts_sess *s);
 
 ts_sess_state ts_sess_get_state(const ts_sess *s);

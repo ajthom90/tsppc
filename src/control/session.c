@@ -1036,8 +1036,11 @@ void ts_sess_up(ts_sess *s)
 
 void ts_sess_logout(ts_sess *s)
 {
-    if (!s->logged_in) {
-        /* Nothing registered: forget any login in progress. */
+    if (!s->logged_in && !s->st.have_login) {
+        /* Nothing registered: forget any login in progress. A saved login
+         * (have_login) is expired at control and cleared below even when the
+         * session is not logged in now, for instance when the refresh at
+         * start was answered with a login URL. */
         s->goal = GOAL_NONE;
         s->auth_url[0] = 0;
         s->regen = 0;
