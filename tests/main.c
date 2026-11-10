@@ -8,6 +8,7 @@ void test_encoding(void);
 void test_json(void);
 void test_hpack(void);
 void test_h2(void);
+void test_noise(void);
 
 int main(void)
 {
@@ -19,5 +20,6 @@ int main(void)
     test_json();
     test_hpack();
     test_h2();
+    test_noise();
     return t_summary();
 }
