@@ -16,7 +16,11 @@ stayed forced, and at -O1 neither did. The `mulli` that gcc-4.0 produced for
 The patch adds `br_ct_mul_operand`, which applies the OR and then passes the
 value through an empty `asm` statement. The optimizer cannot see through it,
 so the OR stays. The arithmetic is unchanged, so results are identical for
-all inputs. A constant operand now also goes through a real `mullw` with bit
-31 forced.
+all in-contract inputs. A constant operand now also goes through a real `mullw`
+with bit 31 forced.
+
+Forcing bit 31 does not protect every operand. `mullw` may treat operands as
+signed and finish early when the top bits are all ones, so operands must also
+keep bit 30 clear, as 30-bit limbs do. Code using 31-bit words is not covered.
 
 `tools/check-ct.sh` verifies the built objects on the VM.

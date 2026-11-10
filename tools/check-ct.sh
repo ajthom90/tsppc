@@ -6,12 +6,19 @@
 # Compilers can legally remove the OR that makes a multiply constant-time, and
 # every test still passes when they do, so this reads the code that was built.
 # Each mullw/mulhw/mulhwu must take both inputs from values with bit 31 forced
-# to 1. mulli and divides are rejected outright.
+# to 1. That is necessary but not sufficient (see below). mulli and divides are
+# rejected outright.
 #
 # It walks otool -tv output top to bottom in each function, tracking which
 # registers, r1-based stack words, lr and ctr have bit 31 forced by oris, lis,
 # ori or or.
 # It is a conservative screen, not a proof:
+# - It shows that bit 31 is set, not that bit 30 is clear. mullw may treat its
+#   operands as signed and finish early when the top bits are all ones, so an
+#   operand with bits 30..16 set (0xFFFFxxxx after the OR) is unsafe and still
+#   passes. The default objects are safe because their operands are 30-bit limbs
+#   or smaller, which comes from the source and not from this check. A pass on
+#   code with 31-bit words, such as BearSSL's i31 objects, shows nothing.
 # - It cannot see which values are secret, so it rejects every other multiply.
 # - It follows the listing in address order and carries state over branches, so
 #   a value forced on only one path into a multiply is reported as forced.
@@ -61,7 +68,7 @@ for obj in $OBJS; do
     }
     op ~ /^(mullw|mullwo|mulhw|mulhwu)$/ {
         muls++
-        if (!(a[2] in reg) || !(a[3] in reg)) bad("operand not forced to full width")
+        if (!(a[2] in reg) || !(a[3] in reg)) bad("operand bit 31 not forced")
         delete reg[a[1]]
         next
     }
@@ -102,7 +109,7 @@ for obj in $OBJS; do
     a[1] ~ /^r[0-9]+$/ { delete reg[a[1]] }
     END {
         if (muls == 0) { printf "check-ct: FAIL %s: no multiplies found\n", obj; fails++ }
-        if (fails == 0) printf "check-ct: ok %s: %d multiplies, all operands forced\n", obj, muls
+        if (fails == 0) printf "check-ct: ok %s: %d multiplies, bit 31 forced on all operands\n", obj, muls
         exit(fails != 0)
     }' || status=1
 done
