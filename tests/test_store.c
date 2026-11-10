@@ -339,6 +339,22 @@ static void test_parse(void)
     bad[5] = 2;
     ts_blake2s(bad + 136, bad, 136);
     t_true("parse: unknown version rejected", ts_state_parse(&b, bad, sizeof bad) != 0);
+    /* logout_pending (bit 2) round-trips, and never with have_login. */
+    a.logout_pending = 1;
+    ts_state_encode(buf, &a);
+    t_true("parse: logout_pending flag is bit 2", buf[7] == 4);
+    t_true("parse: logout_pending round trip", ts_state_parse(&b, buf, sizeof buf) == 0 && b.logout_pending == 1 &&
+           !b.have_login);
+    memcpy(bad, buf, sizeof buf);
+    bad[7] |= 2;
+    ts_blake2s(bad + 136, bad, 136);
+    t_true("parse: logout_pending with have_login rejected", ts_state_parse(&b, bad, sizeof bad) != 0);
+    memcpy(bad, buf, sizeof buf);
+    bad[7] |= 8;
+    ts_blake2s(bad + 136, bad, 136);
+    t_true("parse: bit 3 still reserved", ts_state_parse(&b, bad, sizeof bad) != 0);
+    a.logout_pending = 0;
+    ts_state_encode(buf, &a);
     t_true("parse: failure zeroes output", !nonzero(b.machine_priv) && !nonzero(b.node_priv) && !b.have_login);
     t_true("parse: short", ts_state_parse(&b, buf, sizeof buf - 1) != 0);
     t_true("parse: empty", ts_state_parse(&b, buf, 0) != 0);

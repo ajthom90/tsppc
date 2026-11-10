@@ -42,6 +42,8 @@ static void check(const uint8_t *data, size_t len)
     TS_FUZZ_ASSERT(len == TS_STATE_FILE_LEN);
     TS_FUZZ_ASSERT(s.have_old_node == 0 || s.have_old_node == 1);
     TS_FUZZ_ASSERT(s.have_login == 0 || s.have_login == 1);
+    TS_FUZZ_ASSERT(s.logout_pending == 0 || s.logout_pending == 1);
+    TS_FUZZ_ASSERT(!(s.logout_pending && s.have_login));
     TS_FUZZ_ASSERT(s.have_old_node || all_zero(s.old_node_priv, 32));
     ts_state_encode(enc, &s);
     TS_FUZZ_ASSERT(memcmp(enc, data, len) == 0);
@@ -50,9 +52,10 @@ static void check(const uint8_t *data, size_t len)
 
 void ts_fuzz_store(void)
 {
-    static uint8_t seed_a[TS_STATE_FILE_LEN], seed_b[TS_STATE_FILE_LEN], seed_c[TS_STATE_FILE_LEN];
-    const uint8_t *seeds[3];
-    size_t lens[3], i;
+    static uint8_t seed_a[TS_STATE_FILE_LEN], seed_b[TS_STATE_FILE_LEN], seed_c[TS_STATE_FILE_LEN],
+        seed_d[TS_STATE_FILE_LEN];
+    const uint8_t *seeds[4];
+    size_t lens[4], i;
     ts_state s;
 
     memset(&s, 0, sizeof s);
@@ -66,11 +69,15 @@ void ts_fuzz_store(void)
     s.have_old_node = 1;
     s.have_login = 1;
     ts_state_encode(seed_b, &s);
+    /* A logout not yet confirmed by control. */
+    s.have_login = 0;
+    s.logout_pending = 1;
+    ts_state_encode(seed_d, &s);
     /* A structurally invalid image with a correct checksum: reserved flag. */
     memcpy(seed_c, seed_a, sizeof seed_c);
     seed_c[7] = 0x80;
     ts_blake2s(seed_c + 136, seed_c, 136);
-    seeds[0] = seed_a; seeds[1] = seed_b; seeds[2] = seed_c;
-    for (i = 0; i < 3; i++) lens[i] = TS_STATE_FILE_LEN;
-    ts_fuzz_run("store", target, seeds, lens, 3, TS_FUZZ_DEFAULT_ITERS);
+    seeds[0] = seed_a; seeds[1] = seed_b; seeds[2] = seed_c; seeds[3] = seed_d;
+    for (i = 0; i < 4; i++) lens[i] = TS_STATE_FILE_LEN;
+    ts_fuzz_run("store", target, seeds, lens, 4, TS_FUZZ_DEFAULT_ITERS);
 }

@@ -15,7 +15,8 @@
  * File format (all integers big-endian), TS_STATE_FILE_LEN bytes:
  *   0   4  magic "TSPS"
  *   4   2  version (1)
- *   6   2  flags: bit 0 have_old_node, bit 1 have_login; other bits must be 0
+ *   6   2  flags: bit 0 have_old_node, bit 1 have_login, bit 2 logout_pending
+ *          (never with have_login); other bits must be 0
  *  8  32  machine private key
  *  40 32  node private key
  *  72 32  old node private key (all zero unless have_old_node)
@@ -53,6 +54,9 @@ typedef struct {
     uint8_t disco_priv[32];
     int have_old_node;
     int have_login;
+    /* A logout was started and control has not confirmed it: node_priv is
+     * the key to expire at control, and must never log in again. */
+    int logout_pending;
 } ts_state;
 
 /* Clamp 32 random bytes into an X25519 private key, as every key in the state
