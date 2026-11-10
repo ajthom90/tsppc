@@ -63,6 +63,9 @@ VOBJS   := $(patsubst %.c,$(VOBJDIR)/%.o,$(BSRCS))
 # Each object depends on a stamp holding the compiler and flags it was built
 # with. The stamp is rewritten only when that text changes, so a changed flag
 # rebuilds the objects even where stale ones are kept (build/vendor-ppc on the VM).
+# Vendor objects have no dependency files, so the vendor stamp also holds a
+# checksum of the vendored headers: a patched header rebuilds them.
+VHEADERSUM := $(shell cat $(sort $(wildcard $(BEARSSL)/inc/*.h $(BEARSSL)/src/*.h)) | cksum)
 FLAGSTAMP  := $(OBJDIR)/.flags
 VFLAGSTAMP := $(VOBJDIR)/.flags
 
@@ -78,7 +81,7 @@ $(FLAGSTAMP): FORCE
 	@$(call update_stamp,$(CC) $(CFLAGS))
 
 $(VFLAGSTAMP): FORCE
-	@$(call update_stamp,$(CC) $(VFLAGS))
+	@$(call update_stamp,$(CC) $(VFLAGS) headers $(VHEADERSUM))
 
 $(OBJDIR)/test_all: $(OBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(OBJS) $(VOBJS)

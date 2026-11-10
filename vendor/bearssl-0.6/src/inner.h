@@ -926,6 +926,24 @@ MAX(uint32_t x, uint32_t y)
  */
 #define MUL(x, y)   ((uint64_t)(x) * (uint64_t)(y))
 
+#if BR_CT_MUL15 || BR_CT_MUL31
+
+/*
+ * tsppc patch (see PATCHES.md): set the top bit of a multiply operand so
+ * that the multiplier always sees a full-width value. The empty asm hides
+ * the result from the optimizer: without it gcc-4.0 removes the OR from
+ * operands whose top bit cannot reach the bits that are kept.
+ */
+static inline uint32_t
+br_ct_mul_operand(uint32_t x)
+{
+	x |= (uint32_t)0x80000000;
+	__asm__ ("" : "+r" (x));
+	return x;
+}
+
+#endif
+
 #if BR_CT_MUL31
 
 /*
@@ -941,8 +959,8 @@ MAX(uint32_t x, uint32_t y)
  * word, and then replace automatically the unsigned multiplication with
  * a signed multiplication opcode.
  */
-#define MUL31(x, y)   ((uint64_t)((x) | (uint32_t)0x80000000) \
-                       * (uint64_t)((y) | (uint32_t)0x80000000) \
+#define MUL31(x, y)   ((uint64_t)br_ct_mul_operand(x) \
+                       * (uint64_t)br_ct_mul_operand(y) \
                        - ((uint64_t)(x) << 31) - ((uint64_t)(y) << 31) \
                        - ((uint64_t)1 << 62))
 static inline uint32_t
@@ -951,10 +969,10 @@ MUL31_lo(uint32_t x, uint32_t y)
 	uint32_t xl, xh;
 	uint32_t yl, yh;
 
-	xl = (x & 0xFFFF) | (uint32_t)0x80000000;
-	xh = (x >> 16) | (uint32_t)0x80000000;
-	yl = (y & 0xFFFF) | (uint32_t)0x80000000;
-	yh = (y >> 16) | (uint32_t)0x80000000;
+	xl = br_ct_mul_operand(x & 0xFFFF);
+	xh = br_ct_mul_operand(x >> 16);
+	yl = br_ct_mul_operand(y & 0xFFFF);
+	yh = br_ct_mul_operand(y >> 16);
 	return (xl * yl + ((xl * yh + xh * yl) << 16)) & (uint32_t)0x7FFFFFFF;
 }
 
@@ -980,8 +998,7 @@ MUL31_lo(uint32_t x, uint32_t y)
  * multiplication is not constant-time.
  */
 #if BR_CT_MUL15
-#define MUL15(x, y)   (((uint32_t)(x) | (uint32_t)0x80000000) \
-                       * ((uint32_t)(y) | (uint32_t)0x80000000) \
+#define MUL15(x, y)   (br_ct_mul_operand(x) * br_ct_mul_operand(y) \
 		       & (uint32_t)0x7FFFFFFF)
 #else
 #define MUL15(x, y)   ((uint32_t)(x) * (uint32_t)(y))

@@ -19,9 +19,9 @@
 
 /* Same layout and carry handling as BearSSL's poly1305_ctmul32. Like BearSSL's
  * MUL15, TS_MUL15 sets both operands' top bits so the multiplier always sees
- * full-width values. BearSSL then masks the product to 31 bits, but gcc-4.0
- * works out that the top bits cannot reach a masked result and deletes the
- * ORs. Here bit 31 is cancelled by XOR instead: it equals bit 0 of x ^ y, so
+ * full-width values. Upstream BearSSL then masks the product to 31 bits, but
+ * gcc-4.0 works out that the top bits cannot reach a masked result and deletes
+ * the ORs. Here bit 31 is cancelled by XOR instead: it equals bit 0 of x ^ y, so
  * the ORs stay necessary. The result is x * y as long as that is below 2^31:
  * the operands' bit lengths must sum to at most 31. Here a[] uses at most 15
  * bits and r[] at most 16 (a 13-bit limb times 5). */

@@ -39,5 +39,10 @@ int ts_x25519(uint8_t out[32], const uint8_t priv[32], const uint8_t pub[32])
 void ts_x25519_public(uint8_t out[32], const uint8_t priv[32])
 {
     const br_ec_impl *ec = &br_ec_c25519_m31;
-    ec->mulgen(out, priv, 32, BR_EC_curve25519);
+    uint8_t scalar[32];
+
+    /* Read the scalar first: out may alias priv. */
+    memcpy(scalar, priv, 32);
+    ec->mulgen(out, scalar, 32, BR_EC_curve25519);
+    ts_wipe(scalar, sizeof scalar);
 }
