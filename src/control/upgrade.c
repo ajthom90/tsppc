@@ -4,6 +4,7 @@
 
 #include "../core/bytes.h"
 #include "../proto/encoding.h"
+#include "../proto/json.h"
 
 static const char UPGRADE_VALUE[] = "tailscale-control-protocol";
 static const uint8_t EARLY_MAGIC[5] = { 0xff, 0xff, 0xff, 'T', 'S' };
@@ -23,6 +24,7 @@ size_t ts_upgrade_request(char *out, size_t cap, const char *host,
     static const char l1[] = "POST /ts2021 HTTP/1.1\r\nHost: ";
     static const char l2[] = "\r\nUpgrade: tailscale-control-protocol\r\n"
                              "Connection: upgrade\r\n"
+                             "Content-Length: 0\r\n"
                              "X-Tailscale-Handshake: ";
     static const char l3[] = "\r\n\r\n";
     char b64[4 * ((TS_NOISE_INIT_LEN + 2) / 3) + 1];
@@ -87,7 +89,7 @@ int ts_upgrade_response(const char *buf, size_t len, size_t *consumed)
 {
     size_t scan = len < TS_UPGRADE_HEADER_MAX ? len : TS_UPGRADE_HEADER_MAX;
     size_t eol, at;
-    int upgrade_ok = 0;
+    int upgrade_ok = 0, upgrade_seen = 0;
 
     *consumed = 0;
     /* Decide on the status line as soon as it is complete. */
@@ -104,7 +106,9 @@ int ts_upgrade_response(const char *buf, size_t len, size_t *consumed)
         if (eol == at) break;
         for (colon = at; colon < eol && buf[colon] != ':'; colon++) {}
         if (colon == eol || colon == at) return -1;
-        if (colon - at == 7 && ieq(buf + at, "upgrade", 7)) {
+        /* The first Upgrade header decides, as Go's Header.Get does. */
+        if (!upgrade_seen && colon - at == 7 && ieq(buf + at, "upgrade", 7)) {
+            upgrade_seen = 1;
             for (vs = colon + 1; vs < eol && is_ows(buf[vs]); vs++) {}
             for (ve = eol; ve > vs && is_ows(buf[ve - 1]); ve--) {}
             upgrade_ok = ve - vs == sizeof UPGRADE_VALUE - 1 &&
@@ -115,6 +119,19 @@ int ts_upgrade_response(const char *buf, size_t len, size_t *consumed)
     if (!upgrade_ok) return -1;
     *consumed = eol + 2;
     return 0;
+}
+
+/* One complete JSON value, optionally surrounded by whitespace. */
+static int is_json(const char *p, size_t n)
+{
+    ts_json j;
+    ts_json_tok t;
+    ts_json_type ty;
+
+    ts_json_init(&j, p, n);
+    do ty = ts_json_next(&j, &t);
+    while (ty != TS_JSON_END && ty != TS_JSON_ERROR);
+    return ty == TS_JSON_END;
 }
 
 int ts_early_payload(const uint8_t *buf, size_t len, size_t *consumed)
@@ -129,6 +146,7 @@ int ts_early_payload(const uint8_t *buf, size_t len, size_t *consumed)
     plen = ts_get_be32(buf + 5);
     if (plen > TS_EARLY_PAYLOAD_MAX) return -1;
     if (len - 9 < plen) return 1;
+    if (!is_json((const char *)buf + 9, plen)) return -1;
     *consumed = 9 + (size_t)plen;
     return 0;
 }

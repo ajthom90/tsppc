@@ -265,6 +265,7 @@ int ts_noise_feed(ts_noise *n, const uint8_t *in, size_t len,
         n->rx_ctr++;
         n->rlen = 0;
         if (ctlen > 16) deliver(user, n->rbuf + 3, ctlen - 16);
+        ts_wipe(n->rbuf, 3 + ctlen);   /* no plaintext left behind */
         if (n->state != TS_NOISE_READY) return -1;   /* cleared from the callback */
     }
     return 0;

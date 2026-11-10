@@ -105,8 +105,8 @@ static void test_handshake(void)
     {
         ts_noise a, b;
         uint8_t i1[TS_NOISE_INIT_LEN], i2[TS_NOISE_INIT_LEN];
-        ts_noise_init(&a, i1, MACHINE, CONTROL_PUB, TS_CAPVER);
-        ts_noise_init(&b, i2, MACHINE, CONTROL_PUB, TS_CAPVER);
+        t_true("noise: init a", ts_noise_init(&a, i1, MACHINE, CONTROL_PUB, TS_CAPVER) == 0);
+        t_true("noise: init b", ts_noise_init(&b, i2, MACHINE, CONTROL_PUB, TS_CAPVER) == 0);
         t_true("noise: random ephemerals differ", memcmp(i1 + 5, i2 + 5, 32) != 0);
         ts_noise_clear(&a);
         ts_noise_clear(&b);
@@ -123,15 +123,16 @@ static void test_wrong_key(void)
     sink_t s;
 
     /* Same machine key and ephemeral; only the control key differs. */
-    ts_noise_init_eph(&good, ig, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH);
-    ts_noise_init_eph(&bad, ib, MACHINE, OTHER_PUB, TS_CAPVER, C_EPH);
+    t_true("noise: init good", ts_noise_init_eph(&good, ig, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH) == 0);
+    t_true("noise: init bad", ts_noise_init_eph(&bad, ib, MACHINE, OTHER_PUB, TS_CAPVER, C_EPH) == 0);
     t_true("noise: same ephemeral", memcmp(ig + 5, ib + 5, 32) == 0);
     t_true("noise: responder rejects init for another key",
            responder(&rs, resp, ib, CONTROL, R_EPH) == -1);
     t_true("noise: good responds", responder(&rs, resp, ig, CONTROL, R_EPH) == 0);
     t_true("noise: wrong control key fails", ts_noise_read_response(&bad, resp) == -1);
     t_true("noise: failure wipes", all_zero(bad.s_priv, 32) && all_zero(bad.e_priv, 32) &&
-                                   all_zero(bad.ck, 32) && all_zero(bad.rx_key, 32));
+                                   all_zero(bad.ck, 32) && all_zero(bad.rx_key, 32) &&
+                                   all_zero(bad.tx_key, 32));
     t_true("noise: failed session cannot seal", ts_noise_seal(&bad, resp, sizeof resp,
                                                               (const uint8_t *)"x", 1) == 0);
     memset(&s, 0, sizeof s);
@@ -139,20 +140,20 @@ static void test_wrong_key(void)
     t_true("noise: right key succeeds", ts_noise_read_response(&good, resp) == 0);
 
     /* Response tampering. */
-    ts_noise_init_eph(&good, ig, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH);
+    t_true("noise: reinit", ts_noise_init_eph(&good, ig, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH) == 0);
     resp[50] ^= 1;
     t_true("noise: bad response tag fails", ts_noise_read_response(&good, resp) == -1);
     resp[50] ^= 1;
-    ts_noise_init_eph(&good, ig, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH);
+    t_true("noise: reinit", ts_noise_init_eph(&good, ig, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH) == 0);
     resp[0] = 3;
     t_true("noise: error frame instead of response fails", ts_noise_read_response(&good, resp) == -1);
     resp[0] = 2;
-    ts_noise_init_eph(&good, ig, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH);
+    t_true("noise: reinit", ts_noise_init_eph(&good, ig, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH) == 0);
     resp[2] = 47;
     t_true("noise: bad response length fails", ts_noise_read_response(&good, resp) == -1);
     resp[2] = 48;
     /* A low-order point as the response ephemeral (all zero). */
-    ts_noise_init_eph(&good, ig, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH);
+    t_true("noise: reinit", ts_noise_init_eph(&good, ig, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH) == 0);
     memset(low, 0, sizeof low);
     memcpy(resp + 3, low, 32);
     t_true("noise: low-order response ephemeral fails", ts_noise_read_response(&good, resp) == -1);
@@ -193,6 +194,7 @@ static void test_records(void)
     r1 = r_seal(rec, rs.c2, 1, 0, (const uint8_t *)"defg", 4);
     t_true("noise: feed record 1", ts_noise_feed(&n, rec, r1, sink, &s) == 0);
     t_true("noise: delivered", s.len == 7 && memcmp(s.buf, "abcdefg", 7) == 0 && s.calls == 2);
+    t_true("noise: delivered plaintext wiped", n.rlen == 0 && all_zero(n.rbuf, sizeof n.rbuf));
     /* An empty record is authentic but delivers nothing. */
     r1 = r_seal(rec, rs.c2, 2, 0, NULL, 0);
     t_true("noise: empty record", ts_noise_feed(&n, rec, r1, sink, &s) == 0 && s.calls == 2);
@@ -212,7 +214,7 @@ static void test_large(void)
     int ok = 1;
 
     for (i = 0; i < sizeof big; i++) big[i] = (uint8_t)(i * 31 + 7);
-    establish(&n, &rs);
+    t_true("noise: establish", establish(&n, &rs) == 0);
     len = ts_noise_seal(&n, out, sizeof out, big, sizeof big);
     t_true("noise: 10000 bytes in three records", len == sizeof big + 3 * 19);
     while (at < len) {
@@ -246,7 +248,7 @@ static void test_split(void)
     uint64_t ctr;
 
     for (i = 0; i < sizeof pt; i++) pt[i] = (uint8_t)(i ^ 0x5a);
-    establish(&n, &rs);
+    t_true("noise: establish", establish(&n, &rs) == 0);
     for (ctr = 0; ctr < sizeof sizes / sizeof sizes[0]; ctr++)
         len += r_seal(stream + len, rs.c2, ctr, 0, pt, sizes[ctr]);
     m = n;
@@ -274,7 +276,7 @@ static void test_bad_records(void)
     sink_t s;
     static const uint8_t errframe[] = { 3, 0, 5, 'n', 'o', 'p', 'e', '!' };
 
-    establish(&base, &rs);
+    t_true("noise: establish", establish(&base, &rs) == 0);
     memset(&s, 0, sizeof s);
 
     n = base;
@@ -282,6 +284,8 @@ static void test_bad_records(void)
     rec[5] ^= 0x04;
     t_true("noise: flipped bit fails", ts_noise_feed(&n, rec, len, sink, &s) == -1 && s.calls == 0);
     rec[5] ^= 0x04;
+    t_true("noise: bad record wipes keys", n.state == TS_NOISE_FAILED &&
+                                           all_zero(n.tx_key, 32) && all_zero(n.rx_key, 32));
     t_true("noise: dead after failure", ts_noise_feed(&n, rec, len, sink, &s) == -1 && s.calls == 0);
 
     n = base;
@@ -321,10 +325,10 @@ static void test_bad_records(void)
     {
         ts_noise fresh;
         uint8_t init[TS_NOISE_INIT_LEN];
-        ts_noise_init_eph(&fresh, init, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH);
+        t_true("noise: fresh init", ts_noise_init_eph(&fresh, init, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH) == 0);
         t_true("noise: feed before established fails",
                ts_noise_feed(&fresh, errframe, 3, sink, &s) == -1);
-        ts_noise_init_eph(&fresh, init, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH);
+        t_true("noise: fresh init", ts_noise_init_eph(&fresh, init, MACHINE, CONTROL_PUB, TS_CAPVER, C_EPH) == 0);
         t_true("noise: seal before established fails",
                ts_noise_seal(&fresh, rec, sizeof rec, (const uint8_t *)"a", 1) == 0);
         ts_noise_clear(&fresh);
@@ -352,6 +356,7 @@ static void test_upgrade(void)
              "Host: control.example\r\n"
              "Upgrade: tailscale-control-protocol\r\n"
              "Connection: upgrade\r\n"
+             "Content-Length: 0\r\n"
              "X-Tailscale-Handshake: %s\r\n"
              "\r\n", b64);
     len = ts_upgrade_request(req, sizeof req, "control.example", init);
@@ -382,6 +387,16 @@ static void test_upgrade(void)
            ts_upgrade_response("HTTP/1.1 200 OK\r\n", 17, &consumed) == -1);
     t_true("upgrade: 101 without Upgrade header",
            ts_upgrade_response("HTTP/1.1 101 x\r\n\r\n", 18, &consumed) == -1);
+    {
+        static const char first[] = "HTTP/1.1 101 x\r\nUpgrade: tailscale-control-protocol\r\n"
+                                    "Upgrade: websocket\r\n\r\n";
+        static const char second[] = "HTTP/1.1 101 x\r\nUpgrade: websocket\r\n"
+                                     "Upgrade: tailscale-control-protocol\r\n\r\n";
+        t_true("upgrade: first Upgrade header wins",
+               ts_upgrade_response(first, sizeof first - 1, &consumed) == 0);
+        t_true("upgrade: later Upgrade header ignored",
+               ts_upgrade_response(second, sizeof second - 1, &consumed) == -1);
+    }
     t_true("upgrade: 101 to another protocol",
            ts_upgrade_response("HTTP/1.1 101 x\r\nUpgrade: websocket\r\n\r\n", 38, &consumed) == -1);
     t_true("upgrade: not HTTP", ts_upgrade_response("SSH-2.0-x\r\n\r\n", 13, &consumed) == -1);
@@ -434,7 +449,16 @@ static void test_early(void)
     ts_put_be32(buf + 5, 65536);
     t_true("early: 64 KiB waits", ts_early_payload(buf, 20, &consumed) == 1);
     ts_put_be32(buf + 5, 0);
-    t_true("early: empty payload", ts_early_payload(buf, 9, &consumed) == 0 && consumed == 9);
+    t_true("early: empty payload is not JSON", ts_early_payload(buf, 9, &consumed) == -1);
+    ts_put_be32(buf + 5, 3);
+    memcpy(buf + 9, "{a}", 3);
+    t_true("early: invalid JSON", ts_early_payload(buf, 12, &consumed) == -1 && consumed == 0);
+    t_true("early: invalid JSON waits until complete", ts_early_payload(buf, 11, &consumed) == 1);
+    ts_put_be32(buf + 5, 5);
+    memcpy(buf + 9, "{} {}", 5);
+    t_true("early: trailing data", ts_early_payload(buf, 14, &consumed) == -1);
+    memcpy(buf + 9, " {} \n", 5);
+    t_true("early: surrounding whitespace", ts_early_payload(buf, 14, &consumed) == 0 && consumed == 14);
 }
 
 void test_noise(void)

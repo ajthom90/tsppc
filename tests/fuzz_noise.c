@@ -225,7 +225,13 @@ static void do_early(const uint8_t *d, size_t len)
         if (k > len) continue;
         prc = ts_early_payload(d, k, &pc);
         if (rc == 1) TS_FUZZ_ASSERT(prc == 1);
-        else if (rc == -1) TS_FUZZ_ASSERT(k >= 9 ? prc == -1 : prc == 1);
+        else if (rc == -1) {
+            /* Oversized: known at 9 bytes. Bad JSON: known once complete. */
+            uint32_t plen = len >= 9 ? ts_get_be32(d + 5) : 0;
+            if (k < 9) TS_FUZZ_ASSERT(prc == 1);
+            else if (plen > TS_EARLY_PAYLOAD_MAX) TS_FUZZ_ASSERT(prc == -1);
+            else TS_FUZZ_ASSERT(k - 9 < plen ? prc == 1 : prc == -1);
+        }
         else if (c > 0) TS_FUZZ_ASSERT(k >= c ? prc == 0 && pc == c : prc == 1);
         else TS_FUZZ_ASSERT((prc == 0 && pc == 0) || prc == 1);
     }
