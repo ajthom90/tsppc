@@ -17,8 +17,11 @@ enum {
 
 #define DEFAULT_WINDOW 65535
 #define WINDOW_LIMIT 0x7fffffffLL           /* 2^31 - 1 */
-#define FRAME_SIZE_LIMIT 16777215u
+#define FRAME_SIZE_LIMIT 16777215u          /* RFC 9113 6.5.2 upper bound for MAX_FRAME_SIZE */
+#define FRAME_SIZE_MIN 16384u               /* RFC 9113 6.5.2 lower bound for MAX_FRAME_SIZE */
+#ifndef CREDIT_THRESHOLD
 #define CREDIT_THRESHOLD (TS_H2_WINDOW / 4)  /* send WINDOW_UPDATE once this much is owed */
+#endif
 #define OUT_RESERVE 4096                    /* output kept free of DATA for control frames */
 #define NAME_MAX_LEN 255                    /* request header name, before lowercasing */
 
@@ -294,7 +297,7 @@ int ts_h2_request(ts_h2 *c, uint32_t *sid, const char *method, const char *path,
     }
     if (bl == 0) return -1;
     /* TS_H2_REQ_HDR_MAX never exceeds the minimum MAX_FRAME_SIZE, so one HEADERS frame. */
-    if (9 + bl > TS_H2_OUT_MAX - c->out_len) return -1;
+    if (c->out_len + OUT_RESERVE + 9 + bl > TS_H2_OUT_MAX) return -1;
 
     memset(s, 0, sizeof *s);
     s->id = c->next_id;
@@ -513,7 +516,7 @@ static int on_settings(ts_h2 *c, unsigned flags, uint32_t sid, const uint8_t *p,
             c->peer_init_win = v;
             break;
         case S_MAX_FRAME_SIZE:
-            if (v < TS_H2_FRAME_MAX || v > FRAME_SIZE_LIMIT) return fail(c, TS_H2_PROTOCOL_ERROR);
+            if (v < FRAME_SIZE_MIN || v > FRAME_SIZE_LIMIT) return fail(c, TS_H2_PROTOCOL_ERROR);
             c->peer_max_frame = v;
             break;
         case S_HEADER_TABLE_SIZE:   /* our encoder never indexes */
@@ -649,7 +652,7 @@ int ts_h2_feed(ts_h2 *c, const uint8_t *in, size_t n)
         }
         c->fh_len = 0;
         if (process(c) != 0 || c->dead) return -1;
+        flush_credit(c);
     }
-    flush_credit(c);
     return 0;
 }

@@ -61,6 +61,11 @@
  *   - header fires once per regular field of the response header block, in
  *     order. Pseudo-header fields are not passed to it. A block whose :status
  *     is 1xx (informational) is decoded and dropped: no callbacks.
+ *     Because a block is decoded and checked as a whole, header calls can
+ *     arrive before the block is known to be valid (a later fault still fails
+ *     the stream or connection): act on fields only after headers fires. Field
+ *     names are passed through without RFC 9113 8.2 validation (uppercase,
+ *     connection-specific fields and the like are not rejected), by decision.
  *   - headers fires once, after the header calls for the final (non-1xx)
  *     response header block, with its :status (200..599).
  *   - data fires once per DATA frame with a non-empty payload, padding removed.

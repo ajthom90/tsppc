@@ -54,6 +54,8 @@ SAN    := -fsanitize=address,undefined -fno-omit-frame-pointer
 else ifeq ($(TARGET),fuzz)
 # Undefined behaviour must abort, not just print, so the harness reports it.
 SAN    := -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+# A small HTTP/2 credit threshold makes WINDOW_UPDATE emission reachable by short inputs.
+FZDEF  := -DCREDIT_THRESHOLD=64
 else
 SAN    :=
 endif
@@ -69,7 +71,7 @@ TESTS  := $(filter-out tests/fuzz%,$(ALLTESTS))
 endif
 
 OPT    := -O1 -g
-CFLAGS := $(ARCH) $(CTMUL) -DTS_TEST_HOOKS $(OPT) $(SAN) -Wall -Wextra -Werror -MMD -MP -I. -I$(BEARSSL)/inc
+CFLAGS := $(ARCH) $(CTMUL) $(FZDEF) -DTS_TEST_HOOKS $(OPT) $(SAN) -Wall -Wextra -Werror -MMD -MP -I. -I$(BEARSSL)/inc
 VFLAGS := $(ARCH) $(CTMUL) $(VSAN) -O2 -w -I$(BEARSSL)/inc -I$(BEARSSL)/src
 
 OBJDIR  := build/$(TARGET)

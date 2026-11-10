@@ -402,7 +402,7 @@ static void test_informational_trailers(void)
     (void)ts_h2_request(c, &sid, "GET", "/", "a", NULL, 0, NULL, 0);
     (void)feed_settings(c, &w, NULL, 0);
     t_true("response without :status", feed_frame(c, &w, H2S_HEADERS, H2S_END_HEADERS, 1, blk, bl) == -1);
-    t_true("nothing delivered after error", r.n == 0 || strstr(r.log, "H1") == NULL);
+    t_true("nothing delivered after error", r.n == 0);
     del_conn(c, &w);
 }
 
@@ -784,6 +784,63 @@ static void test_errors(void)
     (void)feed_settings(c, &w, NULL, 0);
     t_true("zero WINDOW_UPDATE", feed_u32(c, &w, H2S_WINDOW, 0, 0) == -1);
     del_conn(c, &w);
+
+    /* Pinned flow-control and settings error codes. */
+    c = new_conn(&r, &w);
+    (void)ts_h2_request(c, &sid, "GET", "/", "a", NULL, 0, NULL, 0);
+    (void)feed_settings(c, &w, NULL, 0);
+    t_true("stream WINDOW_UPDATE of 0", feed_u32(c, &w, H2S_WINDOW, 1, 0) == -1 && ts_h2_error(c) == 1);
+    del_conn(c, &w);
+
+    c = new_conn(&r, &w);
+    (void)ts_h2_request(c, &sid, "GET", "/", "a", NULL, 0, NULL, 0);
+    (void)feed_settings(c, &w, NULL, 0);
+    t_true("stream send window overflow", feed_u32(c, &w, H2S_WINDOW, 1, 0x7fffffffu) == -1 && ts_h2_error(c) == 3);
+    del_conn(c, &w);
+
+    {
+        static const uint32_t bigwin[] = { 4, 0x7fffffffu };
+        c = new_conn(&r, &w);
+        (void)ts_h2_request(c, &sid, "GET", "/", "a", NULL, 0, NULL, 0);
+        (void)feed_settings(c, &w, NULL, 0);
+        t_true("stream credited", feed_u32(c, &w, H2S_WINDOW, 1, 1000) == 0);
+        t_true("retroactive INITIAL_WINDOW_SIZE overflow", feed_settings(c, &w, bigwin, 1) == -1 && ts_h2_error(c) == 3);
+        del_conn(c, &w);
+    }
+
+    /* DATA that fits the stream window but not the connection window. */
+    c = new_conn(&r, &w);
+    r.quiet = 1;
+    (void)ts_h2_request(c, &sid, "GET", "/", "a", NULL, 0, NULL, 0);
+    (void)ts_h2_request(c, &sid, "GET", "/", "a", NULL, 0, NULL, 0);
+    (void)feed_settings(c, &w, NULL, 0);
+    (void)feed_200(c, &w, 1, 0);
+    (void)feed_200(c, &w, 3, 0);
+    rc = 0;
+    for (sent = 0; rc == 0 && sent < 80; sent++)
+        rc = feed_frame(c, &w, H2S_DATA, 0, sent < 40 ? 1 : 3, big, 16384);
+    /* 64 frames fill the 1 MiB connection window; stream 3 had taken only 24. */
+    t_true("connection window exhausted before the stream's", rc == -1 && sent == 65 && ts_h2_error(c) == 3);
+    del_conn(c, &w);
+
+    c = new_conn(&r, &w);
+    (void)feed_settings(c, &w, NULL, 0);
+    {
+        static const uint32_t over[] = { 5, 16777216u };
+        t_true("MAX_FRAME_SIZE over 2^24-1", feed_settings(c, &w, over, 1) == -1 && ts_h2_error(c) == 1);
+    }
+    del_conn(c, &w);
+
+    /* A peer MAX_FRAME_SIZE of 16384 and of 2^24-1 are both legal. */
+    {
+        static const uint32_t lo[] = { 5, 16384 }, hi[] = { 5, 16777215u };
+        c = new_conn(&r, &w);
+        t_true("MAX_FRAME_SIZE 16384", feed_settings(c, &w, lo, 1) == 0);
+        del_conn(c, &w);
+        c = new_conn(&r, &w);
+        t_true("MAX_FRAME_SIZE 2^24-1", feed_settings(c, &w, hi, 1) == 0);
+        del_conn(c, &w);
+    }
 }
 
 /* Header block limits: 128 fields and 65536 decoded bytes. */
@@ -944,6 +1001,33 @@ static void test_request_limits(void)
     del_conn(c, &w);
 }
 
+/* A request cannot use the room kept for control-frame replies. */
+static void test_request_reserve(void)
+{
+    static uint8_t body[TS_H2_BODY_MAX - 500];
+    rec_t r;
+    wire_t w;
+    ts_h2 *c = new_conn(&r, &w);
+    uint32_t sid = 77, ping_acks = 0;
+    size_t i, at;
+    memset(body, 'b', sizeof body);
+    (void)feed_settings(c, &w, NULL, 0);
+    /* Nothing is drained from here, so the queue fills. */
+    t_true("large request accepted", ts_h2_request(c, &sid, "POST", "/", "a", NULL, 0, body, sizeof body) == 0 && sid == 1);
+    t_true("request refused near the queue limit", ts_h2_request(c, &sid, "GET", "/", "a", NULL, 0, NULL, 0) == -1 && sid == 1);
+    at = w.nf;
+    {
+        uint8_t pb[17];
+        size_t n = h2s_frame(pb, H2S_PING, 0, 0, "12345678", 8);
+        t_true("PING accepted", ts_h2_feed(c, pb, n) == 0);
+    }
+    take(&w, c);
+    for (i = at; i < w.nf; i++)
+        if (w.f[i].type == H2S_PING && (w.f[i].flags & H2S_ACK)) ping_acks++;
+    t_true("PING still ACKed", ping_acks == 1);
+    del_conn(c, &w);
+}
+
 void test_h2(void)
 {
     test_preface();
@@ -963,4 +1047,5 @@ void test_h2(void)
     test_split();
     test_reentrant();
     test_request_limits();
+    test_request_reserve();
 }
