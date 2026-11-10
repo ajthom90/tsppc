@@ -1,5 +1,7 @@
 # Targets: test (host), asan (host + sanitizers), ct-test (host + sanitizers,
-# PowerPC constant-time code paths and sanitized vendor objects), ppc-test
+# PowerPC constant-time code paths and sanitized vendor objects), fuzz (mutation
+# fuzzing of every parser, ASan + UBSan, aborting on any fault; set
+# TS_FUZZ_ITERS to change the 200000 iterations per target), ppc-test
 # (PowerPC, build only here; run the binary on a PowerPC Mac; also builds the
 # tun_check driver check tool, which tools/driver.sh runs). GNU make 3.81 and
 # /bin/sh compatible.
@@ -9,14 +11,18 @@ SHELL := /bin/sh
 
 BEARSSL := vendor/bearssl-0.6
 SRCS    := $(shell find src -name '*.c' | sort)
-TESTS   := $(wildcard tests/*.c)
+ALLTESTS := $(wildcard tests/*.c)
 BSRCS   := $(shell find $(BEARSSL)/src -name '*.c' | sort)
 
 ifeq ($(TARGET),)
-.PHONY: test asan ct-test ppc-test clean
+.PHONY: test asan ct-test ppc-test fuzz clean
 test asan ct-test ppc-test:
 	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all $(if $(filter ppc-test,$@),build/ppc-test/tun_check)
 	@./build/$@/test_all
+
+fuzz:
+	@$(MAKE) --no-print-directory TARGET=fuzz build/fuzz/fuzz_all
+	@./build/fuzz/fuzz_all
 
 clean:
 	rm -rf build
@@ -45,14 +51,25 @@ VSAN   :=
 CTMUL  :=
 ifeq ($(TARGET),asan)
 SAN    := -fsanitize=address,undefined -fno-omit-frame-pointer
+else ifeq ($(TARGET),fuzz)
+# Undefined behaviour must abort, not just print, so the harness reports it.
+SAN    := -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 else
 SAN    :=
 endif
 endif
 endif
 
+# The fuzz binary has its own main (tests/fuzz.c) and only the fuzz_*.c targets;
+# the test binaries get everything else.
+ifeq ($(TARGET),fuzz)
+TESTS  := $(wildcard tests/fuzz*.c)
+else
+TESTS  := $(filter-out tests/fuzz%,$(ALLTESTS))
+endif
+
 OPT    := -O1 -g
-CFLAGS := $(ARCH) $(CTMUL) $(OPT) $(SAN) -Wall -Wextra -Werror -MMD -MP -I. -I$(BEARSSL)/inc
+CFLAGS := $(ARCH) $(CTMUL) -DTS_TEST_HOOKS $(OPT) $(SAN) -Wall -Wextra -Werror -MMD -MP -I. -I$(BEARSSL)/inc
 VFLAGS := $(ARCH) $(CTMUL) $(VSAN) -O2 -w -I$(BEARSSL)/inc -I$(BEARSSL)/src
 
 OBJDIR  := build/$(TARGET)
@@ -85,6 +102,25 @@ $(VFLAGSTAMP): FORCE
 
 $(OBJDIR)/test_all: $(OBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(OBJS) $(VOBJS)
+
+# The fuzz registry lists every tests/fuzz_<name>.c as ts_fuzz_<name>().
+FUZZNAMES := $(patsubst tests/fuzz_%.c,%,$(filter tests/fuzz_%.c,$(TESTS)))
+REGISTRY  := $(OBJDIR)/registry.c
+
+$(REGISTRY): FORCE
+	@mkdir -p $(dir $@); { \
+	  for n in $(FUZZNAMES); do echo "extern void ts_fuzz_$$n(void);"; done; \
+	  echo "const char *const ts_fuzz_names[] = { $(foreach n,$(FUZZNAMES),\"$(n)\",) 0 };"; \
+	  echo "void (*const ts_fuzz_funcs[])(void) = { $(foreach n,$(FUZZNAMES),ts_fuzz_$(n),) 0 };"; \
+	  echo "const unsigned long ts_fuzz_count = $(words $(FUZZNAMES));"; \
+	} >$@.new; \
+	if cmp -s $@.new $@; then rm -f $@.new; else mv $@.new $@; fi
+
+$(OBJDIR)/registry.o: $(REGISTRY) $(FLAGSTAMP)
+	$(CC) $(CFLAGS) -Wno-missing-prototypes -c -o $@ $<
+
+$(OBJDIR)/fuzz_all: $(OBJS) $(OBJDIR)/registry.o $(VOBJS)
+	$(CC) $(ARCH) $(SAN) -o $@ $(OBJS) $(OBJDIR)/registry.o $(VOBJS)
 
 CHECKOBJS := $(OBJDIR)/tools/tun_check.o $(OBJDIR)/src/core/bytes.o
 
