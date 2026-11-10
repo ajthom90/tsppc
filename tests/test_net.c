@@ -443,6 +443,122 @@ static void test_keyfetch_args(void)
     ts_keyfetch_close(&k);
 }
 
+/* ---- ts_tls over a local socketpair --------------------------------------
+ * A BearSSL server in this process, with a fresh P-256 key; the client's
+ * certificate check is replaced by that known key (no certificate here could
+ * chain to the real anchors). Everything else is ts_tls as the daemon uses it. */
+
+static int srv_pump(br_ssl_engine_context *e, int fd)
+{
+    int progress = 0;
+    for (;;) {
+        unsigned st = br_ssl_engine_current_state(e);
+        unsigned char *b;
+        size_t len;
+        ssize_t n;
+        int moved = 0;
+        if (st & BR_SSL_CLOSED) return progress;
+        if (st & BR_SSL_SENDREC) {
+            b = br_ssl_engine_sendrec_buf(e, &len);
+            n = send(fd, b, len, 0);
+            if (n > 0) {
+                br_ssl_engine_sendrec_ack(e, (size_t)n);
+                moved = 1;
+            }
+        }
+        b = br_ssl_engine_recvrec_buf(e, &len);
+        if (b && len) {
+            n = recv(fd, b, len, 0);
+            if (n > 0) {
+                br_ssl_engine_recvrec_ack(e, (size_t)n);
+                moved = 1;
+            }
+        }
+        if (!moved) return progress;
+        progress = 1;
+    }
+}
+
+static void test_tls_loopback(void)
+{
+    static br_ssl_server_context sc;
+    static unsigned char sbuf[BR_SSL_BUFSIZE_BIDI];
+    static ts_tls c;
+    static unsigned char rbuf[8000];
+    br_hmac_drbg_context rng;
+    br_ec_private_key sk;
+    br_ec_public_key pk;
+    br_x509_knownkey_context kk;
+    br_x509_certificate chain;
+    unsigned char kbuf[BR_EC_KBUF_PRIV_MAX_SIZE], pbuf[BR_EC_KBUF_PUB_MAX_SIZE], seed[32], dummy[1] = { 0x30 };
+    int sv[2], rc = 1, i, got = 0, pending_seen = 0, want_read_seen = 0, n;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        t_true("tls loop: socketpair", 0);
+        return;
+    }
+    fcntl(sv[0], F_SETFL, O_NONBLOCK);
+    fcntl(sv[1], F_SETFL, O_NONBLOCK);
+    memset(seed, 7, sizeof seed);
+    br_hmac_drbg_init(&rng, &br_sha256_vtable, seed, sizeof seed);
+    t_true("tls loop: server key", br_ec_keygen(&rng.vtable, &br_ec_all_m31, &sk, kbuf, BR_EC_secp256r1) > 0 &&
+           br_ec_compute_pub(&br_ec_all_m31, &pk, pbuf, &sk) > 0);
+    chain.data = dummy;
+    chain.data_len = sizeof dummy;
+    br_ssl_server_init_full_ec(&sc, &chain, 1, BR_KEYTYPE_EC, &sk);
+    br_ssl_engine_set_buffer(&sc.eng, sbuf, sizeof sbuf, 1);
+    br_ssl_server_reset(&sc);
+
+    t_true("tls loop: client start", ts_tls_start(&c, sv[0], "control.example.test") == 0);
+    br_x509_knownkey_init_ec(&kk, &pk, BR_KEYTYPE_KEYX | BR_KEYTYPE_SIGN);
+    br_ssl_engine_set_x509(&c.cc.eng, &kk.vtable);
+    t_true("tls loop: nothing pending before the handshake", ts_tls_pending(&c) == 0);
+
+    for (i = 0; i < 200 && rc == 1; i++) {
+        rc = ts_tls_step(&c);
+        srv_pump(&sc.eng, sv[1]);
+    }
+    t_true("tls loop: handshake", rc == 0);
+
+    /* The server sends more than one small read takes. */
+    {
+        unsigned char *b;
+        size_t room, off = 0;
+        static unsigned char msg[6000];
+        for (i = 0; i < (int)sizeof msg; i++) msg[i] = (unsigned char)i;
+        while (off < sizeof msg) {
+            b = br_ssl_engine_sendapp_buf(&sc.eng, &room);
+            if (!b) break;
+            if (room > sizeof msg - off) room = sizeof msg - off;
+            memcpy(b, msg + off, room);
+            br_ssl_engine_sendapp_ack(&sc.eng, room);
+            br_ssl_engine_flush(&sc.eng, 0);
+            off += room;
+            for (i = 0; i < 50; i++) {
+                srv_pump(&sc.eng, sv[1]);
+                n = ts_tls_read(&c, rbuf + got, 10);   /* small reads leave data in the engine */
+                if (n > 0) got += n;
+                if (ts_tls_pending(&c)) {
+                    pending_seen = 1;
+                    if (ts_tls_want(&c) & TS_TLS_WANT_READ) want_read_seen = 1;
+                }
+            }
+        }
+        t_true("tls loop: data left after a small read is reported pending", pending_seen);
+        (void)want_read_seen;   /* ts_tls_want may or may not ask for more: pending is what counts */
+        for (i = 0; i < 2000 && got < (int)sizeof msg; i++) {
+            srv_pump(&sc.eng, sv[1]);
+            n = ts_tls_read(&c, rbuf + got, sizeof rbuf - got);
+            if (n > 0) got += n;
+        }
+        t_true("tls loop: all data read", got == (int)sizeof msg && memcmp(rbuf, msg, sizeof msg) == 0);
+        t_true("tls loop: nothing pending once drained", ts_tls_pending(&c) == 0);
+    }
+    ts_tls_wipe(&c);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 void test_net(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -454,4 +570,5 @@ void test_net(void)
     test_tls_config();
     test_anchors();
     test_keyfetch_args();
+    test_tls_loopback();
 }

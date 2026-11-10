@@ -151,6 +151,14 @@ int ts_tls_want(const ts_tls *t)
     return w;
 }
 
+int ts_tls_pending(const ts_tls *t)
+{
+    size_t len = 0;
+    if (!(br_ssl_engine_current_state(&t->cc.eng) & BR_SSL_RECVAPP)) return 0;
+    (void)br_ssl_engine_recvapp_buf(&t->cc.eng, &len);
+    return len > 0;
+}
+
 int ts_tls_read(ts_tls *t, void *buf, size_t cap)
 {
     br_ssl_engine_context *e = &t->cc.eng;

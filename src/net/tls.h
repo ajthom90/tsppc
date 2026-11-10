@@ -53,6 +53,12 @@ int ts_tls_step(ts_tls *t);
  * the next step. 0 once closed or failed. */
 int ts_tls_want(const ts_tls *t);
 
+/* 1 if decrypted application data is waiting in the engine, else 0. Such
+ * data is not reported by ts_tls_want (the socket may have nothing more to
+ * read), so a caller that stopped reading early must not sleep in select
+ * while this is 1. */
+int ts_tls_pending(const ts_tls *t);
+
 /* Copy up to cap bytes of received application data. Returns the count (> 0),
  * 0 if none is available yet, TS_TLS_CLOSED after the peer's close_notify, or
  * -1 on failure. Data received before a failure or close is returned first. */
