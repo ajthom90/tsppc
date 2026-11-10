@@ -398,6 +398,11 @@ static void test_send_failure(void)
     end();
 }
 
+static void h_err_logout(fake *f, fk_req *r)
+{
+    if (strcmp(r->path, "/machine/register") == 0) fk_reply(f, r, 500, "internal error");
+}
+
 /* Starting while logged in: one register of the current key, then the map. */
 static void h_refresh(fake *f, fk_req *r)
 {
@@ -456,6 +461,53 @@ static void test_refresh_on_start(void)
            memcmp(F.saved.old_node_priv, F.st.node_priv, 32) == 0);
     t_true("refresh expired: NEED_LOGIN, no map", ts_sess_get_state(S) == TS_SESS_NEED_LOGIN && maps() == 0 &&
            ts_sess_login_url(S) && strcmp(ts_sess_login_url(S), URL2) == 0);
+    /* Logout now: the old (expired) key and the new key awaiting login are
+     * both dropped from the saved state. */
+    {
+        uint8_t newkey[32];
+        int saves = F.nsave;
+        memcpy(newkey, ts_sess_node_state(S)->node_priv, 32);
+        ts_sess_logout(S);
+        fk_pump(&F);
+        t_true("refresh expired logout: saved", F.nsave > saves);
+        t_true("refresh expired logout: no old key kept", !F.saved.have_old_node && F.saved.have_login == 0);
+        t_true("refresh expired logout: neither key kept", memcmp(F.saved.node_priv, F.st.node_priv, 32) != 0 &&
+               memcmp(F.saved.node_priv, newkey, 32) != 0);
+        t_true("refresh expired logout: IDLE", ts_sess_get_state(S) == TS_SESS_IDLE);
+    }
+    end();
+}
+
+/* Logout with a saved login while control cannot be reached on either port:
+ * the login is forgotten here anyway, and nothing is retried. */
+static void test_logout_unreachable(void)
+{
+    char st[512];
+    fk_init(&F, S, HOSTINFO);
+    F.handler = h_std;
+    F.st.have_login = 1;
+    F.refuse_all = 1;
+    fk_start(&F, HOSTINFO);
+    ts_sess_logout(S);
+    fk_pump(&F);
+    t_true("logout unreachable: tried 80 then 443", F.nconnect == 2 && F.ports[0] == 80 && F.ports[1] == 443);
+    t_true("logout unreachable: login cleared and saved", F.nsave >= 1 && F.saved.have_login == 0 &&
+           !F.saved.have_old_node && memcmp(F.saved.node_priv, F.st.node_priv, 32) != 0);
+    t_true("logout unreachable: IDLE", ts_sess_get_state(S) == TS_SESS_IDLE);
+    ts_sess_status(S, st, sizeof st);
+    t_true("logout unreachable: status says control was not told", strstr(st, "not reached") != NULL);
+    fk_advance(&F, 120000, 1000);
+    t_true("logout unreachable: not retried", F.nconnect == 2 && ts_sess_get_state(S) == TS_SESS_IDLE);
+    end();
+
+    /* Control answers the logout with an error: also forgotten here. */
+    begin_running();
+    F.handler = h_err_logout;
+    ts_sess_logout(S);
+    fk_pump(&F);
+    t_true("logout error reply: login cleared", F.saved.have_login == 0 && ts_sess_get_state(S) == TS_SESS_IDLE);
+    fk_advance(&F, 120000, 1000);
+    t_true("logout error reply: not retried", fk_count(&F, "/machine/register", "1970") == 1);
     end();
 }
 
@@ -1209,6 +1261,7 @@ void test_session(void)
     test_send_failure();
     test_refresh_on_start();
     test_logout_after_refresh_url();
+    test_logout_unreachable();
     test_followup_expired_loop();
     test_up_during_logout();
     test_approval();

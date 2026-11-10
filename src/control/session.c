@@ -37,6 +37,7 @@ enum {
 #define EXPIRY_LOGOUT "1970-01-01T00:02:03Z"   /* upstream's time.Unix(123, 0) */
 
 static void settle(ts_sess *s);
+static void forget_login(ts_sess *s);
 
 /* ---- Small helpers --------------------------------------------------- */
 
@@ -188,6 +189,17 @@ static void apply_failure(ts_sess *s)
     close_conn(s, !s->io_closed);
     if (kind == FAIL_RETRY && before_handshake && s->port == 80 && s->goal != GOAL_NONE) {
         start_connect(s, 443);
+        return;
+    }
+    if (s->goal == GOAL_LOGOUT && (kind == FAIL_RETRY || kind == FAIL_RETRY_HERE)) {
+        /* Control could not be told (neither port answered, or it refused the
+         * logout): forget the login here anyway, so the state file keeps
+         * nothing usable. The key stays registered at control until it
+         * expires there. Nothing is retried. */
+        forget_login(s);
+        s->logout_unconfirmed = 1;
+        s->goal = GOAL_NONE;
+        s->retry_armed = 0;
         return;
     }
     if (kind == FAIL_RETRY || kind == FAIL_RETRY_HERE) {
@@ -446,15 +458,15 @@ static void login_done(ts_sess *s, int authorized)
     s->map_at = s->now;
 }
 
-static void logout_done(ts_sess *s)
+/* Forget the login: a fresh node key with no old one, as upstream clears its
+ * persisted state. The machine and disco keys stay. If there is no randomness
+ * the node key is kept: after a logout control has expired it, so the next
+ * login gets NodeKeyExpired and makes a new one then. If the save fails the
+ * file still says logged in; status says so, and a restart registers the old
+ * key and is sent through the same expiry path. */
+static void forget_login(ts_sess *s)
 {
     uint8_t k[32];
-    /* Forget the login: a fresh node key with no old one, as upstream clears
-     * its persisted state. The machine and disco keys stay. If there is no
-     * randomness the node key is kept: control has just expired it, so the
-     * next login gets NodeKeyExpired and makes a new one then. If the save
-     * fails the file still says logged in; status says so, and a restart
-     * registers the expired key and is sent through the same expiry path. */
     if (s->io->random(s->user, k, 32) == 0) {
         ts_state_clamp_key(k);
         memcpy(s->st.node_priv, k, 32);
@@ -470,7 +482,13 @@ static void logout_done(ts_sess *s)
     s->relogin = RELOGIN_NONE;
     s->regen = 0;
     s->reg_at = s->now;
+    s->logout_unconfirmed = 0;
     ts_netmap_reset(&s->nm);
+}
+
+static void logout_done(ts_sess *s)
+{
+    forget_login(s);
     if (s->goal == GOAL_LOGOUT) {
         s->goal = GOAL_NONE;
         fail(s, FAIL_QUIET, "logged out");
@@ -1012,6 +1030,7 @@ void ts_sess_up(ts_sess *s)
 {
     if (!s->nm_ok || !s->hostinfo) return;   /* out of memory at init: stays FAILED */
     s->fatal = 0;
+    s->logout_unconfirmed = 0;
     s->have_exit = 0;
     if (s->relogin != RELOGIN_NONE) {
         /* Expired or removed: log in again with a new node key (as upstream). */
@@ -1041,6 +1060,9 @@ void ts_sess_logout(ts_sess *s)
          * (have_login) is expired at control and cleared below even when the
          * session is not logged in now, for instance when the refresh at
          * start was answered with a login URL. */
+        /* An old key (kept after a key change) or a key with a login URL
+         * out is dropped from the saved state too. */
+        if (s->st.have_old_node || s->auth_url[0] || s->regen) forget_login(s);
         s->goal = GOAL_NONE;
         s->auth_url[0] = 0;
         s->regen = 0;
@@ -1118,7 +1140,10 @@ void ts_sess_status(const ts_sess *s, char *out, size_t cap)
     switch (s->state) {
     case TS_SESS_IDLE:
         snprintf(detail, sizeof detail, "%s", s->logged_in ? "logged in, not connected"
-                 : s->save_failed ? "logged out, but the node state could not be saved" : "logged out");
+                 : s->save_failed ? "logged out, but the node state could not be saved"
+                 : s->logout_unconfirmed ? "logged out here; control was not reached, so the old key stays "
+                                           "registered there until it expires"
+                 : "logged out");
         break;
     case TS_SESS_CONNECTING:
         snprintf(detail, sizeof detail, "%s", s->goal == GOAL_LOGOUT ? "logging out" : "connecting to control");

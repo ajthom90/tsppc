@@ -140,6 +140,7 @@ typedef struct {
     int have_regen;
     int64_t last_regen;                  /* when the last new node key was made */
     int save_failed;                     /* the logout's save failed (status) */
+    int logout_unconfirmed;              /* logged out here without control's answer (status) */
     int relogin;                         /* RELOGIN_*: waiting for ts_sess_up */
     int reg_authorized;                  /* MachineAuthorized, from the register or the map */
     char auth_url[TS_SESS_URL_MAX + 1];  /* "" when none */
@@ -228,11 +229,14 @@ void ts_sess_tick(ts_sess *s, uint64_t now_ms);
  * expiry or removal the next register uses a new node key). */
 void ts_sess_up(ts_sess *s);
 /* Tell control to expire the current node key (register with Expiry in the far
- * past), then forget the login: a fresh node key, have_login cleared and saved,
- * IDLE. This happens whenever the session is logged in or the saved state
- * holds a login (have_login), even in NEED_LOGIN after the refresh at start
- * was answered with a login URL; until control answers, the logout is retried
- * like any request. With neither, nothing is sent and the session goes IDLE. */
+ * past), then forget the login: a fresh node key, no old key, have_login
+ * cleared and saved, IDLE. The register is sent whenever the session is
+ * logged in or the saved state holds a login (have_login), even in NEED_LOGIN
+ * after the refresh at start was answered with a login URL. If it cannot be
+ * delivered (no connection on port 80 or 443, or control answers with an
+ * error), the login is forgotten here all the same and not retried; status
+ * says control was not reached. With no login at all nothing is sent; an old
+ * key or a key with a login URL out is still dropped from the saved state. */
 void ts_sess_logout(ts_sess *s);
 
 ts_sess_state ts_sess_get_state(const ts_sess *s);
