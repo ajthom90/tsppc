@@ -40,7 +40,8 @@ Nothing like this exists. Tailscale's client is written in Go, and neither Go no
 - Tailnet Lock. If the tailnet enforces it, the client reports that it's unsupported and stops.
 - Subnet routing, advertising or accepting routes, and app connectors.
 - Auth-key login. Interactive login only in the first version.
-- Headscale compatibility, Intel Macs, 10.3 and earlier, and 10.6.
+- Headscale compatibility, and 10.3 and earlier. **[Owner]** decided against Panther and Jaguar for now. tuntaposx needs kernel interfaces that first appeared in 10.4, so Panther would need a different driver. It may come back later as a driver investigation.
+- Intel Macs and 10.6 in the first PowerPC release. They follow as milestone 11. **[Owner]**
 - Sending a 64-bit build. G5s run the same 32-bit binary.
 - AltiVec. It may be added later as an optional speedup, and nothing may require it. **[Agreed]**
 
@@ -59,7 +60,8 @@ Any of these makes the project a failure, even if everything else works. All are
 ## Constraints
 
 - **Toolchain:** binaries must run on stock Tiger, so build with `gcc-4.0 -std=gnu99 -arch ppc -isysroot /Developer/SDKs/MacOSX10.4u.sdk -mmacosx-version-min=10.4`. This is proven on the test VM. **[Call]**
-- **Single binary:** one 32-bit `ppc` executable for all three CPUs and both OS versions. **[Agreed]**
+- **Single binary:** one 32-bit `ppc` executable for all three CPUs and both OS versions. **[Agreed]** Milestone 11 adds Intel slices to the same file.
+- **Portability:** nothing may assume a big-endian or 32-bit CPU, because the same code will ship for Intel. The host tests already run on a little-endian 64-bit CPU. **[Call]**
 - **Language:** C. **[Agreed]**
 - **Old-system libraries can't be used for crypto or TLS.** Leopard's OpenSSL is 0.9.7l and its `curl` is equally old. Bundle what's needed, including root certificates.
 - **Big-endian CPU, with mixed byte orders on the wire.** The control channel's framing and nonce are big-endian. WireGuard's message fields, its nonces and the map stream's length prefix are little-endian. All serialisation must use explicit byte-order helpers and never overlay structs on packets.
@@ -154,6 +156,8 @@ If the driver can't be made to work on Tiger, the project continues as a Leopard
 8. **Direct connections.** *Passes when:* `status` shows a direct path between the Mac and a peer on a network that allows it. The current VM's NAT may not allow it, so this needs bridged networking or real hardware.
 9. **Real hardware.** Run the above on the owner's G4 eMac if it boots, and record throughput and CPU use. *Passes when:* interactive SSH feels normal and throughput numbers are written down. There is no numeric throughput target until there's a measurement. If the eMac doesn't boot, the first release says it has only been tested under emulation.
 10. **Public release.** The checklist in "Open source release". *Passes when:* someone following only the published instructions can install the client on a clean Leopard VM and join a tailnet.
+
+11. **Intel Macs on 10.4–10.6.** **[Owner]** The same code ships as a universal binary: `ppc` and `i386` from the 10.4u SDK, plus `x86_64` for 10.6. The tunnel driver also gets Intel slices, i386 and x86_64 for 10.6's 64-bit kernel. The PowerPC constant-time multiply checks don't apply to Intel, where the multiply instruction is already constant-time. *Passes when:* milestones 4 and 5 pass on an Intel 10.6 VM, or on Intel hardware if the owner has some, and the universal binary still passes on the PowerPC VMs. Intel 10.7 through 11 can follow later, using the built-in `utun` interface instead of a kernel driver. Official Tailscale needs macOS 12 or later, so those Macs are left out too. **[Call]**
 
 G3 and real G5 support are designed for but can't be verified by the owner. The release must say so, and ask for reports from people with those machines.
 
