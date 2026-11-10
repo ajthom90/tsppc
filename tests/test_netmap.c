@@ -10,6 +10,8 @@
 #define HA "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 #define HB "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 #define HC "1111111111111111111111111111111111111111111111111111111111111111"
+/* HA with two digits that are not hex: the same length, so only the hex check can reject it. */
+#define HZ "0123456789abcdef0123456789abzzef0123456789abcdef0123456789abcdef"
 
 #define SELF_JSON(auth) \
     "{\"ID\":1,\"Name\":\"self.example.test.\",\"Key\":\"nodekey:" HA "\"," \
@@ -168,7 +170,7 @@ static void test_deltas(void)
     p = ts_netmap_peer(&m, 10);
     t_true("patch changed Online", p && p->online == 0);
     if (p) {
-        ts_node want = *ts_netmap_peer(&m, 10);
+        ts_node want = *p;
         size_t i;
         want.online = 1;
         for (i = 0; i < before->npeers; i++)
@@ -191,10 +193,11 @@ static void test_deltas(void)
     t_true("patch key expiry past 2038", p && p->key_expiry == (int64_t)4102444800LL);
     t_true("patch DERPRegion 0 is unchanged",
            apply(&m, "{\"PeersChangedPatch\":[{\"NodeID\":10,\"DERPRegion\":0}]}") == 0
-           && ts_netmap_peer(&m, 10)->home_derp == 9);
+           && (p = ts_netmap_peer(&m, 10)) != NULL && p->home_derp == 9);
 
     t_true("online change applies", apply(&m, "{\"OnlineChange\":{\"10\":true,\"12\":false,\"777\":true}}") == 0);
-    t_true("online change set", ts_netmap_peer(&m, 10)->online == 1 && ts_netmap_peer(&m, 12)->online == 0);
+    t_true("online change set", (p = ts_netmap_peer(&m, 10)) != NULL && p->online == 1
+           && (p = ts_netmap_peer(&m, 12)) != NULL && p->online == 0);
     t_true("online change unknown ignored", m.npeers == 2);
     t_true("peer seen change ignored", apply(&m, "{\"PeerSeenChange\":{\"10\":true}}") == 0 && m.npeers == 2);
 
@@ -339,8 +342,9 @@ static void test_limits(void)
         memset(name, 'n', 255);
         name[255] = 0;
         snprintf(msg, sizeof msg, "{\"PeersChanged\":[{\"ID\":50,\"Name\":\"%s\"}]}", name);
-        t_true("255-byte name kept", apply(&m, msg) == 0 && ts_netmap_peer(&m, 50)
-               && strlen(ts_netmap_peer(&m, 50)->name) == 255);
+        const ts_node *p;
+        t_true("255-byte name kept", apply(&m, msg) == 0 && (p = ts_netmap_peer(&m, 50)) != NULL
+               && strlen(p->name) == 255);
         name[255] = 'n';
         name[256] = 0;
         snprintf(msg, sizeof msg, "{\"PeersChanged\":[{\"ID\":51,\"Name\":\"%s\"}]}", name);
@@ -349,8 +353,17 @@ static void test_limits(void)
     }
 
     t_unchanged("short key", &m, "{\"PeersChanged\":[{\"ID\":52,\"Key\":\"nodekey:abcd\"}]}");
-    t_unchanged("key wrong prefix", &m, "{\"PeersChanged\":[{\"ID\":52,\"Key\":\"discokey:" HA "\"}]}");
-    t_unchanged("key bad hex", &m, "{\"Node\":{\"ID\":1,\"Key\":\"nodekey:" "zz" HA "\"}}");
+    /* Same length as a good key, so each reaches the check it is named for. */
+    t_unchanged("key wrong prefix", &m, "{\"PeersChanged\":[{\"ID\":52,\"Key\":\"nodekex:" HA "\"}]}");
+    t_unchanged("key bad hex", &m, "{\"Node\":{\"ID\":1,\"Key\":\"nodekey:" HZ "\"}}");
+    t_unchanged("disco key wrong prefix", &m, "{\"PeersChanged\":[{\"ID\":52,\"DiscoKey\":\"discokex:" HA "\"}]}");
+    t_unchanged("disco key bad hex", &m, "{\"Node\":{\"ID\":1,\"DiscoKey\":\"discokey:" HZ "\"}}");
+    t_unchanged("patch key wrong prefix", &m, "{\"PeersChangedPatch\":[{\"NodeID\":10,\"Key\":\"nodekex:" HA "\"}]}");
+    t_unchanged("patch key bad hex", &m, "{\"PeersChangedPatch\":[{\"NodeID\":10,\"Key\":\"nodekey:" HZ "\"}]}");
+    t_unchanged("patch disco key wrong prefix", &m,
+                "{\"PeersChangedPatch\":[{\"NodeID\":10,\"DiscoKey\":\"discokex:" HA "\"}]}");
+    t_unchanged("patch disco key bad hex", &m,
+                "{\"PeersChangedPatch\":[{\"NodeID\":10,\"DiscoKey\":\"discokey:" HZ "\"}]}");
     t_unchanged("empty key", &m, "{\"PeersChanged\":[{\"ID\":52,\"Key\":\"\"}]}");
     t_unchanged("bad address", &m, "{\"PeersChanged\":[{\"ID\":52,\"Addresses\":[\"100.64.0.300/32\"]}]}");
     t_unchanged("bad prefix", &m, "{\"PeersChanged\":[{\"ID\":52,\"Addresses\":[\"100.64.0.3/33\"]}]}");
@@ -387,6 +400,12 @@ static void test_unknown_and_null(void)
     t_true("fractional offset time", apply(&m,
         "{\"Node\":{\"ID\":1,\"KeyExpiry\":\"2026-12-01T02:30:00.123456789+01:00\"}}") == 0
         && m.self.key_expiry == (int64_t)1796088600);
+    t_true("expiry at the epoch is not 0", apply(&m,
+        "{\"Node\":{\"ID\":1,\"KeyExpiry\":\"1970-01-01T00:00:00Z\"}}") == 0 && m.self.key_expiry == -1);
+    t_true("expiry at the epoch via offset is not 0", apply(&m,
+        "{\"Node\":{\"ID\":1,\"KeyExpiry\":\"1970-01-01T01:00:00+01:00\"}}") == 0 && m.self.key_expiry == -1);
+    t_true("expiry one second after the epoch", apply(&m,
+        "{\"Node\":{\"ID\":1,\"KeyExpiry\":\"1970-01-01T00:00:01Z\"}}") == 0 && m.self.key_expiry == 1);
     t_true("pre-1970 expiry is not 0", apply(&m,
         "{\"Node\":{\"ID\":1,\"KeyExpiry\":\"1969-12-31T23:59:59Z\"}}") == 0 && m.self.key_expiry == -1);
     t_true("duplicate key: last wins", apply(&m,

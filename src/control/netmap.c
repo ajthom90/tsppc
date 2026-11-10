@@ -128,7 +128,7 @@ static int64_t days_from_civil(int64_t y, int m, int d)
 
 /* RFC 3339 as Go's time.Time JSON form writes it: YYYY-MM-DDTHH:MM:SS, an
  * optional fraction of 1 to 9 digits, then Z or +hh:mm / -hh:mm. The zero time
- * gives 0. */
+ * gives 0, the Unix epoch itself -1. */
 static int parse_time(const ts_json_tok *t, int64_t *out)
 {
     static const int mdays[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
@@ -163,7 +163,11 @@ static int parse_time(const ts_json_tok *t, int64_t *out)
     if (d < 1 || d > dim) return -1;
     v = days_from_civil(y, mo, d) * 86400 + (int64_t)h * 3600 + mi * 60 + s;
     v -= (int64_t)sign * (oh * 3600 + om * 60);
-    *out = v == GO_ZERO_TIME ? 0 : v;
+    /* 0 means no expiry, so the zero time maps to it, and a real expiry at
+     * the epoch becomes -1 (one second earlier; both are long past). */
+    if (v == GO_ZERO_TIME) v = 0;
+    else if (v == 0) v = -1;
+    *out = v;
     return 0;
 }
 

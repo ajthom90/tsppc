@@ -39,7 +39,18 @@
  *
  * Apply is all-or-nothing: on error the map, the ping request and the
  * per-message fields are exactly as before the call, and last_error says why
- * (it names the field or limit, never message content). */
+ * (it names the field or limit, never message content).
+ *
+ * Caller contract:
+ * - A rejected message means our view of the map may now differ from
+ *   control's (a delta was lost), so the caller must end the map session and
+ *   reconnect, which starts again with a full map (ts_netmap_reset first).
+ * - Read the per-message fields (have_exit, exit_code, sleep_ms) only after
+ *   apply returned 0; after -1 they still describe the previous message.
+ * - m->peers is swapped with an internal buffer by every successful apply, so
+ *   the m->peers pointer and any pointer from ts_netmap_peer are valid only
+ *   until the next successful ts_netmap_apply (or reset or free).
+ * - An all-zero node_key or disco_key means the node has none. */
 
 #define TS_MAX_PEERS 256
 #define TS_MAP_MSG_MAX 4194304          /* largest framed map message, bytes */
@@ -51,7 +62,8 @@
 typedef struct {
     int64_t id;                 /* ID */
     /* KeyExpiry in seconds since the Unix epoch; 0 when absent or the zero
-     * time 0001-01-01T00:00:00Z (the key does not expire). int64_t rather
+     * time 0001-01-01T00:00:00Z (the key does not expire). An expiry of
+     * exactly 1970-01-01T00:00:00Z is stored as -1, so 0 keeps meaning none. int64_t rather
      * than time_t, which is 32 bits on PowerPC Mac OS X. The netmap never
      * reads the clock: the caller decides expiry (non-zero and before now). */
     int64_t key_expiry;
@@ -105,10 +117,11 @@ void ts_netmap_free(ts_netmap *m);
 /* Forget everything (for a new map session after reconnecting); keeps buffers. */
 void ts_netmap_reset(ts_netmap *m);
 
-/* Apply one MapResponse JSON document. 0, or -1 with last_error set. */
+/* Apply one MapResponse JSON document. 0, or -1 with last_error set (the
+ * caller then ends the session; see the contract above). */
 int ts_netmap_apply(ts_netmap *m, const char *json, size_t len);
 
-/* The peer with this ID, or NULL. */
+/* The peer with this ID, or NULL. Valid until the next successful apply. */
 const ts_node *ts_netmap_peer(const ts_netmap *m, int64_t id);
 
 /* Map messages on the long poll: each is a 4-byte little-endian length and
@@ -136,7 +149,9 @@ typedef struct {
 void ts_map_stream_init(ts_map_stream *s, void (*msg)(void *, const char *, size_t), void *user);
 /* 0, or -1 (length over TS_MAP_MSG_MAX, out of memory, or an earlier error;
  * s->failed says which).
- * Calls msg once per complete message, in order, from inside this call. */
+ * Calls msg once per complete message, in order, from inside this call. The
+ * data pointer is valid only during the callback, and msg must not call
+ * ts_map_stream_feed or ts_map_stream_free on the same stream. */
 int ts_map_stream_feed(ts_map_stream *s, const uint8_t *in, size_t n);
 void ts_map_stream_free(ts_map_stream *s);
 

@@ -105,7 +105,7 @@ These are the entries that look ignorable but are not, so they are decisions too
 - Absent `Domain`, `DNSConfig`, `DERPMap`, `PacketFilter`, `PacketFilters` mean unchanged (entries 6, 15, 17), so skipping them is correct.
 - Also parse and skip: `MapSessionHandle`/`Seq` (upstream sends no reattach request at this commit, so every reconnect is a full new session), `PopBrowserURL` (upstream only forwards an `https` URL on `tailscale.com` or a subdomain to the user; this client ignores it and does not log it), `ClientVersion`, `ControlTime`, `UserProfiles`, `SSHPolicy`, `Health` and `DisplayMessages` (entries 24, 117), `DomainDataPlaneAuditLogID`, `CollectServices`, `DefaultAutoUpdate`.
 - Add to `ts_node` now, at the cost of a few fields, so the tunnel plan does not reopen a tested parser: `key_expiry` (seconds since the Unix epoch, 0 when absent or `0001-01-01T00:00:00Z`), `jailed` (`IsJailed`), `wireguard_only` (`IsWireGuardOnly`). `key_expiry` is required for self (below), recommended for peers.
-- Add to `ts_netmap`: `tka_enabled` (the first message has `TKAInfo` present and `Disabled` not true), `have_exit` and `exit_code`, and the ping request from D1. Do not store `AllowedIPs`, `PrimaryRoutes`, `Endpoints`, `Capabilities` or `CapMap`.
+- Add to `ts_netmap`: `tka_enabled` (updated on every message carrying `TKAInfo`: set when `Disabled` is not true, cleared when it is; absent means unchanged, as upstream's `lastTKAInfo`), `have_exit` and `exit_code`, and the ping request from D1. Do not store `AllowedIPs`, `PrimaryRoutes`, `Endpoints`, `Capabilities` or `CapMap`.
 
 **D8. Self key expiry (Tasks 8, 9).** [Source] `ipn/ipnlocal/local.go`: upstream decides the key has expired from `SelfNode.KeyExpiry` being non-zero and earlier than the local clock, checks that before the device-approval check, and goes to NeedsLogin (`nextStateLocked`). It does not rely on `Node.Expired` for self. Entry 53 says the client also honours an explicit `Expired`.
 - Task 9: self is expired when `Expired` is true **or** `key_expiry` is non-zero and before the local clock. Check it before the `AWAIT_APPROVAL` test. An expired self moves the session to `NEED_LOGIN` ("node key expired, run `tsppc up`"). `ts_sess_up` then regenerates the node key, saves state with `old_node_priv` set, and registers with `OldNodeKey`, as the plan already specifies for `NodeKeyExpired`. Add a test.
@@ -146,7 +146,7 @@ One line for every entry that is not plainly safe to ignore. Anything not listed
 | 19, 25 | `Debug.SleepSeconds`, `Debug.Exit` | D2. |
 | 24, 117 | `Health`, `DisplayMessages` | Parse and skip. Optional: Task 10 may show titles on the problem line. |
 | 28, 39 | Noise, any HTTPS port | Implemented (Task 5). Port 80 then 443 (Task 9). |
-| 33, 36 | `PeersChangedPatch` | `DERPRegion`, `Key`, `DiscoKey`, `Online` applied; `Endpoints`, `LastSeen`, `KeyExpiry`, `Capabilities`, `Cap`, `KeySignature` ignored. |
+| 33, 36 | `PeersChangedPatch` | `DERPRegion`, `Key`, `DiscoKey`, `Online`, `KeyExpiry` applied (upstream applies `KeyExpiry` too, and `key_expiry` is stored); `Endpoints`, `LastSeen`, `Capabilities`, `Cap`, `KeySignature` ignored. |
 | 40, 47, 51, 64 | Tailnet Lock | D9. |
 | 44 | `ControlDialPlan` | D4. |
 | 45, 46, 52, 55, 69, 78, 80, 82, 108, 127, 128, 138, 142, 146 | c2n handlers | D3. |

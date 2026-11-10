@@ -6,15 +6,17 @@
 #include <string.h>
 
 /* Oracles, for each input:
- * - apply it to a map restored from one of two base states (3 peers, or 255
- *   so the TS_MAX_PEERS limit is reachable);
+ * - apply it to a map restored from one of three base states (3 peers; 255
+ *   so the TS_MAX_PEERS limit is reachable; or freshly reset, with no self,
+ *   so the "initial MapResponse lacked Node" rejection is reached);
  * - invariants hold after every apply: npeers <= TS_MAX_PEERS, unique IDs,
  *   every name and ping string NUL-terminated, sleep within its cap;
  * - a rejected message leaves the observable state byte-for-byte unchanged;
  * - an accepted message is idempotent: applying it again succeeds and changes
  *   nothing (every MapResponse field we apply is);
  * - the input fed to the stream framer whole and in small pieces gives the
- *   same messages and the same result. */
+ *   same messages and the same result, both raw and framed into messages
+ *   (one over 4 KiB, so the buffer grows past its first allocation). */
 
 #define HA "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 #define HB "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
@@ -29,7 +31,7 @@ typedef struct {
 } snap;
 
 static ts_netmap M;
-static snap *BASE[2], *S1, *S2;
+static snap *BASE[3], *S1, *S2;
 
 static void take(snap *s, const ts_netmap *m)
 {
@@ -132,11 +134,37 @@ static void stream_check(const uint8_t *data, size_t len)
     free(b.buf);
 }
 
+/* Mutated inputs rarely carry a sensible length prefix, so also frame them:
+ * a first message whose length comes from the first byte, then the rest as a
+ * second message, then (for growth past the first 4 KiB allocation) a message
+ * of the input repeated to more than 4 KiB. A final header is cut short. */
+static void stream_shaped(const uint8_t *data, size_t len)
+{
+    size_t n1, rest, rep, cap, o = 0, k;
+    uint8_t *w;
+    if (len == 0) return;
+    n1 = data[0] % len;
+    rest = len - n1;
+    rep = 4097 + (size_t)data[len - 1] * 37;
+    cap = 4 + n1 + 4 + rest + 4 + rep + 2;
+    w = (uint8_t *)malloc(cap);
+    TS_FUZZ_ASSERT(w != NULL);
+    w[o++] = (uint8_t)n1; w[o++] = (uint8_t)(n1 >> 8); w[o++] = 0; w[o++] = 0;
+    memcpy(w + o, data, n1); o += n1;
+    w[o++] = (uint8_t)rest; w[o++] = (uint8_t)(rest >> 8); w[o++] = (uint8_t)(rest >> 16); w[o++] = 0;
+    memcpy(w + o, data + n1, rest); o += rest;
+    w[o++] = (uint8_t)rep; w[o++] = (uint8_t)(rep >> 8); w[o++] = (uint8_t)(rep >> 16); w[o++] = 0;
+    for (k = 0; k < rep; k++) w[o++] = data[k % len];
+    w[o++] = 0x05; w[o++] = 0x00;    /* partial header: nothing more is delivered */
+    stream_check(w, o);
+    free(w);
+}
+
 static void target(const uint8_t *data, size_t len)
 {
     const char *json = (const char *)data;
 
-    restore(&M, BASE[len & 1]);
+    restore(&M, BASE[len % 3]);
     take(S1, &M);
     if (ts_netmap_apply(&M, json, len) != 0) {
         invariants(&M);
@@ -152,6 +180,7 @@ static void target(const uint8_t *data, size_t len)
         TS_FUZZ_ASSERT(memcmp(S1, S2, sizeof *S1) == 0);
     }
     stream_check(data, len);
+    stream_shaped(data, len);
 }
 
 static char *big_base(void)
@@ -198,15 +227,19 @@ void ts_fuzz_netmap(void)
     TS_FUZZ_ASSERT(ts_netmap_init(&M) == 0);
     BASE[0] = (snap *)malloc(sizeof(snap));
     BASE[1] = (snap *)malloc(sizeof(snap));
+    BASE[2] = (snap *)malloc(sizeof(snap));
     S1 = (snap *)malloc(sizeof(snap));
     S2 = (snap *)malloc(sizeof(snap));
-    TS_FUZZ_ASSERT(BASE[0] && BASE[1] && S1 && S2);
+    TS_FUZZ_ASSERT(BASE[0] && BASE[1] && BASE[2] && S1 && S2);
     TS_FUZZ_ASSERT(ts_netmap_apply(&M, SEEDS[0], strlen(SEEDS[0])) == 0);
     take(BASE[0], &M);
     ts_netmap_reset(&M);
     big = big_base();
     TS_FUZZ_ASSERT(ts_netmap_apply(&M, big, strlen(big)) == 0 && M.npeers == 255);
     take(BASE[1], &M);
+    /* A fresh session: the first non-KeepAlive message must carry Node. */
+    ts_netmap_reset(&M);
+    take(BASE[2], &M);
     free(big);
 
     for (i = 0; i < nseeds; i++) {
@@ -218,6 +251,7 @@ void ts_fuzz_netmap(void)
     ts_netmap_free(&M);
     free(BASE[0]);
     free(BASE[1]);
+    free(BASE[2]);
     free(S1);
     free(S2);
 }
