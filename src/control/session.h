@@ -28,6 +28,10 @@
  * 60 s, minus up to 25 percent jitter, reset after 60 s of RUNNING. Keys are
  * kept across reconnects.
  *
+ * Starting (ts_sess_up) while already logged in sends one register of the
+ * current key (no Followup, OldNodeKey only if the state holds one) before
+ * the map, as upstream refreshes the key on login; reconnects map directly.
+ *
  * Expiry is control's decision: NodeKeyExpired in a register response, or the
  * self node's Expired flag in the map. KeyExpiry is only shown in status; the
  * session never compares it with a clock (it has none). On NodeKeyExpired the
@@ -36,12 +40,12 @@
  * map 404 (the node was deleted), moves to NEED_LOGIN until ts_sess_up, which
  * does the same key change.
  *
- * Rate limits: a 429, or a 503 with Retry-After, on a register or the map
- * request keeps the connection and repeats the same request after the given
- * number of seconds, clamped to TS_SESS_RETRY_AFTER_MAX_MS, without advancing
- * the backoff. A Retry-After that is absent, not a positive integer number of
- * seconds (an HTTP-date included: there is no wall clock here) uses the next
- * backoff delay instead.
+ * Rate limits: a 429, or a 503 with a non-empty Retry-After, on a register or
+ * the map request keeps the connection and repeats the same request after the
+ * given number of seconds, clamped to TS_SESS_RETRY_AFTER_MAX_MS. A
+ * Retry-After that is absent, zero, over an hour or not an integer number of
+ * seconds (an HTTP-date included: there is no wall clock here) waits a random
+ * 5 to 10 s instead, as upstream. The reconnect backoff is not touched.
  *
  * Text from control reaches status only as printable ASCII (other bytes become
  * '?'), and a login URL is accepted only if it is "https://" followed by bytes
@@ -70,8 +74,11 @@
 #define TS_SESS_PING_TIMEOUT_MS 30000    /* then this much more before giving up */
 #define TS_SESS_FOLLOWUP_MIN_MS 2000     /* floor between register sends */
 #define TS_SESS_FOLLOWUP_MAX_MS 60000    /* cap of its exponential growth */
-#define TS_SESS_RETRY_AFTER_MAX_MS 300000
+#define TS_SESS_RETRY_AFTER_MAX_MS 300000  /* longest wait honoured */
+#define TS_SESS_RETRY_AFTER_VALID_S 3600   /* a longer Retry-After is not believed */
+#define TS_SESS_RETRY_DEFAULT_MS 5000      /* else wait this plus up to as much again */
 #define TS_SESS_HEAD_PING_MS 15000       /* a PingRequest HEAD is cancelled after this */
+#define TS_SESS_REGEN_MIN_MS 60000       /* at most one new node key per minute */
 
 typedef enum {
     TS_SESS_IDLE,            /* not started, or logged out */
@@ -129,6 +136,10 @@ typedef struct {
     int goal;                            /* GOAL_* in session.c */
     int logged_in;
     int regen;                           /* make a new node key before the next register */
+    int refresh;                         /* logged in at start: register the current key once */
+    int have_regen;
+    int64_t last_regen;                  /* when the last new node key was made */
+    int save_failed;                     /* the logout's save failed (status) */
     int relogin;                         /* RELOGIN_*: waiting for ts_sess_up */
     int reg_authorized;                  /* MachineAuthorized, from the register or the map */
     char auth_url[TS_SESS_URL_MAX + 1];  /* "" when none */
@@ -253,9 +264,9 @@ typedef struct {
  * TS_SESS_URL_MAX bytes. */
 int ts_reg_resp_parse(ts_reg_resp *r, const char *json, size_t len);
 
-/* A Retry-After value: a positive integer number of seconds (spaces around
- * allowed), returned in milliseconds clamped to TS_SESS_RETRY_AFTER_MAX_MS.
- * -1 for anything else. */
+/* A Retry-After value: an integer number of seconds from 1 to
+ * TS_SESS_RETRY_AFTER_VALID_S (spaces around allowed), returned in
+ * milliseconds clamped to TS_SESS_RETRY_AFTER_MAX_MS. -1 for anything else. */
 int ts_retry_after_parse(const char *v, size_t n);
 
 /* Split "http[s]://authority/path?query" into the authority and the path with

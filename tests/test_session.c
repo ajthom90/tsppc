@@ -219,6 +219,44 @@ static void test_followup_reset(void)
     end();
 }
 
+/* Every Followup answered with NodeKeyExpired: no 2-second cycle of new keys. */
+static int g_nke;
+static void h_followup_expired(fake *f, fk_req *r)
+{
+    if (strcmp(r->path, "/machine/register") != 0) return;
+    if (is_followup(r)) {
+        g_nke++;
+        fk_reply(f, r, 200, "{\"NodeKeyExpired\":true}");
+    } else {
+        fk_reply(f, r, 200, "{\"AuthURL\":\"" URL1 "\"}");
+    }
+}
+
+static void test_followup_expired_loop(void)
+{
+    int i, gaps_ok = 1;
+    int64_t start;
+    g_nke = 0;
+    begin(h_followup_expired);
+    ts_sess_up(S);
+    fk_pump(&F);
+    start = F.now;
+    while (g_nke < 100 && F.now - start < 24LL * 3600 * 1000) fk_advance(&F, 1000, 1000);
+    t_true("fu expired: 100 rounds happened", g_nke == 100);
+    for (i = 1; i < F.nsave && i < 512; i++)
+        if (F.save_at[i] - F.save_at[i - 1] < TS_SESS_REGEN_MIN_MS) gaps_ok = 0;
+    t_true("fu expired: at most one new key a minute", gaps_ok);
+    t_true("fu expired: saves bounded by the rounds", F.nsave >= 1 && F.nsave <= 100);
+    /* Two register sends per round (followup, regenerated register), plus the
+     * first; the rounds took at least a minute each. */
+    t_true("fu expired: sends bounded", reg_count() <= 2 * 100 + 2);
+    t_true("fu expired: spread over time", F.now - start >= 99LL * TS_SESS_REGEN_MIN_MS);
+    /* The Followup spacing grows on its own, so the regeneration guard (which
+     * drops the connection) is only reached in the first rounds. */
+    t_true("fu expired: followup spacing does the pacing", F.ndisconnect <= 20);
+    end();
+}
+
 /* NodeKeyExpired: a new key, saved before the register that carries OldNodeKey. */
 static void h_expired(fake *f, fk_req *r)
 {
@@ -297,7 +335,7 @@ static void test_logout(void)
         snprintf(want, sizeof want, "\"NodeKey\":\"nodekey:%s\"", nk);
         t_true("logout: current node key", has(r->body, want));
     }
-    t_true("logout: map stream cancelled", fk_last(&F, "/machine/map")->reset);
+    t_true("logout: map stream cancelled", fk_last(&F, "/machine/map") && fk_last(&F, "/machine/map")->reset);
     t_true("logout: IDLE", ts_sess_get_state(S) == TS_SESS_IDLE);
     t_true("logout: login cleared and saved", F.saved.have_login == 0 && !F.saved.have_old_node);
     t_true("logout: fresh node key", memcmp(F.saved.node_priv, before, 32) != 0);
@@ -332,6 +370,91 @@ static void test_up_during_logout(void)
     r = fk_last(&F, "/machine/register");
     t_true("up in logout: new register on the same connection", r && !is_logout(r) && F.nconnect == 1);
     t_true("up in logout: NEED_LOGIN", ts_sess_get_state(S) == TS_SESS_NEED_LOGIN &&
+           ts_sess_login_url(S) && strcmp(ts_sess_login_url(S), URL2) == 0);
+    end();
+}
+
+/* A failed send closes the connection through io->disconnect. */
+static void test_send_failure(void)
+{
+    begin_running();
+    F.send_fail = 1;
+    F.auto_ping_ack = 0;
+    fk_advance(&F, 90000, 1000);         /* the keepalive PING is the next send */
+    t_true("send fail: one disconnect", F.ndisconnect == 1 && !F.up);
+    t_true("send fail: BACKOFF", ts_sess_get_state(S) == TS_SESS_BACKOFF && status_has("sending"));
+    t_true("send fail: no protocol violation", !F.bad);
+    end();
+
+    /* On port 80 before the handshake: disconnect, and only then 443. */
+    begin(h_std);
+    F.send_fail = 1;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("send fail on 80: then 443", F.nconnect == 2 && F.ports[0] == 80 && F.ports[1] == 443);
+    t_true("send fail on 80: each connection disconnected", F.ndisconnect == 2);
+    t_true("send fail on 80: 443 not opened while 80 was", !F.bad);
+    t_true("send fail on 80: BACKOFF", ts_sess_get_state(S) == TS_SESS_BACKOFF);
+    end();
+}
+
+/* Starting while logged in: one register of the current key, then the map. */
+static void h_refresh(fake *f, fk_req *r)
+{
+    if (strcmp(r->path, "/machine/register") == 0) {
+        if (has(r->body, "OldNodeKey")) fk_reply(f, r, 200, "{\"AuthURL\":\"" URL2 "\"}");
+        else if (f->hold_followup) fk_reply(f, r, 200, "{\"NodeKeyExpired\":true}");
+        else fk_reply(f, r, 200, "{\"MachineAuthorized\":true}");
+    } else if (strcmp(r->path, "/machine/map") == 0) {
+        fk_headers(f, r, 200, NULL, 0, 0);
+        fk_map_msg(f, r, MAP_OK);
+    }
+}
+
+static void test_refresh_on_start(void)
+{
+    char nk[65], want[128];
+    fk_req *r;
+    fk_init(&F, S, HOSTINFO);
+    F.handler = h_refresh;
+    F.st.have_login = 1;
+    fk_start(&F, HOSTINFO);
+    ts_sess_up(S);
+    fk_pump(&F);
+    key_hex(nk, F.st.node_priv);
+    r = F.nreq ? &F.req[0] : NULL;
+    t_true("refresh: first request is a register", r && strcmp(r->path, "/machine/register") == 0);
+    if (r) {
+        snprintf(want, sizeof want, "\"NodeKey\":\"nodekey:%s\"", nk);
+        t_true("refresh: current key, zero expiry", has(r->body, want) && has(r->body, "\"Expiry\":\"0001-01-01T00:00:00Z\""));
+        t_true("refresh: no Followup or OldNodeKey", !has(r->body, "Followup") && !has(r->body, "OldNodeKey"));
+        t_true("refresh: Hostinfo sent", has(r->body, "\"Hostinfo\":" HOSTINFO));
+    }
+    t_true("refresh: then the map, RUNNING", reg_count() == 1 && maps() == 1 && ts_sess_get_state(S) == TS_SESS_RUNNING);
+    t_true("refresh: no key change", F.nsave == 0);
+    fk_close(&F, "reset");
+    fk_advance(&F, 2000, 100);
+    t_true("refresh: not on reconnect", reg_count() == 1 && maps() == 2 && ts_sess_get_state(S) == TS_SESS_RUNNING);
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("refresh: not on up while running", reg_count() == 1);
+    end();
+
+    /* The refresh is answered NodeKeyExpired: a new key and a new login. */
+    fk_init(&F, S, HOSTINFO);
+    F.handler = h_refresh;
+    F.hold_followup = 1;
+    F.st.have_login = 1;
+    fk_start(&F, HOSTINFO);
+    ts_sess_up(S);
+    fk_pump(&F);
+    key_hex(nk, F.st.node_priv);
+    r = fk_last(&F, "/machine/register");
+    snprintf(want, sizeof want, "\"OldNodeKey\":\"nodekey:%s\"", nk);
+    t_true("refresh expired: register with OldNodeKey", reg_count() == 2 && r && has(r->body, want));
+    t_true("refresh expired: saved first, logged out", F.reqs_at_save == 1 && F.saved.have_login == 0 &&
+           memcmp(F.saved.old_node_priv, F.st.node_priv, 32) == 0);
+    t_true("refresh expired: NEED_LOGIN, no map", ts_sess_get_state(S) == TS_SESS_NEED_LOGIN && maps() == 0 &&
            ts_sess_login_url(S) && strcmp(ts_sess_login_url(S), URL2) == 0);
     end();
 }
@@ -560,17 +683,23 @@ static void test_rate_limits(void)
     w = rl_wait(503, "20", 100000);
     t_true("503 with Retry-After: waits 20 s", w == 20000 && F.ndisconnect == 0);
     end();
-    w = rl_wait(429, "Wed, 21 Oct 2037 07:28:00 GMT", 100000);
-    t_true("429 HTTP-date: backoff instead", w >= 700 && w <= 1000 && F.ndisconnect == 0);
-    end();
-    w = rl_wait(429, "0", 100000);
-    t_true("429 zero: backoff instead", w >= 700 && w <= 1000);
-    end();
-    w = rl_wait(429, "soon", 100000);
-    t_true("429 junk: backoff instead", w >= 700 && w <= 1000);
-    end();
-    w = rl_wait(429, NULL, 100000);
-    t_true("429 without Retry-After: backoff instead", w >= 700 && w <= 1000);
+    {
+        /* No usable Retry-After: a random 5 to 10 s, the connection kept, the
+         * backoff untouched (upstream's parseRateLimitError). */
+        static const char *const fallback[] = {
+            "Wed, 21 Oct 2037 07:28:00 GMT", "0", "soon", "7200", "", NULL,
+        };
+        size_t i;
+        for (i = 0; i < sizeof fallback / sizeof fallback[0]; i++) {
+            char label[96];
+            w = rl_wait(429, fallback[i], 100000);
+            snprintf(label, sizeof label, "429 Retry-After \"%s\": random 5 to 10 s", fallback[i] ? fallback[i] : "(none)");
+            t_true(label, w >= 5000 && w <= 10000 && F.ndisconnect == 0 && S->backoff_ms == 0);
+            end();
+        }
+    }
+    w = rl_wait(503, "", 100000);
+    t_true("503 with an empty Retry-After: an ordinary failure", w >= 700 && w <= 1000 && F.ndisconnect == 1);
     end();
     w = rl_wait(503, NULL, 100000);
     t_true("503 without Retry-After: an ordinary failure", w >= 700 && w <= 1000 && F.ndisconnect == 1 && F.nconnect == 2);
@@ -710,9 +839,9 @@ static void test_ping_request(void)
            fk_count(&F, "/p/4", NULL) == 0 && fk_count(&F, "/p/5", NULL) == 0);
     t_true("ping: pending cleared", !ts_sess_netmap(S)->ping.pending);
     fk_advance(&F, 14000, 1000);
-    t_true("ping: HEAD open before 15 s", !fk_last(&F, "/p/2")->reset);
+    t_true("ping: HEAD open before 15 s", fk_last(&F, "/p/2") && !fk_last(&F, "/p/2")->reset);
     fk_advance(&F, 2000, 1000);
-    t_true("ping: unanswered HEAD cancelled after 15 s", fk_last(&F, "/p/2")->reset);
+    t_true("ping: unanswered HEAD cancelled after 15 s", fk_last(&F, "/p/2") && fk_last(&F, "/p/2")->reset);
     t_true("ping: map unaffected", ts_sess_get_state(S) == TS_SESS_RUNNING && !m->closed);
     /* An answered ping, and one per URL across a reconnect too. */
     fk_reply(&F, fk_last(&F, "/p/1?x=y"), 200, NULL);
@@ -937,7 +1066,7 @@ static void test_window_update(void)
     }
     t_true("window: more than 1 MiB sent", F.data_sent > 1600000);
     t_true("window: WINDOW_UPDATEs returned credit", F.winupd_bytes >= 1000000);
-    t_true("window: all of it delivered", fk_out_slot(&F, m->sid, 0)->len == 0);
+    t_true("window: all of it delivered", fk_out_slot(&F, m->sid, 0) && fk_out_slot(&F, m->sid, 0)->len == 0);
     t_true("window: last message applied", ts_sess_netmap(S)->npeers == 1 &&
            ts_sess_netmap(S)->peers[0].id == 25);
     t_true("window: RUNNING", ts_sess_get_state(S) == TS_SESS_RUNNING);
@@ -985,8 +1114,12 @@ static void test_parsers(void)
     }
     t_true("retry-after: 30", ts_retry_after_parse("30", 2) == 30000);
     t_true("retry-after: spaces", ts_retry_after_parse(" 7 ", 3) == 7000);
-    t_true("retry-after: cap", ts_retry_after_parse("7200", 4) == TS_SESS_RETRY_AFTER_MAX_MS);
-    t_true("retry-after: huge", ts_retry_after_parse("99999999999999999999999", 23) == TS_SESS_RETRY_AFTER_MAX_MS);
+    t_true("retry-after: clamped to 300 s", ts_retry_after_parse("900", 3) == TS_SESS_RETRY_AFTER_MAX_MS &&
+           ts_retry_after_parse("3600", 4) == TS_SESS_RETRY_AFTER_MAX_MS);
+    t_true("retry-after: 299 s kept", ts_retry_after_parse("299", 3) == 299000);
+    t_true("retry-after: over an hour refused", ts_retry_after_parse("3601", 4) == -1 &&
+           ts_retry_after_parse("7200", 4) == -1);
+    t_true("retry-after: huge", ts_retry_after_parse("99999999999999999999999", 23) == -1);
     t_true("retry-after: zero", ts_retry_after_parse("0", 1) == -1);
     t_true("retry-after: negative", ts_retry_after_parse("-5", 2) == -1);
     t_true("retry-after: empty", ts_retry_after_parse("", 0) == -1);
@@ -1033,6 +1166,9 @@ void test_session(void)
     test_expired_twice();
     test_logout();
     test_logout_not_logged_in();
+    test_send_failure();
+    test_refresh_on_start();
+    test_followup_expired_loop();
     test_up_during_logout();
     test_approval();
     test_status();

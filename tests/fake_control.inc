@@ -76,6 +76,8 @@ typedef struct fake {
     ts_state saved;
     int reqs_at_save;
     int save_fail;
+    int send_fail;            /* the next sends fail (the connection stays open until disconnect) */
+    int64_t save_at[512];     /* fake time of each save */
 
     /* The connection. */
     int up;
@@ -151,6 +153,7 @@ FK_FN int fk_io_send(void *u, const uint8_t *p, size_t n)
 {
     fake *f = (fake *)u;
     if (!f->up) { f->bad = 1; return -1; }
+    if (f->send_fail) return -1;
     fk_append(&f->c2s, &f->c2s_len, &f->c2s_cap, p, n);
     return 0;
 }
@@ -184,6 +187,7 @@ FK_FN int fk_io_save(void *u, const ts_state *st)
 {
     fake *f = (fake *)u;
     if (f->save_fail) return -1;
+    if (f->nsave < 512) f->save_at[f->nsave] = f->now;
     f->nsave++;
     f->saved = *st;
     f->reqs_at_save = f->nreq;

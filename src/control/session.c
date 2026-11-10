@@ -214,8 +214,14 @@ static void send_register(ts_sess *s, int kind)
     int regen = 0;
 
     if (kind == REG_LOGIN && s->regen) {
-        /* A new node key, saved before control sees it. */
+        /* A new node key, saved before control sees it. Each one writes the
+         * state to disk, so a control that keeps expiring them is not
+         * followed more than once a minute. */
         uint8_t k[32];
+        if (s->have_regen && s->now - s->last_regen < TS_SESS_REGEN_MIN_MS) {
+            fail(s, FAIL_RETRY_HERE, "control keeps expiring new node keys");
+            return;
+        }
         if (s->io->random(s->user, k, 32) != 0) {
             fail(s, FAIL_RETRY_HERE, "no randomness for a new node key");
             return;
@@ -239,6 +245,8 @@ static void send_register(ts_sess *s, int kind)
             return;
         }
         s->regen = 0;
+        s->have_regen = 1;
+        s->last_regen = s->now;
         regen = 1;
     }
     ts_wipe(&prev, sizeof prev);
@@ -350,6 +358,7 @@ static void handle_ping(ts_sess *s)
     uint32_t sid;
     if (!pr->pending) return;
     pr->pending = 0;
+    if (!pr->url[0]) return;                               /* nothing to answer */
     if (strcmp(pr->url, s->last_ping_url) == 0) return;   /* duplicate */
     memcpy(s->last_ping_url, pr->url, sizeof s->last_ping_url);
     if (pr->types[0] || !pr->url_is_noise) return;       /* c2n, TSMP, disco, plain TLS: ignored */
@@ -395,12 +404,19 @@ static void on_map_msg(void *user, const char *json, size_t len)
     if (s->nm.have_self) s->reg_authorized = s->nm.self.authorized;
 }
 
-/* Rate limited: wait as told (or the backoff) and repeat the same request. */
+/* Rate limited: wait as told and repeat the same request. Without a usable
+ * Retry-After, a random 5 to 10 s, as upstream (direct.go parseRateLimitError).
+ * The reconnect backoff is neither advanced nor reset. */
 static int rate_limit(ts_sess *s, const ts_sess_resp *r, int64_t *at)
 {
     int64_t w;
+    uint8_t rnd[2];
     if (r->status != 429 && !(r->status == 503 && r->have_retry_after)) return 0;
-    w = r->retry_after_ms > 0 ? r->retry_after_ms : next_backoff(s);
+    w = r->retry_after_ms;
+    if (w <= 0) {
+        w = TS_SESS_RETRY_DEFAULT_MS;
+        if (s->io->random(s->user, rnd, 2) == 0) w += ts_get_be16(rnd) % TS_SESS_RETRY_DEFAULT_MS;
+    }
     *at = s->now + w;
     s->rate_limited = 1;
     s->rate_until = *at;
@@ -417,6 +433,7 @@ static void followup_ended(ts_sess *s)
 static void login_done(ts_sess *s, int authorized)
 {
     s->logged_in = 1;
+    s->refresh = 0;
     s->auth_url[0] = 0;
     s->fu_interval = TS_SESS_FOLLOWUP_MIN_MS;
     s->reg_authorized = authorized;
@@ -433,7 +450,11 @@ static void logout_done(ts_sess *s)
 {
     uint8_t k[32];
     /* Forget the login: a fresh node key with no old one, as upstream clears
-     * its persisted state. The machine and disco keys stay. */
+     * its persisted state. The machine and disco keys stay. If there is no
+     * randomness the node key is kept: control has just expired it, so the
+     * next login gets NodeKeyExpired and makes a new one then. If the save
+     * fails the file still says logged in; status says so, and a restart
+     * registers the expired key and is sent through the same expiry path. */
     if (s->io->random(s->user, k, 32) == 0) {
         ts_state_clamp_key(k);
         memcpy(s->st.node_priv, k, 32);
@@ -442,8 +463,9 @@ static void logout_done(ts_sess *s)
     ts_wipe(s->st.old_node_priv, 32);
     s->st.have_old_node = 0;
     s->st.have_login = 0;
-    (void)s->io->save_state(s->user, &s->st);
+    s->save_failed = s->io->save_state(s->user, &s->st) != 0;
     s->logged_in = 0;
+    s->refresh = 0;
     s->auth_url[0] = 0;
     s->relogin = RELOGIN_NONE;
     s->regen = 0;
@@ -507,8 +529,12 @@ static void reg_end(ts_sess *s, int error)
             return;
         }
         s->regen = 1;
+        s->logged_in = 0;
         s->auth_url[0] = 0;
-        s->reg_at = s->now;
+        /* After a Followup, keep its growing spacing: a control that answers
+         * every Followup this way must not make us cycle every 2 s. */
+        if (kind == REG_FOLLOWUP) followup_ended(s);
+        else s->reg_at = s->now;
         return;
     }
     if (rr.auth_url[0]) {
@@ -517,6 +543,7 @@ static void reg_end(ts_sess *s, int error)
             fail(s, FAIL_RETRY_HERE, "control sent an invalid login URL");
             return;
         }
+        s->logged_in = 0;   /* a refresh of a logged-in key can need a login again */
         if (kind == REG_FOLLOWUP) followup_ended(s);
         else s->reg_at = s->last_reg_send + s->fu_interval;
         memcpy(s->auth_url, rr.auth_url, sizeof s->auth_url);
@@ -573,7 +600,8 @@ static void cb_header(void *u, uint32_t sid, const char *n, size_t nl, const cha
     ts_sess *s = (ts_sess *)u;
     ts_sess_resp *r = resp_for(s, sid);
     if (s->pending_fail || !r || r->status) return;   /* after status: trailers */
-    if (name_is(n, nl, "retry-after") && !r->have_retry_after) {
+    /* An empty value is absent, as Go's Header.Get(...) != "". */
+    if (name_is(n, nl, "retry-after") && vl > 0 && !r->have_retry_after) {
         r->have_retry_after = 1;
         r->retry_after_ms = ts_retry_after_parse(v, vl);
     }
@@ -781,7 +809,7 @@ static void flush(ts_sess *s)
             break;
         }
         if (s->io->send(s->user, s->sbuf, w) != 0) {
-            s->io_closed = 1;
+            /* The connection is still the I/O layer's: close_conn disconnects it. */
             fail(s, FAIL_RETRY, "sending to control failed");
             break;
         }
@@ -816,6 +844,11 @@ static void drive(ts_sess *s)
     if (!s->logged_in) {
         if (!s->reg.sid && s->now >= s->reg_at)
             send_register(s, s->auth_url[0] ? REG_FOLLOWUP : REG_LOGIN);
+    } else if (s->refresh) {
+        /* Logged in at start: register the current key once before mapping,
+         * as upstream's "try refreshing the current key" login. It brings
+         * Hostinfo up to date and lets control answer NodeKeyExpired. */
+        if (!s->reg.sid && s->now >= s->reg_at) send_register(s, REG_LOGIN);
     } else if (!s->map.sid && s->now >= s->map_at && s->now >= s->sleep_until) {
         send_map(s);
     }
@@ -920,7 +953,6 @@ void ts_sess_connected(ts_sess *s)
         if (n == 0) {
             fail(s, FAIL_RETRY_HERE, "cannot build the upgrade request");
         } else if (s->io->send(s->user, s->sbuf, n) != 0) {
-            s->io_closed = 1;
             fail(s, FAIL_RETRY, "sending to control failed");
         }
     }
@@ -993,6 +1025,8 @@ void ts_sess_up(ts_sess *s)
         s->goal = GOAL_UP;
         if (!s->auth_url[0]) s->reg_at = s->now;
         s->map_at = s->now;
+        /* Starting while logged in: one register of the current key first. */
+        if (s->logged_in) s->refresh = 1;
     }
     /* An operator's request retries now. */
     s->backoff_ms = 0;
@@ -1080,7 +1114,8 @@ void ts_sess_status(const ts_sess *s, char *out, size_t cap)
     detail[0] = 0;
     switch (s->state) {
     case TS_SESS_IDLE:
-        snprintf(detail, sizeof detail, "%s", s->logged_in ? "logged in, not connected" : "logged out");
+        snprintf(detail, sizeof detail, "%s", s->logged_in ? "logged in, not connected"
+                 : s->save_failed ? "logged out, but the node state could not be saved" : "logged out");
         break;
     case TS_SESS_CONNECTING:
         snprintf(detail, sizeof detail, "%s", s->goal == GOAL_LOGOUT ? "logging out" : "connecting to control");
@@ -1214,7 +1249,7 @@ int ts_retry_after_parse(const char *v, size_t n)
     for (; i < end; i++) {
         if (v[i] < '0' || v[i] > '9') return -1;
         secs = secs * 10 + (uint32_t)(v[i] - '0');
-        if (secs > TS_SESS_RETRY_AFTER_MAX_MS / 1000) secs = TS_SESS_RETRY_AFTER_MAX_MS / 1000 + 1;
+        if (secs > TS_SESS_RETRY_AFTER_VALID_S) return -1;   /* over an hour: not believed */
     }
     if (secs == 0) return -1;
     if (secs > TS_SESS_RETRY_AFTER_MAX_MS / 1000) return TS_SESS_RETRY_AFTER_MAX_MS;
