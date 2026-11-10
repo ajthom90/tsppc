@@ -14,12 +14,19 @@
  *   1  a Retry-After value
  *   2  a PingRequest URL split into authority and path
  *
- * "session_stream": the server's HTTP/2 plaintext after a real handshake with
- * the fake server, when the session has sent its register. Input: BE16 split,
- * then bytes; bytes[0..split) and the rest are sealed and delivered in two
- * reads, so the map request opened after the first can be answered by the
- * second. Then the clock runs for a while. Each iteration is a full handshake,
- * so this target runs fewer iterations. */
+ * "session_stream": the server's plaintext after a real handshake with the
+ * fake server. Input: BE16 split, then bytes; bytes[0..split & 0x7fff) and the
+ * rest are sealed and delivered in two reads, so the map request opened after
+ * the first can be answered by the second. With bit 15 of split clear the fake
+ * has already sent its SETTINGS (HTTP/2 is decided); with it set the input is
+ * the very first plaintext, so the early payload is fuzzed too. Then the clock
+ * runs for a while. Each iteration is a full handshake, so this target runs
+ * fewer iterations.
+ *
+ * "session_handshake": the server's bytes before Noise transport (the HTTP
+ * upgrade response, the 3-byte reply header, the response or error text),
+ * delivered in pieces whose sizes come from the first byte. No server keys are
+ * involved, so it runs the default count. */
 
 #define STREAM_ITERS 10000u
 
@@ -69,18 +76,21 @@ static ts_sess_state stream_run(const uint8_t *d, size_t len)
     size_t split;
     const char *url;
     ts_sess_state state;
+    int raw = len >= 2 && (d[0] & 0x80);
     fk_init(&g_f, g_s, NULL);
+    g_f.no_preface = raw;
     fk_start(&g_f, "{\"OS\":\"macOS\"}");
     ts_sess_up(g_s);
     fk_pump(&g_f);
     TS_FUZZ_ASSERT(g_f.nreq == 1 && g_f.up);
     if (len >= 2) {
-        split = ts_get_be16(d);
+        split = ts_get_be16(d) & 0x7fff;
         d += 2;
         len -= 2;
         if (split > len) split = len;
         fk_send_plain(&g_f, d, split);
         fk_pump(&g_f);
+        g_f.no_preface = 0;   /* the fake may answer PINGs from here on */
         if (g_f.up && len > split) {
             fk_send_plain(&g_f, d + split, len - split);
             fk_pump(&g_f);
@@ -100,6 +110,50 @@ static ts_sess_state stream_run(const uint8_t *d, size_t len)
 static void stream(const uint8_t *d, size_t len)
 {
     (void)stream_run(d, len);
+}
+
+/* ---- Handshake target ---------------------------------------------------- */
+
+static int hs_connect(void *u, const char *h, uint16_t p) { (void)u; (void)h; (void)p; return 0; }
+static int hs_send(void *u, const uint8_t *p, size_t n) { (void)u; (void)p; (void)n; return 0; }
+static void hs_disconnect(void *u) { (void)u; }
+static int hs_save(void *u, const ts_state *st) { (void)u; (void)st; return 0; }
+static int hs_random(void *u, uint8_t *o, size_t n) { (void)u; memset(o, 0x5a, n); return 0; }
+static const ts_sess_io HS_IO = { hs_connect, hs_send, hs_disconnect, hs_save, hs_random };
+
+static void handshake(const uint8_t *d, size_t len)
+{
+    static ts_state st;
+    uint8_t cpriv[32], cpub[32];
+    char text[2048];
+    size_t at = 1, i;
+    unsigned pat;
+    ts_sess_state state;
+    if (len == 0) return;
+    pat = d[0];
+    for (i = 0; i < 32; i++) {
+        st.machine_priv[i] = (uint8_t)(0x10 + i);
+        st.node_priv[i] = (uint8_t)(0x90 + i);
+        st.disco_priv[i] = (uint8_t)(0x50 + i);
+        cpriv[i] = (uint8_t)(0x40 + 3 * i);
+    }
+    ts_x25519_public(cpub, cpriv);
+    ts_sess_init(g_s, &st, &HS_IO, NULL, cpub, "{}");
+    ts_sess_tick(g_s, 1000);
+    ts_sess_up(g_s);
+    ts_sess_connected(g_s);
+    while (at < len) {
+        size_t piece = (pat & 7) == 0 ? len - at : (size_t)((pat + at) % 61) + 1;
+        if (piece > len - at) piece = len - at;
+        ts_sess_recv(g_s, d + at, piece);
+        at += piece;
+    }
+    ts_sess_tick(g_s, 40000);
+    state = ts_sess_get_state(g_s);
+    TS_FUZZ_ASSERT(state == TS_SESS_CONNECTING || state == TS_SESS_BACKOFF);
+    ts_sess_status(g_s, text, sizeof text);
+    for (i = 0; text[i]; i++) TS_FUZZ_ASSERT((unsigned char)text[i] >= 0x20 && (unsigned char)text[i] < 0x7f);
+    ts_sess_free(g_s);
 }
 
 /* ---- Seeds ------------------------------------------------------------ */
@@ -165,9 +219,9 @@ void ts_fuzz_session(void)
         "\x02https://ping.example.test:443/p/1?x=y",
         "\x02http://h?q",
     };
-    static sbuf seeds[4];
-    const uint8_t *sp[6], *ss[4];
-    size_t sl[6], sn[4], i;
+    static sbuf seeds[5];
+    const uint8_t *sp[6], *ss[5], *hp[3];
+    size_t sl[6], sn[5], hl[3], i;
     static const uint8_t ping[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
 
     for (i = 0; i < 6; i++) {
@@ -211,7 +265,25 @@ void ts_fuzz_session(void)
     s_headers(&seeds[3], 3, "200", NULL, 0);
     s_msg(&seeds[3], 3, "{\"Node\":" SEED_SELF ",\"TKAInfo\":{},\"Debug\":{\"Exit\":0}}");
     s_headers(&seeds[3], 5, "404", NULL, 1);
-    for (i = 0; i < 4; i++) {
+    /* No preface from the fake: an early payload, then SETTINGS and a login. */
+    seeds[4].n = 2;
+    {
+        static const char ep[] = "{\"nodeKeyChallenge\":\"chal\"}";
+        uint8_t h[9];
+        memcpy(h, "\xff\xff\xffTS", 5);
+        ts_put_be32(h + 5, (uint32_t)(sizeof ep - 1));
+        memcpy(seeds[4].b + seeds[4].n, h, 9);
+        memcpy(seeds[4].b + seeds[4].n + 9, ep, sizeof ep - 1);
+        seeds[4].n += 9 + sizeof ep - 1;
+    }
+    s_frame(&seeds[4], FK_SETTINGS, 0, 0, NULL, 0);
+    s_headers(&seeds[4], 1, "200", NULL, 0);
+    s_data(&seeds[4], 1, "{\"MachineAuthorized\":true}", 1);
+    s_split(&seeds[4]);
+    seeds[4].b[0] |= 0x80;
+    s_headers(&seeds[4], 3, "200", NULL, 0);
+    s_msg(&seeds[4], 3, "{\"Node\":" SEED_SELF "}");
+    for (i = 0; i < 5; i++) {
         ss[i] = seeds[i].b;
         sn[i] = seeds[i].n;
     }
@@ -220,6 +292,37 @@ void ts_fuzz_session(void)
     TS_FUZZ_ASSERT(stream_run(ss[1], sn[1]) == TS_SESS_NEED_LOGIN);
     TS_FUZZ_ASSERT(stream_run(ss[2], sn[2]) == TS_SESS_CONNECTING);
     TS_FUZZ_ASSERT(stream_run(ss[3], sn[3]) == TS_SESS_FAILED);
-    ts_fuzz_run("session_stream", stream, ss, sn, 4, STREAM_ITERS);
+    TS_FUZZ_ASSERT(stream_run(ss[4], sn[4]) == TS_SESS_RUNNING);
+    ts_fuzz_run("session_stream", stream, ss, sn, 5, STREAM_ITERS);
+
+    {
+        static uint8_t h0[200], h1[200], h2[8192];
+        static const char up[] = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: tailscale-control-protocol\r\n"
+                                 "Connection: upgrade\r\n\r\n";
+        size_t u = sizeof up - 1;
+        h0[0] = 3;
+        memcpy(h0 + 1, up, u);
+        h0[1 + u] = 2;
+        ts_put_be16(h0 + 2 + u, 48);
+        for (i = 0; i < 48; i++) h0[4 + u + i] = (uint8_t)(7 * i);
+        hl[0] = 4 + u + 48;
+        h1[0] = 0;
+        memcpy(h1 + 1, up, u);
+        memcpy(h1 + 1 + u, "\x03\x00\x1b" "client \x1b[31mversion too old", 30);
+        hl[1] = 1 + u + 30;
+        h2[0] = 5;
+        memcpy(h2 + 1, up, u - 2);
+        hl[2] = 1 + u - 2;
+        while (hl[2] < 8150) {
+            memcpy(h2 + hl[2], "X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n", 40);
+            hl[2] += 40;
+        }
+        memcpy(h2 + hl[2], "\r\n\x02\x00\x30", 5);
+        hl[2] += 5;
+        hp[0] = h0;
+        hp[1] = h1;
+        hp[2] = h2;
+        ts_fuzz_run("session_handshake", handshake, hp, hl, 3, TS_FUZZ_DEFAULT_ITERS);
+    }
     free(g_s);
 }

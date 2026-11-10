@@ -88,6 +88,7 @@ typedef struct fake {
     int phase;                /* 0: HTTP upgrade, 1: Noise transport, 2: silent */
     const char *hs_error;     /* answer the handshake with this error frame */
     const char *early;        /* early payload JSON to send before HTTP/2 */
+    int no_preface;           /* send no frames of our own: the caller writes the whole stream */
     r_session rs;
     uint64_t rx_ctr, tx_ctr;
     uint8_t *pt;
@@ -221,7 +222,7 @@ FK_FN void fk_frame(fake *f, unsigned type, unsigned flags, uint32_t sid, const 
 {
     uint8_t h[9], l[4];
     uint8_t *buf;
-    if (!f->up || f->phase != 1) return;
+    if (!f->up || f->phase != 1 || f->no_preface) return;
     buf = (uint8_t *)malloc(9 + len);
     if (!buf) abort();
     ts_put_be32(l, (uint32_t)len);
@@ -545,6 +546,7 @@ FK_FN size_t fk_upgrade(fake *f)
     }
     fk_append(&f->s2c, &f->s2c_len, &f->s2c_cap, resp, sizeof resp);
     f->phase = 1;
+    if (f->no_preface) return (size_t)(end - b);
     if (f->early) {
         uint8_t eh[9];
         size_t n = strlen(f->early);
