@@ -1,3 +1,9 @@
+/* G3/G4 multiply instructions take variable time; the PowerPC build must use
+ * BearSSL's constant-time multiply (set by the ppc-test target). */
+#if defined(__ppc__) && (!defined(BR_CT_MUL31) || !BR_CT_MUL31)
+#error "PowerPC build requires -DBR_CT_MUL31=1 for constant-time X25519"
+#endif
+
 #include "x25519.h"
 #include <string.h>
 #include <bearssl_ec.h>

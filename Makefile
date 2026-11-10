@@ -24,6 +24,8 @@ CC     := gcc-4.0
 ARCH   := -std=gnu99 -arch ppc -isysroot /Developer/SDKs/MacOSX10.4u.sdk -mmacosx-version-min=10.4
 VENDOR := ppc
 SAN    :=
+# G3/G4 multiplies are variable-time: force BearSSL's constant-time multiply.
+CTMUL  := -DBR_CT_MUL31=1
 else
 CC     := cc
 ARCH   := -std=gnu99
@@ -36,8 +38,8 @@ endif
 endif
 
 OPT    := -O1 -g
-CFLAGS := $(ARCH) $(OPT) $(SAN) -Wall -Wextra -Werror -MMD -MP -I. -I$(BEARSSL)/inc
-VFLAGS := $(ARCH) -O2 -w -I$(BEARSSL)/inc -I$(BEARSSL)/src
+CFLAGS := $(ARCH) $(CTMUL) $(OPT) $(SAN) -Wall -Wextra -Werror -MMD -MP -I. -I$(BEARSSL)/inc
+VFLAGS := $(ARCH) $(CTMUL) -O2 -w -I$(BEARSSL)/inc -I$(BEARSSL)/src
 
 OBJDIR  := build/$(TARGET)
 VOBJDIR := build/vendor-$(VENDOR)
