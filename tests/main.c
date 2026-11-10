@@ -12,6 +12,7 @@ void test_noise(void);
 void test_net(void);
 void test_store(void);
 void test_netmap(void);
+void test_session(void);
 
 int main(void)
 {
@@ -27,5 +28,6 @@ int main(void)
     test_net();
     test_store();
     test_netmap();
+    test_session();
     return t_summary();
 }

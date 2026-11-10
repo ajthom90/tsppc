@@ -261,13 +261,17 @@ int ts_state_save(const ts_state *s, const char *dir, char *err, size_t errcap)
     return save_impl(s, dir, 0, err, errcap);
 }
 
-/* Clamp as X25519 requires; the crypto module clamps again when it uses the key. */
-static int new_key(uint8_t k[32])
+void ts_state_clamp_key(uint8_t k[32])
 {
-    if (ts_random_bytes(k, 32) != 0) return -1;
     k[0] &= 248;
     k[31] &= 127;
     k[31] |= 64;
+}
+
+static int new_key(uint8_t k[32])
+{
+    if (ts_random_bytes(k, 32) != 0) return -1;
+    ts_state_clamp_key(k);
     return 0;
 }
 

@@ -55,6 +55,10 @@ typedef struct {
     int have_login;
 } ts_state;
 
+/* Clamp 32 random bytes into an X25519 private key, as every key in the state
+ * is made (the crypto module clamps again when it uses the key). */
+void ts_state_clamp_key(uint8_t k[32]);
+
 /* Serialise s into out (TS_STATE_FILE_LEN bytes). */
 void ts_state_encode(uint8_t out[TS_STATE_FILE_LEN], const ts_state *s);
 
