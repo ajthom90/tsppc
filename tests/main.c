@@ -13,6 +13,7 @@ void test_net(void);
 void test_store(void);
 void test_netmap(void);
 void test_session(void);
+void test_ipc(void);
 
 int main(void)
 {
@@ -29,5 +30,6 @@ int main(void)
     test_store();
     test_netmap();
     test_session();
+    test_ipc();
     return t_summary();
 }

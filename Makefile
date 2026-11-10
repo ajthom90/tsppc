@@ -4,22 +4,44 @@
 # TS_FUZZ_ITERS to change the 200000 iterations per target), ppc-test
 # (PowerPC, build only here; run the binary on a PowerPC Mac; also builds the
 # tun_check driver check tool, which tools/driver.sh runs, and the
-# keyfetch_check live TLS check), keyfetch-check (host build of keyfetch_check).
+# keyfetch_check live TLS check), keyfetch-check (host build of keyfetch_check),
+# release (host tsppcd and tsppc without test hooks), ppc (the same for
+# PowerPC, with the ppc-test compiler and flags).
+# test, asan and ppc-test also build their own tsppcd and tsppc (with test
+# hooks, for the daemon tests) and the matching release programs, and check
+# with tools/check-release.sh that the release daemon has no test hooks.
 # GNU make 3.81 and /bin/sh compatible.
-# New src/**/*.c files are picked up automatically.
+# New src/**/*.c files are picked up automatically; src/daemon/main.c and
+# src/cli/main.c are the programs' mains and stay out of the test binaries.
 
 SHELL := /bin/sh
 
 BEARSSL := vendor/bearssl-0.6
 SRCS    := $(shell find src -name '*.c' | sort)
+MAINS   := src/daemon/main.c src/cli/main.c
+LIBSRCS := $(filter-out $(MAINS),$(SRCS))
 ALLTESTS := $(wildcard tests/*.c)
 BSRCS   := $(shell find $(BEARSSL)/src -name '*.c' | sort)
 
 ifeq ($(TARGET),)
-.PHONY: test asan ct-test ppc-test fuzz keyfetch-check clean
-test asan ct-test ppc-test:
-	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all $(if $(filter ppc-test,$@),build/ppc-test/tun_check build/ppc-test/keyfetch_check)
+.PHONY: test asan ct-test ppc-test fuzz keyfetch-check release ppc clean
+# The release build that goes with each test target.
+rel_test := release
+rel_asan := release
+rel_ppc-test := ppc
+test asan ppc-test:
+	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all build/$@/tsppcd build/$@/tsppc $(if $(filter ppc-test,$@),build/ppc-test/tun_check build/ppc-test/keyfetch_check)
+	@$(MAKE) --no-print-directory TARGET=$(rel_$@) build/$(rel_$@)/tsppcd build/$(rel_$@)/tsppc
+	@sh tools/check-release.sh build/$(rel_$@)/tsppcd build/$@/tsppcd
 	@./build/$@/test_all
+
+ct-test:
+	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all
+	@./build/$@/test_all
+
+release ppc:
+	@$(MAKE) --no-print-directory TARGET=$@ build/$@/tsppcd build/$@/tsppc
+	@sh tools/check-release.sh build/$@/tsppcd
 
 keyfetch-check:
 	@$(MAKE) --no-print-directory TARGET=test build/test/keyfetch_check
@@ -32,7 +54,7 @@ clean:
 	rm -rf build
 else
 
-ifeq ($(TARGET),ppc-test)
+ifneq ($(filter ppc-test ppc,$(TARGET)),)
 CC     := gcc-4.0
 ARCH   := -std=gnu99 -arch ppc -isysroot /Developer/SDKs/MacOSX10.4u.sdk -mmacosx-version-min=10.4
 VENDOR := ppc
@@ -74,13 +96,22 @@ else
 TESTS  := $(filter-out tests/fuzz%,$(ALLTESTS))
 endif
 
+# Release programs have no test hooks: no environment overrides, no test-only
+# functions. Everything else is built with them.
+ifneq ($(filter release ppc,$(TARGET)),)
+HOOKS  :=
+else
+HOOKS  := -DTS_TEST_HOOKS
+endif
+
 OPT    := -O1 -g
-CFLAGS := $(ARCH) $(CTMUL) $(FZDEF) -DTS_TEST_HOOKS $(OPT) $(SAN) -Wall -Wextra -Werror -MMD -MP -I. -I$(BEARSSL)/inc
+CFLAGS := $(ARCH) $(CTMUL) $(FZDEF) $(HOOKS) -DTS_BIN_DIR=\"build/$(TARGET)\" $(OPT) $(SAN) -Wall -Wextra -Werror -MMD -MP -I. -I$(BEARSSL)/inc
 VFLAGS := $(ARCH) $(CTMUL) $(VSAN) -O2 -w -I$(BEARSSL)/inc -I$(BEARSSL)/src
 
 OBJDIR  := build/$(TARGET)
 VOBJDIR := build/vendor-$(VENDOR)
-OBJS    := $(patsubst %.c,$(OBJDIR)/%.o,$(SRCS) $(TESTS))
+LIBOBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(LIBSRCS))
+OBJS    := $(patsubst %.c,$(OBJDIR)/%.o,$(LIBSRCS) $(TESTS))
 VOBJS   := $(patsubst %.c,$(VOBJDIR)/%.o,$(BSRCS))
 
 # Each object depends on a stamp holding the compiler and flags it was built
@@ -134,7 +165,14 @@ CHECKOBJS := $(OBJDIR)/tools/tun_check.o $(OBJDIR)/src/core/bytes.o
 $(OBJDIR)/tun_check: $(CHECKOBJS)
 	$(CC) $(ARCH) -o $@ $(CHECKOBJS)
 
-KFOBJS := $(OBJDIR)/tools/keyfetch_check.o $(patsubst %.c,$(OBJDIR)/%.o,$(SRCS))
+KFOBJS := $(OBJDIR)/tools/keyfetch_check.o $(LIBOBJS)
+
+$(OBJDIR)/tsppcd: $(OBJDIR)/src/daemon/main.o $(LIBOBJS) $(VOBJS)
+	$(CC) $(ARCH) $(SAN) -o $@ $(OBJDIR)/src/daemon/main.o $(LIBOBJS) $(VOBJS)
+
+# The CLI needs only the socket code.
+$(OBJDIR)/tsppc: $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/daemon/ipc.o
+	$(CC) $(ARCH) $(SAN) -o $@ $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/daemon/ipc.o
 
 $(OBJDIR)/keyfetch_check: $(KFOBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(KFOBJS) $(VOBJS)
@@ -147,5 +185,5 @@ $(VOBJDIR)/%.o: %.c $(VFLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(VFLAGS) -c -o $@ $<
 
--include $(OBJS:.o=.d) $(CHECKOBJS:.o=.d) $(OBJDIR)/tools/keyfetch_check.d
+-include $(OBJS:.o=.d) $(CHECKOBJS:.o=.d) $(OBJDIR)/tools/keyfetch_check.d $(patsubst %.c,$(OBJDIR)/%.d,$(MAINS))
 endif

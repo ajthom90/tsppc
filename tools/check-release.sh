@@ -1,0 +1,54 @@
+#!/bin/sh
+# Check that a release tsppcd has no test hooks: no test-only symbols and none
+# of the environment overrides. With a second argument (a hooked tsppcd from
+# the same tree), also check that the hooked one has them, so the check cannot
+# pass because it looks in the wrong place.
+# Usage: tools/check-release.sh <release tsppcd> [<hooked tsppcd>]
+set -u
+
+REL=${1:?usage: $0 <release tsppcd> [<hooked tsppcd>]}
+HOOKED=${2:-}
+SYMS="ts_noise_init_eph ts_resolve_test_delay"
+STRS="TSPPC_STATE_DIR TSPPC_SOCKET TSPPC_CONTROL"
+fail=0
+
+tmp=$(mktemp -t tsppcnm) || exit 1
+trap 'rm -f "$tmp"' EXIT
+
+# has_sym <binary> <symbol>: 0 if defined or referenced in the symbol table.
+syms_of() {
+    if ! nm "$1" >"$tmp" 2>/dev/null; then
+        echo "check-release: nm failed on $1" >&2
+        exit 1
+    fi
+    if ! grep -q ' _main$' "$tmp"; then
+        echo "check-release: no _main in the symbols of $1" >&2
+        exit 1
+    fi
+}
+
+check() {   # check <binary> <want: 0 absent, 1 present>
+    bin=$1
+    want=$2
+    [ -f "$bin" ] || { echo "check-release: $bin missing" >&2; exit 1; }
+    syms_of "$bin"
+    for s in $SYMS; do
+        if grep -q " _$s\$" "$tmp"; then got=1; else got=0; fi
+        if [ "$got" != "$want" ]; then
+            echo "check-release: $bin: symbol $s $( [ "$want" = 1 ] && echo missing || echo present)" >&2
+            fail=1
+        fi
+    done
+    for s in $STRS; do
+        if LC_ALL=C grep -a -q "$s" "$bin"; then got=1; else got=0; fi
+        if [ "$got" != "$want" ]; then
+            echo "check-release: $bin: string $s $( [ "$want" = 1 ] && echo missing || echo present)" >&2
+            fail=1
+        fi
+    done
+}
+
+check "$REL" 0
+if [ -n "$HOOKED" ]; then check "$HOOKED" 1; fi
+if [ "$fail" != 0 ]; then exit 1; fi
+echo "check-release: $REL has no test hooks"

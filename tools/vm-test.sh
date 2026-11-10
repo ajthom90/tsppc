@@ -1,10 +1,14 @@
 #!/bin/sh
 # Build and run the PowerPC test binary on a VM.
 # Usage: TSPPC_SSH_CONFIG=<ssh config> [TSPPC_VM_USER=<login>] tools/vm-test.sh <leopard|tiger|leopard-root>
-# leopard: copy the tree, build with make ppc-test CC=gcc-4.0, run the binary,
-#          then check the built objects with tools/check-ct.sh.
+# leopard: copy the tree, build with make ppc-test CC=gcc-4.0 (which also builds
+#          tsppcd and tsppc, hooked and release, checks with
+#          tools/check-release.sh that the release tsppcd has no test hooks,
+#          and runs the binary, daemon tests included), then check the built
+#          objects with tools/check-ct.sh.
 # leopard-root: run the Leopard-built binary under sudo (after a leopard run).
-# tiger:   fetch the Leopard-built binary via the host, copy to Tiger, run it.
+# tiger:   fetch the Leopard-built binary via the host, copy to Tiger, run it
+#          (without tsppcd and tsppc beside it, the daemon tests print SKIP).
 set -u
 
 : "${TSPPC_SSH_CONFIG:?set TSPPC_SSH_CONFIG to the ssh config path}"
