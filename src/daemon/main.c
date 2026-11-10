@@ -11,8 +11,14 @@
  * session is started at once if the saved state is logged in, as upstream's
  * daemon does; otherwise it waits for `tsppc up`.
  *
+ * Logout follows ts_sess_logout: the intent (logout_pending) is saved first,
+ * also before the control key is in, and the key is expired at control once
+ * a session can run; a restart mid-logout finishes it and never logs in with
+ * that key.
+ *
  * In builds with -DTS_TEST_HOOKS only, TSPPC_CONTROL ("host" or "host:port";
  * with a port every control connection goes there, with TLS if it is 443),
+ * TSPPC_CONTROL_KEY (control's public key in hex: no key fetch),
  * TSPPC_STATE_DIR and TSPPC_SOCKET override the defaults. */
 #include <errno.h>
 #include <fcntl.h>
@@ -38,6 +44,7 @@
 #include "src/net/resolve.h"
 #include "src/net/sock.h"
 #include "src/net/tls.h"
+#include "src/proto/encoding.h"
 #include "src/state/hostinfo.h"
 #include "src/state/store.h"
 
@@ -50,6 +57,10 @@
 #define HOSTINFO_MAX 4096
 #define LOOP_MS 1000                /* the session needs a tick at least every second */
 #define TEXT_MAX 512
+#define ACCEPT_PAUSE_MS 1000        /* after accept fails for lack of descriptors */
+
+/* A status line (with a login URL) must fit a reply value the CLI reads. */
+typedef char status_fits_cli[TS_IPC_VALUE_MAX >= TS_SESS_URL_MAX + 512 ? 1 : -1];
 
 enum { C_NONE, C_RESOLVE, C_TCP, C_TLS, C_OPEN };
 
@@ -80,8 +91,6 @@ static struct {
     /* Session and what the operator asked for. */
     ts_sess *sess;
     int want_up;
-    int logout_req;
-    int logout_here;                /* logged out before the session existed */
 
     /* The control connection. */
     int cphase;
@@ -101,6 +110,7 @@ static struct {
     int lfd;
     dev_t ldev;
     ino_t lino;
+    int64_t accept_paused_until;
     client cl[TS_IPC_MAX_CLIENTS];
 
     int sigpipe[2];
@@ -172,6 +182,11 @@ static int io_connect(void *user, const char *host, uint16_t port)
     snprintf(D.chost, sizeof D.chost, "%s", host);
     if (ts_resolve_start(&D.res, host) != 0) {
         logline("cannot start the DNS lookup for control");
+        return -1;
+    }
+    if (ts_resolve_fd(&D.res) >= FD_SETSIZE) {
+        ts_resolve_cancel(&D.res);
+        logline("out of descriptors for select");
         return -1;
     }
     D.cphase = C_RESOLVE;
@@ -342,6 +357,10 @@ static void conn_events(fd_set *r, fd_set *w, unsigned gen_at_select)
             conn_fail("cannot connect to control");
             return;
         }
+        if (D.fd >= FD_SETSIZE) {
+            conn_fail("out of descriptors for select");
+            return;
+        }
         D.cphase = C_TCP;
         return;
     case C_TCP:
@@ -401,8 +420,10 @@ static void session_start(void)
     ts_sess_init(D.sess, &D.st, &sess_io, NULL, D.control_pub, D.hostinfo);
     ts_sess_tick(D.sess, (uint64_t)now_ms());
     if (D.host_override && ts_sess_set_host(D.sess, D.host) != 0) logline("control host override refused");
-    if (D.logout_req) ts_sess_logout(D.sess);
-    else if (D.want_up) ts_sess_up(D.sess);
+    /* A logout saved before the key was in (or before a restart) is told to
+     * control now; ts_sess_up would also finish it first. */
+    if (D.want_up) ts_sess_up(D.sess);
+    else if (D.st.logout_pending) (void)ts_sess_logout(D.sess);
 }
 
 static void kf_fail(const char *why)
@@ -441,6 +462,10 @@ static void kf_events(void)
 {
     int rc;
     if (!D.kf_active) return;
+    if (KF.fd >= FD_SETSIZE || KF.res.fd >= FD_SETSIZE) {
+        kf_fail("out of descriptors for select");
+        return;
+    }
     rc = ts_keyfetch_step(&KF, D.control_pub);
     if (rc == 1) return;
     if (rc != 0) {
@@ -470,13 +495,7 @@ static void get_view(view *v)
         ts_sess_state s = ts_sess_get_state(D.sess);
         v->name = ts_sess_state_name(s);
         ts_sess_status(D.sess, v->status, sizeof v->status);
-        if (s == TS_SESS_BACKOFF || s == TS_SESS_FAILED)
-            snprintf(v->problem, sizeof v->problem, "%s", D.sess->reason);
-        else if (s == TS_SESS_NEED_LOGIN && !ts_sess_login_url(D.sess)) {
-            const char *c = strchr(v->status, ':');
-            snprintf(v->problem, sizeof v->problem, "%s", c ? c + 2 : v->status);
-            if ((c = strstr(v->problem, "; "))) v->problem[c - v->problem] = 0;
-        }
+        snprintf(v->problem, sizeof v->problem, "%s", ts_sess_problem(D.sess));
     } else if (D.kf_active) {
         v->name = "CONNECTING";
         snprintf(v->status, sizeof v->status, "CONNECTING: fetching the control key");
@@ -487,10 +506,10 @@ static void get_view(view *v)
                  (long)((ms < 0 ? 0 : ms + 999) / 1000));
         snprintf(v->problem, sizeof v->problem, "%s", D.kf_err);
     }
-    if (!D.sess && D.logout_here) {
+    if (!D.sess && D.st.logout_pending) {
         size_t n = strlen(v->status);
         snprintf(v->status + n, sizeof v->status - n,
-                 "; logged out here; control was not reached, so the old key stays registered there until it expires");
+                 "; logout saved; control will be told once the control key is fetched");
     }
     /* The wall clock, for this check only: no correct clock is before the build. */
     if (time(NULL) < ts_build_time && !strstr(v->problem, "system clock is wrong")) {
@@ -499,33 +518,30 @@ static void get_view(view *v)
     }
 }
 
-/* Logout before the session exists (no control key yet, so control cannot be
- * told): forget the login in the saved state now, as ts_sess_logout does when
- * control is unreachable. */
-static void forget_login_here(void)
+/* Logout before the session exists (no control key yet): save the intent, as
+ * ts_sess_logout does first. The session tells control once the key is in.
+ * Returns 0, or -1 if the save failed (nothing changed). */
+static int logout_before_session(void)
 {
-    uint8_t k[32];
+    ts_state n;
     char err[256];
-    if (!D.st.have_login && !D.st.have_old_node) return;
-    if (ts_random_bytes(k, 32) == 0) {
-        ts_state_clamp_key(k);
-        memcpy(D.st.node_priv, k, 32);
-        ts_wipe(k, sizeof k);
-    }
-    ts_wipe(D.st.old_node_priv, 32);
-    D.st.have_old_node = 0;
-    D.st.have_login = 0;
-    if (ts_state_save(&D.st, D.state_dir, err, sizeof err) != 0) {
-        logline("cannot save the node state: %s", err);
-        return;
-    }
-    D.logout_here = 1;
-    logline("logged out here; control was not reached (no control key yet)");
+    int rc;
+    if (!D.st.have_login || D.st.logout_pending) return 0;
+    n = D.st;
+    n.have_login = 0;
+    n.logout_pending = 1;
+    rc = ts_state_save(&n, D.state_dir, err, sizeof err);
+    if (rc == 0) D.st = n;
+    else logline("cannot save the node state: %s", err);
+    ts_wipe(&n, sizeof n);
+    return rc;
 }
 
-static int have_login(void)
+/* "yes", "no" or "leaving" (a logout saved and not finished). */
+static const char *login_word(void)
 {
-    return D.sess ? ts_sess_node_state(D.sess)->have_login : D.st.have_login;
+    const ts_state *st = D.sess ? ts_sess_node_state(D.sess) : &D.st;
+    return st->have_login ? "yes" : st->logout_pending ? "leaving" : "no";
 }
 
 /* ---- Replies ---------------------------------------------------------- */
@@ -571,7 +587,7 @@ static void build_status(rbuild *b)
     put(b, "ok", NULL);
     put(b, "state", v.name);
     put(b, "status", v.status);
-    put(b, "login", have_login() ? (D.logout_req ? "leaving" : "yes") : "no");
+    put(b, "login", login_word());
     if (D.sess && (url = ts_sess_login_url(D.sess)) != NULL) put(b, "url", url);
     if (v.problem[0]) put(b, "problem", v.problem);
     if (D.sess) {
@@ -591,14 +607,18 @@ static void build_status(rbuild *b)
     }
 }
 
+static void client_error(client *c, const char *text)
+{
+    int n = snprintf(c->out, TS_IPC_RESP_MAX, "error %s\n", text);
+    c->outlen = n > 0 ? (size_t)n : 0;
+}
+
 static void do_request(client *c, ts_ipc_cmd cmd)
 {
     rbuild b;
     switch (cmd) {
     case TS_IPC_UP:
         D.want_up = 1;
-        D.logout_req = 0;
-        D.logout_here = 0;
         if (D.sess) ts_sess_up(D.sess);
         else if (!D.kf_active) {
             D.kf_backoff = 0;           /* an operator's request retries now */
@@ -608,11 +628,13 @@ static void do_request(client *c, ts_ipc_cmd cmd)
         logline("up requested");
         break;
     case TS_IPC_LOGOUT:
-        D.want_up = 0;
-        D.logout_req = 1;
-        if (D.sess) ts_sess_logout(D.sess);
-        else forget_login_here();
         logline("logout requested");
+        if ((D.sess ? ts_sess_logout(D.sess) : logout_before_session()) != 0) {
+            logline("logout failed: the node state could not be saved");
+            client_error(c, "logout failed: the node state could not be saved; nothing was changed");
+            return;
+        }
+        D.want_up = 0;
         break;
     default:
         break;
@@ -636,12 +658,6 @@ static void client_close(client *c)
     c->inlen = c->outlen = c->outoff = 0;
 }
 
-static void client_error(client *c, const char *text)
-{
-    int n = snprintf(c->out, TS_IPC_RESP_MAX, "error %s\n", text);
-    c->outlen = n > 0 ? (size_t)n : 0;
-}
-
 static void accept_clients(void)
 {
     for (;;) {
@@ -650,7 +666,19 @@ static void accept_clients(void)
 #ifdef SO_NOSIGPIPE
         int one = 1;
 #endif
-        if (fd < 0) return;
+        if (fd < 0) {
+            if (errno == EMFILE || errno == ENFILE) {
+                /* Out of descriptors: stop polling the listener for a while
+                 * rather than spin on it. */
+                D.accept_paused_until = now_ms() + ACCEPT_PAUSE_MS;
+                logline("out of descriptors: not accepting clients for a moment");
+            }
+            return;
+        }
+        if (fd >= FD_SETSIZE) {
+            close(fd);
+            continue;
+        }
         for (i = 0; i < TS_IPC_MAX_CLIENTS; i++)
             if (D.cl[i].fd < 0) {
                 c = &D.cl[i];
@@ -688,7 +716,11 @@ static void client_read(client *c)
     c->inlen += (size_t)n;
     nl = memchr(c->in, '\n', c->inlen);
     if (nl) {
-        if (ts_ipc_parse_request(c->in, (size_t)(nl - c->in) + 1, &cmd) == 0) do_request(c, cmd);
+        size_t len = (size_t)(nl - c->in) + 1;
+        char extra;
+        /* One line and nothing after it, here or already waiting. */
+        if (len != c->inlen || read(c->fd, &extra, 1) > 0) client_error(c, "unexpected bytes after the request");
+        else if (ts_ipc_parse_request(c->in, len, &cmd) == 0) do_request(c, cmd);
         else client_error(c, "unknown request");
     } else if (c->inlen > TS_IPC_LINE_MAX) {
         client_error(c, "request too long");
@@ -771,6 +803,11 @@ static int setup_control_host(void)
             }
             D.host_override = 1;
         }
+        e = getenv("TSPPC_CONTROL_KEY");
+        if (e && e[0]) {
+            if (ts_hex_decode(D.control_pub, 32, e, strlen(e)) != 0) return -1;
+            D.have_key = 1;
+        }
     }
 #endif
     return 0;
@@ -837,6 +874,7 @@ int main(int argc, char **argv)
         return 1;
     }
     D.want_up = D.st.have_login;
+    if (D.have_key) session_start();   /* test hook: key given */
     logline("started (%s)", D.st.have_login ? "logged in: connecting" : "logged out: waiting for tsppc up");
 
     while (!got_signal) {
@@ -859,8 +897,10 @@ int main(int argc, char **argv)
         FD_ZERO(&r);
         FD_ZERO(&w);
         FD_SET(D.sigpipe[0], &r);
-        FD_SET(D.lfd, &r);
-        if (D.lfd > maxfd) maxfd = D.lfd;
+        if (now_ms() >= D.accept_paused_until) {
+            FD_SET(D.lfd, &r);
+            if (D.lfd > maxfd) maxfd = D.lfd;
+        }
         for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) {
             client *c = &D.cl[i];
             if (c->fd < 0) continue;
@@ -869,10 +909,16 @@ int main(int argc, char **argv)
             if (c->fd > maxfd) maxfd = c->fd;
         }
         if (D.sess) conn_fds(&r, &w, &maxfd);
-        if (D.kf_active && ts_keyfetch_fds(&KF, &r, &w, &kfmax) == 0 && kfmax > maxfd) maxfd = kfmax;
+        if (D.kf_active && KF.fd < FD_SETSIZE && KF.res.fd < FD_SETSIZE &&
+            ts_keyfetch_fds(&KF, &r, &w, &kfmax) == 0 && kfmax > maxfd)
+            maxfd = kfmax;
         gen = D.gen;
         tv.tv_sec = LOOP_MS / 1000;
         tv.tv_usec = (LOOP_MS % 1000) * 1000;
+        /* Decrypted data already in the TLS engine shows on no descriptor:
+         * do not sleep on it. */
+        if (D.sess && D.cphase == C_OPEN && D.tls && ts_sess_want_read(D.sess) && ts_tls_pending(D.tls))
+            tv.tv_sec = tv.tv_usec = 0;
         if (select(maxfd + 1, &r, &w, NULL, &tv) < 0) {
             if (errno == EINTR) continue;
             logline("select failed: %s", strerror(errno));

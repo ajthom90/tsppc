@@ -16,6 +16,8 @@
 #include <unistd.h>
 
 #include "../src/daemon/ipc.h"
+#include "../src/core/bytes.h"
+#include "../src/proto/encoding.h"
 #include "../src/state/store.h"
 
 /* Where the Makefile put tsppcd and tsppc for this target. */
@@ -203,6 +205,7 @@ static int run_cli(const char *arg, char *out, size_t cap)
     if (pid < 0) return -1;
     if (pid == 0) {
         dup2(p[1], 1);
+        dup2(p[1], 2);   /* messages are checked too, and kept out of the test output */
         close(p[0]);
         close(p[1]);
         execl(TS_BIN_DIR "/tsppc", "tsppc", arg, (char *)NULL);
@@ -229,12 +232,14 @@ static int run_cli(const char *arg, char *out, size_t cap)
     return WEXITSTATUS(st);
 }
 
-/* Start tsppcd with the test overrides. stderr goes to logpath. */
-static pid_t start_daemon(const char *statedir, const char *sock, const char *logpath)
+/* Start tsppcd with the test overrides: control at localhost:1 (refused), and
+ * control's key given (no key fetch) when key is not NULL. Its output is
+ * appended to logpath. */
+static pid_t start_daemon(const char *statedir, const char *sock, const char *logpath, const char *key)
 {
     pid_t pid = fork();
     if (pid == 0) {
-        int fd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int fd = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (fd >= 0) {
             dup2(fd, 1);
             dup2(fd, 2);
@@ -242,7 +247,9 @@ static pid_t start_daemon(const char *statedir, const char *sock, const char *lo
         }
         setenv("TSPPC_STATE_DIR", statedir, 1);
         setenv("TSPPC_SOCKET", sock, 1);
-        setenv("TSPPC_CONTROL", "127.0.0.1:1", 1);
+        setenv("TSPPC_CONTROL", "localhost:1", 1);
+        if (key) setenv("TSPPC_CONTROL_KEY", key, 1);
+        else unsetenv("TSPPC_CONTROL_KEY");
         execl(TS_BIN_DIR "/tsppcd", "tsppcd", (char *)NULL);
         _exit(127);
     }
@@ -307,14 +314,50 @@ static void raw_request(const char *sock, const char *req, size_t n, char *out, 
     close(fd);
 }
 
+/* Wait until a raw status reply contains want. */
+static int wait_status(const char *sock, const char *want, char *out, size_t cap, int ms)
+{
+    int64_t until = mono_ms() + ms;
+    do {
+        raw_request(sock, "status\n", 7, out, cap);
+        if (strstr(out, want)) return 1;
+        nap_ms(200);
+    } while (mono_ms() < until);
+    return 0;
+}
+
+static int load_state(const char *dir, ts_state *st)
+{
+    char err[256];
+    return ts_state_load_or_create(st, dir, err, sizeof err);
+}
+
+/* The log holds none of these private keys, in hex. */
+static int log_has_key(const char *logpath, const uint8_t *const *keys, int n)
+{
+    FILE *f = fopen(logpath, "r");
+    char line[1024], hex[65];
+    int i, bad = 0;
+    while (f && fgets(line, sizeof line, f)) {
+        if (strstr(line, "privkey")) bad = 1;
+        for (i = 0; i < n; i++) {
+            ts_hex_encode(hex, sizeof hex, keys[i], 32);
+            if (strstr(line, hex)) bad = 1;
+        }
+    }
+    if (f) fclose(f);
+    return bad;
+}
+
+#define FAKE_CONTROL_KEY "4c3d1a8e0f2b7c6d5e4f30211203f4e5d6c7b8a99a8b7c6d5e4f3021120314e5"
+
 static void test_daemon(void)
 {
-    char statedir[128], sock[128], logpath[128], out[4096], longreq[100];
-    ts_state saved, after;
+    char statedir[128], sock[128], logpath[128], out[8192], longreq[100];
+    ts_state saved, mid, after;
     struct stat sb;
     pid_t pid;
     int rc, i, idle[TS_IPC_MAX_CLIENTS];
-    int64_t until;
 
     if (access(TS_BIN_DIR "/tsppcd", X_OK) != 0 || access(TS_BIN_DIR "/tsppc", X_OK) != 0) {
         printf("SKIP: daemon tests (no " TS_BIN_DIR "/tsppcd or tsppc here)\n");
@@ -329,10 +372,10 @@ static void test_daemon(void)
     snprintf(logpath, sizeof logpath, "%s/log", tmpdir);
     setenv("TSPPC_SOCKET", sock, 1);
 
-    /* A saved login with an old key, for the logout check below. */
+    /* A saved login with an old key. */
     {
         char err[256];
-        rc = ts_state_load_or_create(&saved, statedir, err, sizeof err);
+        rc = load_state(statedir, &saved);
         saved.have_login = 1;
         saved.have_old_node = 1;
         memset(saved.old_node_priv, 0x42, 32);
@@ -342,25 +385,20 @@ static void test_daemon(void)
     /* A path held by a regular file: refused, file kept. */
     rc = open(sock, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (rc >= 0) close(rc);
-    pid = start_daemon(statedir, sock, logpath);
+    pid = start_daemon(statedir, sock, logpath, NULL);
     t_true("daemon: refuses a socket path held by a file", wait_exit(pid, 60000) == 1);
     t_true("daemon: the file is kept", lstat(sock, &sb) == 0 && S_ISREG(sb.st_mode));
     unlink(sock);
 
-    pid = start_daemon(statedir, sock, logpath);
+    /* The key fetch resolves localhost and is refused on 443: BACKOFF. */
+    pid = start_daemon(statedir, sock, logpath, NULL);
     t_true("daemon: socket appears", wait_socket(sock, pid, 120000) == 0);
-
-    /* The key fetch cannot reach 127.0.0.1:1, so status reports BACKOFF. */
-    until = mono_ms() + 60000;
-    do {
-        rc = run_cli("status", out, sizeof out);
-        if (strstr(out, "BACKOFF")) break;
-        nap_ms(200);
-    } while (mono_ms() < until);
-    t_true("daemon: status reports BACKOFF", rc == 0 && strstr(out, "BACKOFF") != NULL);
-    t_true("daemon: status has a problem line", strstr(out, "Problem:") != NULL);
+    t_true("daemon: key fetch failing, BACKOFF", wait_status(sock, "state BACKOFF\n", out, sizeof out, 60000));
+    t_true("daemon: saved login shown", strstr(out, "\nlogin yes\n") != NULL);
+    rc = run_cli("status", out, sizeof out);
+    t_true("daemon: status reports BACKOFF and a problem", rc == 0 && strstr(out, "BACKOFF") && strstr(out, "Problem:"));
     rc = run_cli("ip", out, sizeof out);
-    t_true("daemon: ip without an address fails", rc == 1);
+    t_true("daemon: ip without an address fails", rc == 1 && strstr(out, "no tailnet IP"));
     rc = run_cli("bogus", out, sizeof out);
     t_true("daemon: CLI rejects an unknown command", rc == 2);
 
@@ -374,7 +412,9 @@ static void test_daemon(void)
         if (idle[i] >= 0) close(idle[i]);
     nap_ms(300);
     raw_request(sock, "status\n", 7, out, sizeof out);
-    t_true("daemon: raw status reply", strncmp(out, "ok\nstate BACKOFF\n", 17) == 0);
+    /* BACKOFF, or CONNECTING while a key fetch retry runs. */
+    t_true("daemon: raw status reply", strncmp(out, "ok\nstate BACKOFF\n", 17) == 0 ||
+           strncmp(out, "ok\nstate CONNECTING\n", 20) == 0);
     memset(longreq, 'x', sizeof longreq);
     raw_request(sock, longreq, sizeof longreq, out, sizeof out);
     t_true("daemon: an over-long request is an error", strncmp(out, "error ", 6) == 0 && !strstr(out, "state"));
@@ -382,6 +422,8 @@ static void test_daemon(void)
     t_true("daemon: an unknown request is an error", strncmp(out, "error ", 6) == 0);
     raw_request(sock, "st\0us\n", 6, out, sizeof out);
     t_true("daemon: a request with a NUL is an error", strncmp(out, "error ", 6) == 0);
+    raw_request(sock, "status\nstatus\n", 14, out, sizeof out);
+    t_true("daemon: bytes after the request are an error", strncmp(out, "error ", 6) == 0);
 
     /* A client that never sends is dropped after the timeout. */
     {
@@ -393,48 +435,85 @@ static void test_daemon(void)
         if (fd >= 0) close(fd);
     }
 
-    /* Logout while control cannot be reached (no control key): the login is
-     * forgotten here at once, and the CLI says control was not reached. */
-    raw_request(sock, "status\n", 7, out, sizeof out);
-    t_true("daemon: saved login shown", strstr(out, "\nlogin yes\n") != NULL);
-    rc = run_cli("logout", out, sizeof out);
-    t_true("daemon: logout without control succeeds", rc == 0 && strstr(out, "not reached") != NULL);
-    {
-        char err[256];
-        t_true("daemon: logout cleared the saved state",
-               ts_state_load_or_create(&after, statedir, err, sizeof err) == 0 && !after.have_login &&
-               !after.have_old_node && memcmp(after.node_priv, saved.node_priv, 32) != 0 &&
-               memcmp(after.machine_priv, saved.machine_priv, 32) == 0);
+    /* The logout's first save fails: it fails, and nothing changes. (Root
+     * writes to a read-only directory anyway.) */
+    if (geteuid() != 0) {
+        chmod(statedir, 0500);
+        rc = run_cli("logout", out, sizeof out);
+        chmod(statedir, 0700);
+        t_true("daemon: logout with a failed save exits 1 and says so", rc == 1 && strstr(out, "logout failed"));
+        t_true("daemon: failed logout changed nothing", load_state(statedir, &mid) == 0 && mid.have_login &&
+               !mid.logout_pending && memcmp(mid.node_priv, saved.node_priv, 32) == 0);
+        raw_request(sock, "status\n", 7, out, sizeof out);
+        t_true("daemon: still logged in after a failed logout", strstr(out, "\nlogin yes\n") != NULL);
+    } else {
+        printf("SKIP: failed-save logout (root)\n");
     }
+
+    /* Logout during the key fetch: the intent is saved, control is told later. */
+    rc = run_cli("logout", out, sizeof out);
+    t_true("daemon: logout during the key fetch is saved", rc == 0 && strstr(out, "logout saved") != NULL);
+    t_true("daemon: state holds logout_pending and the same key", load_state(statedir, &mid) == 0 &&
+           !mid.have_login && mid.logout_pending && memcmp(mid.node_priv, saved.node_priv, 32) == 0);
+    raw_request(sock, "status\n", 7, out, sizeof out);
+    t_true("daemon: login leaving", strstr(out, "\nlogin leaving\n") != NULL);
 
     kill(pid, SIGTERM);
     t_true("daemon: SIGTERM exits cleanly", wait_exit(pid, 60000) == 0);
     t_true("daemon: SIGTERM removes the socket", lstat(sock, &sb) != 0 && errno == ENOENT);
     t_true("daemon: CLI reports no daemon", run_cli("status", out, sizeof out) == 1);
 
-    /* Started again over a socket left by a crash. */
-    pid = start_daemon(statedir, sock, logpath);
+    /* Restart mid-logout, still no key: the logout stays pending, no login. */
+    pid = start_daemon(statedir, sock, logpath, NULL);
     t_true("daemon: restarts", wait_socket(sock, pid, 120000) == 0);
+    t_true("daemon: restart keeps the logout pending", wait_status(sock, "state BACKOFF\n", out, sizeof out, 60000) &&
+           strstr(out, "\nlogin leaving\n") != NULL);
     kill(pid, SIGKILL);
     wait_exit(pid, 60000);
     t_true("daemon: crash leaves the socket", lstat(sock, &sb) == 0 && S_ISSOCK(sb.st_mode));
-    pid = start_daemon(statedir, sock, logpath);
-    t_true("daemon: replaces a stale socket", wait_socket_new(sock, pid, 120000, sb.st_ino) == 0 &&
-           run_cli("status", out, sizeof out) == 0);
-    kill(pid, SIGINT);
-    t_true("daemon: SIGINT exits cleanly", wait_exit(pid, 60000) == 0 && lstat(sock, &sb) != 0);
 
-    /* The log names no keys. */
+    /* Restart with control's key: the session tries to tell control (refused
+     * on both tries), then finishes the logout with a new key. */
+    pid = start_daemon(statedir, sock, logpath, FAKE_CONTROL_KEY);
+    t_true("daemon: replaces a stale socket", wait_socket_new(sock, pid, 120000, sb.st_ino) == 0);
+    t_true("daemon: pending logout finished", wait_status(sock, "\nlogin no\n", out, sizeof out, 120000));
+    t_true("daemon: says control was not reached", strstr(out, "not reached") != NULL);
+    t_true("daemon: key rotated, nothing pending", load_state(statedir, &after) == 0 && !after.logout_pending &&
+           !after.have_login && !after.have_old_node && memcmp(after.node_priv, saved.node_priv, 32) != 0 &&
+           memcmp(after.machine_priv, saved.machine_priv, 32) == 0);
+    rc = run_cli("logout", out, sizeof out);
+    t_true("daemon: logout again succeeds, note kept", rc == 0 && strstr(out, "logged out here") != NULL);
+
+    /* up: the session goes through DNS and TCP to localhost:1 and backs off. */
+    raw_request(sock, "up\n", 3, out, sizeof out);
+    t_true("daemon: up accepted", strncmp(out, "ok\n", 3) == 0);
+    t_true("daemon: session backs off when control refuses",
+           wait_status(sock, "state BACKOFF\n", out, sizeof out, 120000) && strstr(out, "\nproblem ") != NULL);
     {
         FILE *f = fopen(logpath, "r");
         char line[512];
-        int bad = 0;
+        int saw = 0;
         while (f && fgets(line, sizeof line, f))
-            if (strstr(line, "key:") || strstr(line, "privkey")) bad = 1;
+            if (strstr(line, "connecting to control on port 1")) saw = 1;
         if (f) fclose(f);
-        t_true("daemon: log holds no keys", !bad);
+        t_true("daemon: the session's connection ran", saw);
+    }
+    kill(pid, SIGINT);
+    t_true("daemon: SIGINT exits cleanly", wait_exit(pid, 60000) == 0 && lstat(sock, &sb) != 0);
+
+    {
+        const uint8_t *keys[5];
+        keys[0] = saved.node_priv;
+        keys[1] = saved.machine_priv;
+        keys[2] = saved.disco_priv;
+        keys[3] = after.node_priv;
+        keys[4] = saved.old_node_priv;
+        t_true("daemon: log holds no private keys", !log_has_key(logpath, keys, 5));
     }
 
+    ts_wipe(&saved, sizeof saved);
+    ts_wipe(&mid, sizeof mid);
+    ts_wipe(&after, sizeof after);
     unsetenv("TSPPC_SOCKET");
     unlink(logpath);
     unlink(sock);

@@ -8,13 +8,13 @@
  * Exit status: 0 done, 1 failed or tsppcd not reachable, 2 usage.
  * Everything the daemon sends is cleaned of control bytes before it is shown. */
 #include <errno.h>
+#include <mach/mach_time.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/time.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "src/daemon/ipc.h"
@@ -30,6 +30,15 @@ typedef struct {
 } reply;
 
 static char *rbuf;
+static mach_timebase_info_data_t tb;
+
+/* Monotonic seconds, for timeouts (mach_absolute_time exists from 10.0 on). */
+static long mono_s(void)
+{
+    uint64_t t = mach_absolute_time();
+    uint64_t ns = (t / tb.denom) * tb.numer + (t % tb.denom) * tb.numer / tb.denom;
+    return (long)(ns / 1000000000u);
+}
 
 static void usage(void)
 {
@@ -49,7 +58,7 @@ static int request(ts_ipc_cmd cmd, reply *r)
 {
     const char *path = ts_ipc_socket_path();
     const char *line = ts_ipc_cmd_line(cmd);
-    time_t until = time(NULL) + REPLY_TIMEOUT_S;
+    long until = mono_s() + REPLY_TIMEOUT_S;
     size_t off = 0, n = strlen(line);
     int fd = ts_ipc_connect(path);
     char safe[256];
@@ -60,6 +69,11 @@ static int request(ts_ipc_cmd cmd, reply *r)
     if (fd < 0) {
         ts_ipc_clean(safe, sizeof safe, path, strlen(path), 0);
         fprintf(stderr, "tsppc: cannot reach tsppcd at %s: %s\n", safe, strerror(errno));
+        return -1;
+    }
+    if (fd >= FD_SETSIZE) {
+        close(fd);
+        fprintf(stderr, "tsppc: out of descriptors\n");
         return -1;
     }
     while (off < n) {
@@ -76,7 +90,7 @@ static int request(ts_ipc_cmd cmd, reply *r)
         fd_set rs;
         struct timeval tv = { 1, 0 };
         ssize_t k;
-        if (time(NULL) > until) {
+        if (mono_s() > until) {
             fprintf(stderr, "tsppc: tsppcd did not answer\n");
             close(fd);
             return -1;
@@ -141,7 +155,7 @@ static int cmd_status(void)
 {
     reply r;
     size_t pos = 0;
-    char key[32], val[1500];
+    char key[32], val[TS_IPC_VALUE_MAX];
     int peers = 0;
     if (request(TS_IPC_STATUS, &r) != 0 || check_ok(&r) != 0) return 1;
     while (next_line(&r, &pos, key, sizeof key, val, sizeof val)) {
@@ -180,8 +194,9 @@ static int cmd_ip(void)
 static int cmd_up(void)
 {
     reply r;
-    char st[32], last[32] = "", status[1400], url[1100], shown[1100] = "", prob[512], lastprob[512] = "";
-    time_t until = time(NULL) + UP_TIMEOUT_S;
+    char st[32], last[32] = "", status[TS_IPC_VALUE_MAX], url[TS_IPC_VALUE_MAX], shown[TS_IPC_VALUE_MAX] = "",
+        prob[TS_IPC_VALUE_MAX], lastprob[TS_IPC_VALUE_MAX] = "";
+    long until = mono_s() + UP_TIMEOUT_S;
     if (request(TS_IPC_UP, &r) != 0 || check_ok(&r) != 0) return 1;
     for (;;) {
         field(&r, "state", st, sizeof st);
@@ -213,7 +228,7 @@ static int cmd_up(void)
             memcpy(lastprob, prob, sizeof lastprob);
         }
         memcpy(last, st, sizeof last);
-        if (time(NULL) > until) {
+        if (mono_s() > until) {
             fprintf(stderr, "tsppc: still not logged in; tsppcd keeps trying (see tsppc status)\n");
             return 1;
         }
@@ -225,20 +240,29 @@ static int cmd_up(void)
 static int cmd_logout(void)
 {
     reply r;
-    char login[32], status[1400];
-    time_t until = time(NULL) + LOGOUT_TIMEOUT_S;
+    char login[32], st[32], status[TS_IPC_VALUE_MAX], prob[TS_IPC_VALUE_MAX];
+    long until = mono_s() + LOGOUT_TIMEOUT_S;
+    /* A failed first save comes back as an error: nothing was changed. */
     if (request(TS_IPC_LOGOUT, &r) != 0 || check_ok(&r) != 0) return 1;
     for (;;) {
         field(&r, "login", login, sizeof login);
+        field(&r, "state", st, sizeof st);
+        field(&r, "status", status, sizeof status);
+        field(&r, "problem", prob, sizeof prob);
         if (strcmp(login, "no") == 0) {
-            field(&r, "status", status, sizeof status);
-            if (strstr(status, "not reached")) printf("%s\n", status);
+            /* Anything but a plain logout is shown as the daemon put it. */
+            if (prob[0]) printf("%s\n", status);
             else printf("Logged out.\n");
-            return 0;
+            return strcmp(st, "FAILED") == 0 ? 1 : 0;
         }
-        if (time(NULL) > until) {
-            field(&r, "status", status, sizeof status);
-            fprintf(stderr, "tsppc: logout not confirmed by control yet; tsppcd keeps trying (%s)\n", status);
+        if (strcmp(login, "leaving") == 0 && (strcmp(st, "FAILED") == 0 || strstr(status, "logout saved"))) {
+            /* Saved, and control not reachable yet (no control key) or no
+             * randomness: the key never logs in again; tsppcd finishes later. */
+            printf("%s\n", status);
+            return strcmp(st, "FAILED") == 0 ? 1 : 0;
+        }
+        if (mono_s() > until) {
+            fprintf(stderr, "tsppc: logout not finished yet; tsppcd keeps going (%s)\n", status);
             return 1;
         }
         sleep_ms(POLL_MS);
@@ -249,6 +273,7 @@ static int cmd_logout(void)
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
+    mach_timebase_info(&tb);
     if (argc != 2) {
         usage();
         return 2;

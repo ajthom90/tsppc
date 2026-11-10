@@ -6,9 +6,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#define STALE_TRIES 5
+#define STALE_WAIT_US 200000
 
 static const char *const cmd_lines[] = { "status\n", "up\n", "ip\n", "logout\n" };
 #define NCMDS (sizeof cmd_lines / sizeof cmd_lines[0])
@@ -115,7 +120,7 @@ int ts_ipc_listen(const char *path, gid_t gid, dev_t *dev, ino_t *ino, char *err
     struct sockaddr_un a;
     struct stat sb;
     mode_t old;
-    int fd, rc, e;
+    int fd, rc, e, i;
 
     if (errcap) err[0] = 0;
     if (fill_addr(&a, path) != 0) {
@@ -127,16 +132,24 @@ int ts_ipc_listen(const char *path, gid_t gid, dev_t *dev, ino_t *ino, char *err
             seterr(err, errcap, "refusing to replace a non-socket at", path, 0);
             return -1;
         }
-        /* A socket: a running daemon answers, a crashed one's refuses. */
-        fd = ts_ipc_connect(path);
-        if (fd >= 0) {
-            close(fd);
-            seterr(err, errcap, "tsppcd is already running on", path, 0);
-            return -1;
-        }
-        if (errno != ECONNREFUSED) {
-            seterr(err, errcap, "cannot check the old socket", path, errno);
-            return -1;
+        /* A socket: a running daemon answers, a crashed one's refuses. A
+         * live daemon with a full backlog also refuses, so only a socket that
+         * refuses every time over about a second is taken as stale. */
+        for (i = 0; i < STALE_TRIES; i++) {
+            fd = ts_ipc_connect(path);
+            if (fd >= 0) {
+                close(fd);
+                seterr(err, errcap, "tsppcd is already running on", path, 0);
+                return -1;
+            }
+            if (errno != ECONNREFUSED) {
+                seterr(err, errcap, "cannot check the old socket", path, errno);
+                return -1;
+            }
+            if (i + 1 < STALE_TRIES) {
+                struct timeval tv = { 0, STALE_WAIT_US };
+                (void)select(0, NULL, NULL, NULL, &tv);
+            }
         }
         if (unlink(path) != 0 && errno != ENOENT) {
             seterr(err, errcap, "cannot remove the stale socket", path, errno);
@@ -152,6 +165,8 @@ int ts_ipc_listen(const char *path, gid_t gid, dev_t *dev, ino_t *ino, char *err
         seterr(err, errcap, "cannot create a socket for", path, errno);
         return -1;
     }
+    /* listen at once after bind: between the two a client is refused, and
+     * another daemon starting then would take the socket for stale. */
     old = umask(077);
     rc = bind(fd, (struct sockaddr *)&a, sizeof a);
     e = errno;
@@ -160,6 +175,10 @@ int ts_ipc_listen(const char *path, gid_t gid, dev_t *dev, ino_t *ino, char *err
         close(fd);
         seterr(err, errcap, "cannot bind", path, e);
         return -1;
+    }
+    if (listen(fd, 16) != 0) {
+        e = errno;
+        goto fail;
     }
     if (lstat(path, &sb) != 0 || !S_ISSOCK(sb.st_mode)) {
         e = errno;
@@ -175,7 +194,7 @@ int ts_ipc_listen(const char *path, gid_t gid, dev_t *dev, ino_t *ino, char *err
     } else {
         (void)chown(path, (uid_t)-1, gid);   /* tests: our own group if we may */
     }
-    if (chmod(path, 0660) != 0 || listen(fd, 16) != 0) {
+    if (chmod(path, 0660) != 0) {
         e = errno;
         goto fail;
     }

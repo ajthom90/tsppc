@@ -8,7 +8,8 @@
  *
  * Protocol: the client connects, sends one request line (a command name and
  * '\n', at most TS_IPC_LINE_MAX bytes with the newline), and reads the reply
- * until the daemon closes the connection. One request per connection.
+ * until the daemon closes the connection. One request per connection; bytes
+ * after the newline make it an error.
  *
  * Every reply line is "<key> <value>\n" or "<key>\n". Keys:
  *   ok                      the command was accepted
@@ -36,6 +37,7 @@
 #define TS_IPC_MAX_CLIENTS 8           /* more are accepted and closed at once */
 #define TS_IPC_CLIENT_TIMEOUT_MS 10000 /* a client must be done within this */
 #define TS_IPC_RESP_MAX 131072         /* largest reply, bytes */
+#define TS_IPC_VALUE_MAX 2048          /* longest reply value a client must handle */
 #define TS_IPC_GROUP "admin"
 #define TS_IPC_GROUP_GID 80            /* admin's gid if the lookup fails */
 
@@ -72,10 +74,11 @@ int ts_ipc_split(const char *line, size_t len, size_t *klen, size_t *voff);
 /* Create the listening socket at path (non-blocking, close-on-exec):
  * - a socket already at path that accepts a connection is a running daemon:
  *   refused;
- * - a socket that refuses is left from a crash: removed;
+ * - a socket that refuses five times over about a second is left from a
+ *   crash: removed (a live daemon with a full backlog also refuses, briefly);
  * - anything else at path (file, directory, symbolic link) is refused.
- * It is bound under umask 077, then given owner root (if running as root)
- * and group gid, then mode 0660. As root, a failed chown is an error;
+ * It is bound under umask 077 and listens at once, then gets owner root (if
+ * running as root) and group gid, then mode 0660. As root, a failed chown is an error;
  * otherwise (tests) the group is best effort. On success the device and inode
  * of the new socket go to *dev and *ino (for ts_ipc_unlink). Returns the
  * descriptor, or -1 with a message in err. */
