@@ -3,6 +3,169 @@
 #include "../core/bytes.h"
 #include "x25519.h"
 
+/* G3/G4 multiply instructions take variable time. PowerPC (and the host
+ * ct-test build) therefore uses the 13-bit limb Poly1305 below, whose
+ * multiplies are all TS_MUL15, and needs BearSSL's constant-time MUL15. */
+#if defined(__ppc__) || defined(TS_FORCE_CT_POLY)
+#define TS_CT_POLY 1
+#if !defined(BR_CT_MUL15) || !BR_CT_MUL15
+#error "constant-time Poly1305 requires -DBR_CT_MUL15=1"
+#endif
+#endif
+
+#ifdef TS_CT_POLY
+
+/* ---- Poly1305: 10 x 13-bit limbs, 32x32->32 multiplies only ---- */
+
+/* Same layout and carry handling as BearSSL's poly1305_ctmul32. Like BearSSL's
+ * MUL15, TS_MUL15 sets both operands' top bits so the multiplier always sees
+ * full-width values. BearSSL then masks the product to 31 bits, but gcc-4.0
+ * works out that the top bits cannot reach a masked result and deletes the
+ * ORs. Here bit 31 is cancelled by XOR instead: it equals bit 0 of x ^ y, so
+ * the ORs stay necessary. The result is x * y as long as that is below 2^31:
+ * the operands' bit lengths must sum to at most 31. Here a[] uses at most 15
+ * bits and r[] at most 16 (a 13-bit limb times 5). */
+#define TS_MUL15(x, y) \
+    ((((uint32_t)(x) | 0x80000000u) * ((uint32_t)(y) | 0x80000000u)) ^ \
+     (((uint32_t)(x) ^ (uint32_t)(y)) << 31))
+
+#define M13 0x1fffu
+
+/* r[9..18] holds the limbs of r, r[0..8] holds 5 * r[10..18], so r[u + 9 - v]
+ * is the factor for a[v] in column u. b is working space. hibit is the bit
+ * at position 128 for this block: 1 << 11 in the top limb, or 0 for a final
+ * partial block (which carries its own 0x01 padding byte). */
+static void poly_block(uint32_t a[10], uint32_t b[10], const uint32_t r[19],
+                       const uint8_t *m, uint32_t hibit)
+{
+    uint32_t t0 = ts_get_le32(m), t1 = ts_get_le32(m + 4);
+    uint32_t t2 = ts_get_le32(m + 8), t3 = ts_get_le32(m + 12);
+    uint32_t cc1, cc2, s, z;
+    unsigned u;
+
+    a[0] += t0 & M13;
+    a[1] += (t0 >> 13) & M13;
+    a[2] += ((t0 >> 26) | (t1 << 6)) & M13;
+    a[3] += (t1 >> 7) & M13;
+    a[4] += ((t1 >> 20) | (t2 << 12)) & M13;
+    a[5] += (t2 >> 1) & M13;
+    a[6] += (t2 >> 14) & M13;
+    a[7] += ((t2 >> 27) | (t3 << 5)) & M13;
+    a[8] += (t3 >> 8) & M13;
+    a[9] += (t3 >> 21) | hibit;
+
+    /* Two passes with a carry between them: one full column of a[] * r[]
+     * could overflow a 32-bit word. */
+    cc1 = 0;
+    for (u = 0; u < 10; u++) {
+        s = cc1 + TS_MUL15(a[0], r[u + 9 - 0]) + TS_MUL15(a[1], r[u + 9 - 1]) +
+            TS_MUL15(a[2], r[u + 9 - 2]) + TS_MUL15(a[3], r[u + 9 - 3]) +
+            TS_MUL15(a[4], r[u + 9 - 4]);
+        b[u] = s & M13;
+        cc1 = s >> 13;
+    }
+    cc2 = 0;
+    for (u = 0; u < 10; u++) {
+        s = b[u] + cc2 + TS_MUL15(a[5], r[u + 9 - 5]) + TS_MUL15(a[6], r[u + 9 - 6]) +
+            TS_MUL15(a[7], r[u + 9 - 7]) + TS_MUL15(a[8], r[u + 9 - 8]) +
+            TS_MUL15(a[9], r[u + 9 - 9]);
+        b[u] = s & M13;
+        cc2 = s >> 13;
+    }
+    for (u = 0; u < 10; u++) a[u] = b[u];
+
+    /* The carries out of the top wrap around with a factor of 5. */
+    z = cc1 + cc2;
+    z += (z << 2) + a[0];
+    a[0] = z & M13;
+    a[1] += z >> 13;
+}
+
+void ts_poly1305(uint8_t tag[16], const uint8_t key[32],
+                 const uint8_t *msg, size_t len)
+{
+    uint32_t r[19], a[10], b[10], z, cc, ctl, x, mask;
+    uint32_t t0 = ts_get_le32(key), t1 = ts_get_le32(key + 4);
+    uint32_t t2 = ts_get_le32(key + 8), t3 = ts_get_le32(key + 12);
+    unsigned i;
+
+    /* Clamp r in 26-bit pieces, then split each piece in two 13-bit limbs. */
+    z = t0 & 0x3ffffffu;
+    r[9] = z & M13; r[10] = z >> 13;
+    z = ((t0 >> 26) | (t1 << 6)) & 0x3ffff03u;
+    r[11] = z & M13; r[12] = z >> 13;
+    z = ((t1 >> 20) | (t2 << 12)) & 0x3ffc0ffu;
+    r[13] = z & M13; r[14] = z >> 13;
+    z = ((t2 >> 14) | (t3 << 18)) & 0x3f03fffu;
+    r[15] = z & M13; r[16] = z >> 13;
+    z = (t3 >> 8) & 0x00fffffu;
+    r[17] = z & M13; r[18] = z >> 13;
+    for (i = 0; i < 9; i++) r[i] = TS_MUL15(5, r[i + 10]);
+
+    memset(a, 0, sizeof a);
+    memset(b, 0, sizeof b);
+
+    while (len >= 16) {
+        poly_block(a, b, r, msg, 1u << 11);
+        msg += 16;
+        len -= 16;
+    }
+    if (len > 0) {
+        uint8_t buf[16];
+        memset(buf, 0, sizeof buf);
+        memcpy(buf, msg, len);
+        buf[len] = 1;
+        poly_block(a, b, r, buf, 0);
+        ts_wipe(buf, sizeof buf);
+    }
+
+    /* Full carry. poly_block left a[0] below 2^13 and only a[1] above it. */
+    cc = 0;
+    for (i = 1; i < 10; i++) {
+        z = a[i] + cc;
+        a[i] = z & M13;
+        cc = z >> 13;
+    }
+    z = a[0] + cc + (cc << 2);
+    a[0] = z & M13;
+    a[1] += z >> 13;
+
+    /* Subtract p if a >= p, without branching. a[1] may be 2^13 here, but
+     * then a is below p and the comparison correctly fails. */
+    ctl = (a[0] + 5) >> 13;
+    for (i = 1; i < 10; i++) {
+        x = a[i] ^ M13;
+        ctl &= ((x | (0u - x)) >> 31) ^ 1;
+    }
+    mask = 0u - ctl;
+    a[0] -= 0x1ffbu & mask;
+    for (i = 1; i < 10; i++) a[i] &= ~mask;
+
+    /* Back to bytes, adding the pad s modulo 2^128. */
+    z = a[0] + (a[1] << 13) + ts_get_le16(key + 16);
+    ts_put_le16(tag, (uint16_t)z);
+    z = (z >> 16) + (a[2] << 10) + ts_get_le16(key + 18);
+    ts_put_le16(tag + 2, (uint16_t)z);
+    z = (z >> 16) + (a[3] << 7) + ts_get_le16(key + 20);
+    ts_put_le16(tag + 4, (uint16_t)z);
+    z = (z >> 16) + (a[4] << 4) + ts_get_le16(key + 22);
+    ts_put_le16(tag + 6, (uint16_t)z);
+    z = (z >> 16) + (a[5] << 1) + (a[6] << 14) + ts_get_le16(key + 24);
+    ts_put_le16(tag + 8, (uint16_t)z);
+    z = (z >> 16) + (a[7] << 11) + ts_get_le16(key + 26);
+    ts_put_le16(tag + 10, (uint16_t)z);
+    z = (z >> 16) + (a[8] << 8) + ts_get_le16(key + 28);
+    ts_put_le16(tag + 12, (uint16_t)z);
+    z = (z >> 16) + (a[9] << 5) + ts_get_le16(key + 30);
+    ts_put_le16(tag + 14, (uint16_t)z);
+
+    ts_wipe(r, sizeof r);
+    ts_wipe(a, sizeof a);
+    ts_wipe(b, sizeof b);
+}
+
+#else /* !TS_CT_POLY */
+
 /* ---- Poly1305: 5 x 26-bit limbs, 32-bit words, 64-bit products ---- */
 
 #define M26 0x3ffffffu
@@ -109,6 +272,8 @@ void ts_poly1305(uint8_t tag[16], const uint8_t key[32],
     ts_wipe(h, sizeof h);
     ts_wipe(g, sizeof g);
 }
+
+#endif /* TS_CT_POLY */
 
 /* ---- Salsa20 / HSalsa20 ---- */
 

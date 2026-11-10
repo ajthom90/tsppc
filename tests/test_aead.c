@@ -28,6 +28,16 @@ static void test_x25519(void)
     t_hex("x25519 shared", o, 32, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
     t_true("x25519 rejects zero", ts_x25519(o, k, zero32) == -1);
     t_true("x25519 rejects low order", ts_x25519(o, k, low) == -1);
+    memset(o, 0xaa, sizeof o);
+    t_true("x25519 zero rejected again", ts_x25519(o, k, zero32) == -1);
+    t_true("x25519 rejection wipes out", all_zero(o, sizeof o));
+    memset(o, 0xaa, sizeof o);
+    t_true("x25519 low order rejected again", ts_x25519(o, k, low) == -1);
+    t_true("x25519 low order rejection wipes out", all_zero(o, sizeof o));
+    /* out may be the same buffer as the scalar. */
+    memcpy(o, k, sizeof o);
+    t_true("x25519 out == priv ok", ts_x25519(o, o, peer) == 0);
+    t_hex("x25519 out == priv", o, 32, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
 }
 
 static void test_chacha(void)
@@ -72,6 +82,19 @@ static void test_chacha(void)
     t_true("seal in place", memcmp(buf, ct, 130) == 0);
     t_true("open in place", ts_aead_open(buf, key, nonce, ad, sizeof ad, buf, 130) == 0);
     t_true("open in place data", memcmp(buf, pt, 114) == 0);
+
+    memcpy(buf, ct, 130);
+    buf[5] ^= 1;
+    t_true("tampered in place rejected", ts_aead_open(buf, key, nonce, ad, sizeof ad, buf, 130) == -1);
+    t_true("tampered in place wipes", all_zero(buf, 114));
+
+    /* ctlen == 16 (empty plaintext) with non-empty AD. */
+    ts_aead_seal(ct2, key, nonce, ad, sizeof ad, NULL, 0);
+    t_hex("ad only tag", ct2, 16, "e622e5647a38d967a7ecbcb46c7f675c");
+    t_true("ad only open", ts_aead_open(back, key, nonce, ad, sizeof ad, ct2, 16) == 0);
+    t_true("ad only without ad rejected", ts_aead_open(back, key, nonce, NULL, 0, ct2, 16) == -1);
+    ct2[15] ^= 1;
+    t_true("ad only tampered", ts_aead_open(back, key, nonce, ad, sizeof ad, ct2, 16) == -1);
 
     ts_aead_seal(ct2, key, nonce, NULL, 0, NULL, 0);
     memset(back, 0xaa, sizeof back);

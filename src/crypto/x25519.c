@@ -15,11 +15,16 @@
 int ts_x25519(uint8_t out[32], const uint8_t priv[32], const uint8_t pub[32])
 {
     const br_ec_impl *ec = &br_ec_c25519_m31;
-    uint8_t acc = 0;
+    uint8_t acc = 0, scalar[32];
     size_t i;
+    uint32_t ok;
 
-    memcpy(out, pub, 32);
-    if (!ec->mul(out, 32, priv, 32, BR_EC_curve25519)) {
+    /* Read the scalar first: out may alias priv (or pub). */
+    memcpy(scalar, priv, 32);
+    memmove(out, pub, 32);
+    ok = ec->mul(out, 32, scalar, 32, BR_EC_curve25519);
+    ts_wipe(scalar, sizeof scalar);
+    if (!ok) {
         ts_wipe(out, 32);
         return -1;
     }
