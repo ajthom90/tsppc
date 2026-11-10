@@ -15,7 +15,7 @@
 unsigned ts_resolve_test_delay;
 #endif
 
-static int valid_name(const char *h)
+int ts_host_name_ok(const char *h)
 {
     size_t n = 0;
     if (h == NULL) return 0;
@@ -79,7 +79,7 @@ int ts_resolve_start(ts_resolve *r, const char *host)
     r->pid = -1;
     r->fd = -1;
     r->len = 0;
-    if (!valid_name(host)) return -1;
+    if (!ts_host_name_ok(host)) return -1;
     if (pipe(p) != 0) return -1;
     pid = fork();
     if (pid == 0) {

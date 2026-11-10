@@ -66,8 +66,8 @@ tests/test_net.c checks the engine's settings and the ClientHello it sends.
   `br_ecdsa_i31_vrfy_asn1` with `br_ec_all_m31`. The X.509 engine uses the same
   pair, and `br_rsa_i31_pkcs1_vrfy` for RSA. This reads the X25519-only rule as
   "X25519 for key exchange". Signature checks use whatever curve the certificate
-  has. `ec_p256_m31` and `ec_prime_i31` (P-384, used by ISRG Root X2 and its
-  intermediates) and the i31 RSA code therefore only run on public values: a
+  has. `ec_p256_m31` and `ec_prime_i31` (P-384, used by ISRG Root X2 and Root
+  YE and their intermediates) and the i31 RSA code therefore only run on public values: a
   public key, a public signature and a hash of public handshake messages. The
   client never signs (no client certificates) and never does ECDHE on those
   curves.
@@ -79,10 +79,11 @@ tests/test_net.c checks the engine's settings and the ClientHello it sends.
 
 Live checks (`tools/keyfetch_check.c`) on the host, Leopard and Tiger negotiate
 `ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` over X25519 with
-controlplane.tailscale.com. Its chain is RSA and reaches ISRG Root X1. Against
-letsencrypt.org they negotiate `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` with
-a P-256 leaf that chains to ISRG Root X2. This exercises the ECDSA verifier and
-P-384.
+controlplane.tailscale.com, whose chain was RSA (leaf, YR2, "O=ISRG, CN=Root
+YR"). Against letsencrypt.org they negotiate
+`ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` with a P-256 leaf under "O=ISRG,
+CN=Root YE". This exercises the ECDSA verifier and P-384. The control server
+has also been seen serving an ECDSA chain (YE1, Root YE), so both paths matter.
 
 Other accepted limits of the TLS client:
 
@@ -90,17 +91,20 @@ Other accepted limits of the TLS client:
   the same `api_mul`, so each connection's ephemeral scalar, clamped, stays on
   the stack until it is reused. It is ephemeral and protects only that
   connection.
-- **Two roots only.** `src/net/anchors.c` holds ISRG Root X1 and X2, generated
-  by `tools/gen_anchors.py` with their SHA-256 fingerprints pinned. The control
-  server's chain today runs leaf, YR2, ISRG Root YR, then Root YR cross-signed
-  by X1. If Let's Encrypt stops serving that cross-signed certificate, the newer
-  roots must be added: extend `ROOTS` in the script, review the pins and
-  regenerate.
+- **Four roots only.** `src/net/anchors.c` holds ISRG Root X1 and X2 and Let's
+  Encrypt's generation Y roots "O=ISRG, CN=Root YR" (RSA-4096) and "O=ISRG,
+  CN=Root YE" (P-384). `tools/gen_anchors.py` generates the file, with each
+  root's SHA-256 fingerprint pinned. Servers currently send Root YR or Root YE
+  cross-signed by X1 or X2, and those cross-signs expire on 2032-09-02. BearSSL
+  accepts a chain as soon as a certificate's issuer is an anchor, so the
+  intermediate under Root YR or YE is trusted directly and the cross-signs are
+  not needed. Any root Let's Encrypt adds later must be added to `ROOTS`, with
+  its pin reviewed, and the file regenerated.
 - **SHA-256, SHA-384 and SHA-512 only.** A chain signed with SHA-1 or SHA-224 is
   rejected.
 - **Clock.** Certificate validity uses `time()`. An expired or not-yet-valid
   certificate, or any certificate error while the clock reads earlier than
-  `ts_build_time` (the day anchors.c was generated), is reported as "system
+  `ts_build_time` (the day the anchors were generated), is reported as "system
   clock is wrong".
 - **No session resumption.** Every connection does a full handshake, including
   the RSA-4096 or P-384 chain checks. On the emulated G4 that takes about a

@@ -47,10 +47,11 @@ typedef struct {
     char err[128];
 } ts_keyfetch;
 
-/* Start a fetch from host (a name or dotted quad) with ?v=capver. Returns 0, or
- * -1 with ts_keyfetch_error set. The struct is large (about 100 KiB); do not
- * put it on a small stack. Call ts_keyfetch_close when finished with it, after
- * success, failure or a failed start. The caller bounds the total time. */
+/* Start a fetch from host, a DNS name (ts_host_name_ok; an address literal is
+ * refused, as TLS needs a name), with ?v=capver. Returns 0, or -1 with
+ * ts_keyfetch_error set. The struct is large (about 100 KiB); do not put it on
+ * a small stack. Call ts_keyfetch_close when finished with it, after success,
+ * failure or a failed start. The caller bounds the total time. */
 int ts_keyfetch_start(ts_keyfetch *k, const char *host, int capver);
 
 /* Add the descriptors to wait on to r and w, raising *maxfd. Returns 0, or -1
@@ -64,7 +65,9 @@ int ts_keyfetch_step(ts_keyfetch *k, uint8_t pub[32]);
 /* Why the fetch failed ("" while pending or after success). */
 const char *ts_keyfetch_error(const ts_keyfetch *k);
 
-/* Release everything: helper, socket, TLS state. Safe in any state. */
+/* Release everything: helper, socket, TLS state. Safe on a zero-initialised
+ * struct, after any ts_keyfetch_start (successful or not), at any point of a
+ * fetch, and again after a close. Not safe on uninitialised memory. */
 void ts_keyfetch_close(ts_keyfetch *k);
 
 #endif

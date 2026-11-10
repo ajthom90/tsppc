@@ -6,6 +6,8 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 
 enum { IO_OK = 0, IO_EOF, IO_ERR };
@@ -31,12 +33,14 @@ int ts_tls_start(ts_tls *t, int fd, const char *host)
         &br_sha256_vtable, &br_sha384_vtable, &br_sha512_vtable
     };
     br_ssl_engine_context *e = &t->cc.eng;
-    unsigned char seed[32];
+    unsigned char seed[32], addr[16];
     size_t i;
 
     memset(t, 0, sizeof *t);
     t->fd = fd;
     if (host == NULL || host[0] == '\0') return -1;
+    /* RFC 6066 forbids literal addresses in SNI, and BearSSL would send one. */
+    if (inet_pton(AF_INET, host, addr) == 1 || inet_pton(AF_INET6, host, addr) == 1) return -1;
 
     br_ssl_client_zero(&t->cc);
     br_ssl_engine_set_versions(e, BR_TLS12, BR_TLS12);

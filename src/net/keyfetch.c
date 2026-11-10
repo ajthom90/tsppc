@@ -145,19 +145,6 @@ static int fail(ts_keyfetch *k, const char *what, const char *why)
     return -1;
 }
 
-static int valid_host(const char *h)
-{
-    size_t n = 0;
-    for (; h[n] != '\0'; n++) {
-        char c = h[n];
-        if (n >= TS_RESOLVE_NAME_MAX) return 0;
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-              c == '.' || c == '-'))
-            return 0;
-    }
-    return n > 0;
-}
-
 static int start_connect(ts_keyfetch *k, const char *ip)
 {
     k->fd = ts_tcp_start(ip, 443);
@@ -184,7 +171,9 @@ int ts_keyfetch_start(ts_keyfetch *k, const char *host, int capver)
     k->tls_suite = 0;
     k->tls_curve = 0;
     k->err[0] = '\0';
-    if (host == NULL || !valid_host(host)) return fail(k, "invalid control host name", NULL);
+    if (!ts_host_name_ok(host)) return fail(k, "invalid control host name", NULL);
+    /* TLS needs a name to send and to check against the certificate. */
+    if (inet_pton(AF_INET, host, &a) == 1) return fail(k, "control host must be a name, not an address", NULL);
     if (capver <= 0 || capver > 99999) return fail(k, "invalid capability version", NULL);
     memcpy(k->host, host, strlen(host) + 1);
     n = snprintf(k->req, sizeof k->req,
@@ -193,8 +182,6 @@ int ts_keyfetch_start(ts_keyfetch *k, const char *host, int capver)
     if (n <= 0 || (size_t)n >= sizeof k->req) return fail(k, "request too long", NULL);
     k->reqlen = (size_t)n;
 
-    if (inet_pton(AF_INET, host, &a) == 1)
-        return start_connect(k, host) < 0 ? -1 : 0;
     if (ts_resolve_start(&k->res, host) != 0) return fail(k, "cannot start DNS lookup", NULL);
     if (k->res.fd >= FD_SETSIZE) return fail(k, "too many open descriptors", NULL);
     k->state = KF_RESOLVE;
@@ -301,10 +288,7 @@ int ts_keyfetch_step(ts_keyfetch *k, uint8_t pub[32])
             if (n == -1) return fail(k, "TLS", ts_tls_error(&k->tls));
             if (n > 0) k->resplen += (size_t)n;
             rc = ts_http1_response(k->resp, k->resplen, n == TS_TLS_CLOSED, &st, &off, &blen);
-            if (rc == 1) {
-                if (n == TS_TLS_CLOSED) return fail(k, "connection closed early", NULL);
-                break;
-            }
+            if (rc == 1) break;   /* eof makes the parser return 0 or -1, never 1 */
             return finish(k, pub, rc, st, off, blen);
         case KF_DONE:
             memcpy(pub, k->pub, 32);
@@ -322,6 +306,9 @@ const char *ts_keyfetch_error(const ts_keyfetch *k)
 
 void ts_keyfetch_close(ts_keyfetch *k)
 {
+    /* Idle owns nothing: a zeroed struct, a closed one. A failed start or
+     * fetch has cleaned up already (fail), so cleanup is a no-op there. */
+    if (k->state == KF_IDLE) return;
     cleanup(k);
     k->state = KF_IDLE;
 }

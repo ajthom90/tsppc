@@ -17,10 +17,10 @@
  * The engine's EC implementation is br_ec_c25519_m31, the only curve code that
  * sees a secret. Signatures (the server's key exchange and the certificate
  * chain) are verified with br_ec_all_m31 / ECDSA i31 and RSA i31, which only
- * handle public values. Certificates chain to ISRG Root X1 or X2 (anchors.c)
- * and must match the host name. See docs/known-limits.md. */
+ * handle public values. Certificates chain to ISRG Root X1, X2, YR or YE
+ * (anchors.c) and must match the host name. See docs/known-limits.md. */
 
-#define TS_ANCHOR_COUNT 2
+#define TS_ANCHOR_COUNT 4
 extern const br_x509_trust_anchor ts_anchors[TS_ANCHOR_COUNT];
 /* Midnight UTC on the day anchors.c was generated: no correct clock is earlier. */
 extern const time_t ts_build_time;
@@ -39,8 +39,9 @@ typedef struct {
 } ts_tls;
 
 /* Set up a client on fd (non-blocking, owned by the caller) for host, which
- * goes in SNI and must match the certificate. Nothing is sent until
- * ts_tls_step. Returns 0, or -1 (bad host, no randomness). */
+ * goes in SNI and must match the certificate. host must be a name: an IPv4 or
+ * IPv6 literal is refused, since BearSSL would send it as SNI. Nothing is sent
+ * until ts_tls_step. Returns 0, or -1 (empty or literal host, no randomness). */
 int ts_tls_start(ts_tls *t, int fd, const char *host);
 
 /* Do all socket I/O possible without blocking. 1: handshake in progress, wait

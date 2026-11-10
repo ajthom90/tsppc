@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -185,6 +186,16 @@ static void test_resolve(void)
     t_true("resolve: no such host", resolve("no-such-host.invalid", ip, sizeof ip) == -1);
     t_true("resolve: small buffer", resolve("localhost", ip, 9) == -1);
     t_true("resolve: bad name", ts_resolve_start(&r, "") == -1 && ts_resolve_start(&r, "a b") == -1);
+    {
+        char longname[TS_RESOLVE_NAME_MAX + 2];
+        memset(longname, 'a', sizeof longname - 1);
+        longname[sizeof longname - 1] = '\0';
+        t_true("host name: valid", ts_host_name_ok("controlplane.tailscale.com") &&
+               ts_host_name_ok("a-b.c9") && ts_host_name_ok(longname + 1));
+        t_true("host name: invalid", !ts_host_name_ok(NULL) && !ts_host_name_ok("") &&
+               !ts_host_name_ok("a_b") && !ts_host_name_ok("a/b") && !ts_host_name_ok("a:443") &&
+               !ts_host_name_ok(longname));
+    }
 
     /* The helper keeps none of our descriptors: once it has closed them, the
      * write end of this pipe has no holder left and the read end sees EOF while
@@ -350,6 +361,10 @@ static void test_tls_config(void)
     t_true("tls: read fails", ts_tls_read(&t, hello, sizeof hello) == -1);
     t_true("tls: write fails", ts_tls_write(&t, "x", 1) == -1);
     ts_tls_wipe(&t);
+    t_true("tls: IPv4 literal host refused", ts_tls_start(&t, sp[0], "192.0.2.1") == -1);
+    t_true("tls: IPv6 literal host refused", ts_tls_start(&t, sp[0], "2001:db8::1") == -1);
+    t_true("tls: empty host refused", ts_tls_start(&t, sp[0], "") == -1);
+    ts_tls_wipe(&t);
     close(sp[0]);
 }
 
@@ -371,11 +386,11 @@ static int same(const unsigned char *a, size_t al, const unsigned char *b, size_
 /* BearSSL's own decoder must agree with the generated anchors. */
 static void test_anchors(void)
 {
-    static const unsigned char *const der[TS_ANCHOR_COUNT] = { anchor_der0, anchor_der1 };
-    static const size_t derlen[TS_ANCHOR_COUNT] = { sizeof anchor_der0, sizeof anchor_der1 };
+    char name[96];
     size_t i;
 
-    for (i = 0; i < TS_ANCHOR_COUNT; i++) {
+    t_true("anchors: fixture covers every anchor", ANCHOR_FIXTURES == TS_ANCHOR_COUNT);
+    for (i = 0; i < TS_ANCHOR_COUNT && i < ANCHOR_FIXTURES; i++) {
         br_x509_decoder_context d;
         const br_x509_trust_anchor *a = &ts_anchors[i];
         const br_x509_pkey *k;
@@ -383,7 +398,7 @@ static void test_anchors(void)
         int ok;
         memset(&dn, 0, sizeof dn);
         br_x509_decoder_init(&d, dn_append, &dn);
-        br_x509_decoder_push(&d, der[i], derlen[i]);
+        br_x509_decoder_push(&d, anchor_der[i], anchor_der_len[i]);
         k = br_x509_decoder_get_pkey(&d);
         ok = k != NULL && br_x509_decoder_last_error(&d) == 0 && br_x509_decoder_isCA(&d) &&
              !dn.over && same(dn.dn, dn.len, a->dn.data, a->dn.len) && a->flags == BR_X509_TA_CA &&
@@ -394,19 +409,33 @@ static void test_anchors(void)
         else if (ok)
             ok = k->key.ec.curve == a->pkey.key.ec.curve &&
                  same(k->key.ec.q, k->key.ec.qlen, a->pkey.key.ec.q, a->pkey.key.ec.qlen);
-        t_true(i == 0 ? "anchors: ISRG Root X1 matches BearSSL's decoding"
-                      : "anchors: ISRG Root X2 matches BearSSL's decoding", ok);
+        snprintf(name, sizeof name, "anchors: %s matches BearSSL's decoding", anchor_name[i]);
+        t_true(name, ok);
     }
     t_true("anchors: X1 is RSA-4096", ts_anchors[0].pkey.key_type == BR_KEYTYPE_RSA &&
            ts_anchors[0].pkey.key.rsa.nlen == 512);
     t_true("anchors: X2 is P-384", ts_anchors[1].pkey.key_type == BR_KEYTYPE_EC &&
            ts_anchors[1].pkey.key.ec.curve == BR_EC_secp384r1);
+    t_true("anchors: YR is RSA-4096", ts_anchors[2].pkey.key_type == BR_KEYTYPE_RSA &&
+           ts_anchors[2].pkey.key.rsa.nlen == 512);
+    t_true("anchors: YE is P-384", ts_anchors[3].pkey.key_type == BR_KEYTYPE_EC &&
+           ts_anchors[3].pkey.key.ec.curve == BR_EC_secp384r1);
     t_true("anchors: build time set", ts_build_time > 1700000000);
 }
 
 static void test_keyfetch_args(void)
 {
-    static ts_keyfetch k;
+    static ts_keyfetch k;   /* zero-initialised: fd 0 in every descriptor field */
+    int fd0 = fcntl(0, F_GETFD) != -1 ? 0 : open("/dev/null", O_RDONLY);
+
+    /* Closing a zeroed struct must not close descriptor 0. */
+    ts_keyfetch_close(&k);
+    ts_keyfetch_close(&k);
+    t_true("keyfetch: close of a zeroed struct leaves fd 0 open", fd0 == 0 && fcntl(0, F_GETFD) != -1);
+    t_true("keyfetch: address literal refused", ts_keyfetch_start(&k, "192.0.2.1", TS_CAPVER) == -1 &&
+           strlen(ts_keyfetch_error(&k)) > 0);
+    ts_keyfetch_close(&k);
+    ts_keyfetch_close(&k);
     t_true("keyfetch: bad host", ts_keyfetch_start(&k, "bad host", TS_CAPVER) == -1 &&
            strlen(ts_keyfetch_error(&k)) > 0);
     ts_keyfetch_close(&k);

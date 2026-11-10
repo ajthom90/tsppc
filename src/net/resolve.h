@@ -25,8 +25,10 @@ typedef struct {
     char buf[24];   /* answer so far */
 } ts_resolve;
 
-/* Start a lookup of host (1 to TS_RESOLVE_NAME_MAX characters from
- * [A-Za-z0-9.-]). Returns 0, or -1 (bad name, pipe or fork failed; r is then
+/* 1 if h is 1 to TS_RESOLVE_NAME_MAX characters, all from [A-Za-z0-9.-]. */
+int ts_host_name_ok(const char *h);
+
+/* Start a lookup of host (ts_host_name_ok). Returns 0, or -1 (bad name, pipe or fork failed; r is then
  * idle and cancel is a no-op). */
 int ts_resolve_start(ts_resolve *r, const char *host);
 

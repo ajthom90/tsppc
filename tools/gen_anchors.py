@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the TLS trust anchors (ISRG Root X1 and X2) and their test fixture.
+"""Generate the TLS trust anchors (ISRG Root X1, X2, YR and YE) and their test fixture.
 
 Standard library only. The outputs are committed, so building the project
 never needs Python or network access:
@@ -7,7 +7,7 @@ never needs Python or network access:
     python3 -I tools/gen_anchors.py src/net/anchors.c tests/anchors_der.inc
 
 By default the PEMs are fetched from letsencrypt.org. With --pem-dir DIR they
-are read from DIR/isrgrootx1.pem and DIR/isrg-root-x2.pem instead.
+are read from DIR/<file> instead, with the file names listed in ROOTS.
 
 Each certificate's SHA-256 fingerprint must equal the value pinned below, so a
 re-run cannot silently change a root. The pinned values were checked against
@@ -15,7 +15,10 @@ the macOS system root store. A changed pin needs review.
 
 anchors.c holds, per root, the encoded subject DN and the public key in
 BearSSL's br_x509_trust_anchor form, plus ts_build_time: midnight UTC on the
-day it was generated, a date a correct clock can never precede. The fixture
+day the anchors were generated. The TLS client uses it as a lower bound for
+the clock: a certificate error while the clock reads earlier is reported as
+"system clock is wrong". tls.h's TS_ANCHOR_COUNT must equal len(ROOTS); the
+generated file refuses to compile otherwise. The fixture
 holds the full DER of each certificate (test builds only), so a test can check
 that BearSSL's own decoder agrees with what this script extracted.
 """
@@ -39,6 +42,19 @@ ROOTS = [
         "file": "isrg-root-x2.pem",
         "url": "https://letsencrypt.org/certs/isrg-root-x2.pem",
         "sha256": "69729b8e15a86efc177a57afb7171dfc64add28c2fca8cf1507e34453ccb1470",
+    },
+    # Generation Y roots. Pins checked against an independent fetch in review.
+    {
+        "name": "ISRG Root YR",
+        "file": "root-yr.pem",
+        "url": "https://letsencrypt.org/certs/gen-y/root-yr.pem",
+        "sha256": "e57b7e6f150c419102e8d5c055729ff967b9d1a829bf00cec89ca604ebf4a86f",
+    },
+    {
+        "name": "ISRG Root YE",
+        "file": "root-ye.pem",
+        "url": "https://letsencrypt.org/certs/gen-y/root-ye.pem",
+        "sha256": "e14ffcad5b0025731006caa43a121a22d8e9700f4fb9cf852f02a708aa5d5666",
     },
 ]
 
@@ -213,7 +229,10 @@ def main():
     head.append(" */")
 
     c = list(head)
-    c += ["", '#include "tls.h"', ""]
+    c += ["", '#include "tls.h"', "",
+          "#if TS_ANCHOR_COUNT != %d" % len(ROOTS),
+          "#error TS_ANCHOR_COUNT in tls.h does not match the generated anchors",
+          "#endif", ""]
     entries = []
     for i, (r, der) in enumerate(zip(ROOTS, ders)):
         dn, key = extract(der)
@@ -257,9 +276,18 @@ def main():
         f.append("static const unsigned char anchor_der%d[] = {" % i)
         f.append(c_bytes(der))
         f.append("};")
+    f.append("")
+    f.append("#define ANCHOR_FIXTURES %d" % len(ROOTS))
+    f.append("static const char *const anchor_name[ANCHOR_FIXTURES] = {")
+    f.append(",\n".join('    "%s"' % r["name"] for r in ROOTS))
+    f.append("};")
+    f.append("static const unsigned char *const anchor_der[ANCHOR_FIXTURES] = {")
+    f.append(",\n".join("    anchor_der%d" % i for i in range(len(ROOTS))))
+    f.append("};")
+    f.append("static const size_t anchor_der_len[ANCHOR_FIXTURES] = {")
+    f.append(",\n".join("    sizeof anchor_der%d" % i for i in range(len(ROOTS))))
+    f.append("};")
 
-    if len(ROOTS) != 2:
-        fail("tls.h's TS_ANCHOR_COUNT assumes two roots")
     with open(args.anchors_c, "w", encoding="ascii") as out:
         out.write("\n".join(c) + "\n")
     with open(args.fixture_inc, "w", encoding="ascii") as out:
