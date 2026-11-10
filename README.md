@@ -1,4 +1,4 @@
-# tailscale-ppc
+# tsppc
 
 A from-scratch C client that speaks Tailscale's protocol on PowerPC Mac OS X
 (Tiger and Leopard).
