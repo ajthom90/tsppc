@@ -565,6 +565,119 @@ static void test_logout_after_refresh_url(void)
     end();
 }
 
+/* The logout's first save fails: the logout fails and nothing changes. */
+static void test_logout_save_fails(void)
+{
+    char st[512];
+    int regs;
+    begin_running();
+    F.handler = h_std;
+    regs = reg_count();
+    F.save_fail = 1;
+    t_true("logout save fails: -1", ts_sess_logout(S) == -1);
+    fk_pump(&F);
+    t_true("logout save fails: nothing sent", reg_count() == regs && !fk_count(&F, "/machine/register", "1970"));
+    t_true("logout save fails: still RUNNING, still logged in", ts_sess_get_state(S) == TS_SESS_RUNNING &&
+           ts_sess_node_state(S)->have_login && !ts_sess_node_state(S)->logout_pending);
+    ts_sess_status(S, st, sizeof st);
+    t_true("logout save fails: status says so", strstr(st, "logout failed") != NULL &&
+           strstr(ts_sess_problem(S), "could not be saved") != NULL);
+    end();
+}
+
+/* The intent is saved before the register; the key rotates on the answer. */
+static void test_logout_intent_first(void)
+{
+    uint8_t key[32];
+    fk_req *r;
+    int i, at = -1;
+    begin_running();
+    F.handler = h_hold_logout;
+    memcpy(key, ts_sess_node_state(S)->node_priv, 32);
+    t_true("logout intent: 0", ts_sess_logout(S) == 0);
+    fk_pump(&F);
+    for (i = 0; i < F.nreq; i++)
+        if (is_logout(&F.req[i])) at = i;
+    t_true("logout intent: saved before the register", at >= 0 && F.reqs_at_save <= at);
+    t_true("logout intent: pending, not logged in, same key", F.saved.logout_pending && !F.saved.have_login &&
+           memcmp(F.saved.node_priv, key, 32) == 0);
+    r = at >= 0 ? &F.req[at] : NULL;
+    if (r) fk_reply(&F, r, 200, "{}");
+    fk_pump(&F);
+    t_true("logout intent: confirmed, rotated", !F.saved.logout_pending && !F.saved.have_login &&
+           memcmp(F.saved.node_priv, key, 32) != 0 && ts_sess_get_state(S) == TS_SESS_IDLE);
+    t_true("logout intent: plain logged out", strcmp(ts_sess_problem(S), "") == 0);
+    end();
+}
+
+/* Restart mid-logout: the state holds logout_pending. */
+static void test_logout_pending_restart(void)
+{
+    char want[128], nk[65];
+    fk_req *r;
+    int i, logins_with_old = 0;
+
+    /* The daemon finishes it with ts_sess_logout: once, then rotated. */
+    fk_init(&F, S, HOSTINFO);
+    F.handler = h_std;
+    F.st.logout_pending = 1;
+    fk_start(&F, HOSTINFO);
+    key_hex(nk, F.st.node_priv);
+    snprintf(want, sizeof want, "\"NodeKey\":\"nodekey:%s\"", nk);
+    t_true("pending restart: logout 0", ts_sess_logout(S) == 0);
+    fk_pump(&F);
+    r = fk_last(&F, "/machine/register");
+    t_true("pending restart: expiry register of the saved key", reg_count() == 1 && r && is_logout(r) &&
+           has(r->body, want));
+    t_true("pending restart: rotated and cleared", !F.saved.logout_pending &&
+           memcmp(F.saved.node_priv, F.st.node_priv, 32) != 0 && ts_sess_get_state(S) == TS_SESS_IDLE);
+    end();
+
+    /* ts_sess_up on such a state: the logout comes first, then a login with
+     * a new key, never with the saved one. */
+    fk_init(&F, S, HOSTINFO);
+    F.handler = h_std;
+    F.hold_followup = 1;
+    F.st.logout_pending = 1;
+    fk_start(&F, HOSTINFO);
+    ts_sess_up(S);
+    fk_pump(&F);
+    for (i = 0; i < F.nreq; i++)
+        if (strcmp(F.req[i].path, "/machine/register") == 0 && !is_logout(&F.req[i]) && has(F.req[i].body, want))
+            logins_with_old++;
+    t_true("pending up: logout first", F.nreq >= 2 && is_logout(&F.req[0]) && has(F.req[0].body, want));
+    t_true("pending up: never logs in with the saved key", logins_with_old == 0);
+    t_true("pending up: then a login with a new key", reg_count() >= 2 && !F.saved.logout_pending &&
+           ts_sess_get_state(S) == TS_SESS_NEED_LOGIN);
+    end();
+
+    /* Control unreachable: one try on each port, then rotated here. */
+    fk_init(&F, S, HOSTINFO);
+    F.handler = h_std;
+    F.st.logout_pending = 1;
+    F.refuse_all = 1;
+    fk_start(&F, HOSTINFO);
+    ts_sess_logout(S);
+    fk_pump(&F);
+    t_true("pending unreachable: 80 then 443", F.nconnect == 2);
+    t_true("pending unreachable: rotated", !F.saved.logout_pending && memcmp(F.saved.node_priv, F.st.node_priv, 32) != 0);
+    t_true("pending unreachable: status says not reached", strstr(ts_sess_problem(S), "not reached") != NULL);
+    fk_advance(&F, 120000, 1000);
+    t_true("pending unreachable: not retried", F.nconnect == 2 && ts_sess_get_state(S) == TS_SESS_IDLE);
+    end();
+
+    /* No randomness when finishing: the key stays marked, FAILED, said so. */
+    begin_running();
+    F.handler = h_std;
+    F.rand_fail = 1;
+    ts_sess_logout(S);
+    fk_pump(&F);
+    t_true("logout no randomness: key stays marked", F.saved.logout_pending && !F.saved.have_login);
+    t_true("logout no randomness: FAILED, said so", ts_sess_get_state(S) == TS_SESS_FAILED &&
+           strstr(ts_sess_problem(S), "randomness") != NULL);
+    end();
+}
+
 /* Approval arrives through the map. */
 static void h_unauth(fake *f, fk_req *r)
 {
@@ -1262,6 +1375,9 @@ void test_session(void)
     test_refresh_on_start();
     test_logout_after_refresh_url();
     test_logout_unreachable();
+    test_logout_save_fails();
+    test_logout_intent_first();
+    test_logout_pending_restart();
     test_followup_expired_loop();
     test_up_during_logout();
     test_approval();

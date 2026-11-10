@@ -35,9 +35,12 @@ enum {
 #define EXPIRED_TEXT "node key expired, run `tsppc up`"
 #define EXPIRY_ZERO "0001-01-01T00:00:00Z"
 #define EXPIRY_LOGOUT "1970-01-01T00:02:03Z"   /* upstream's time.Unix(123, 0) */
+#define NORAND_TEXT "logged out, but there is no randomness for a new node key; the old key stays " \
+    "marked as logged out"
+#define LOGOUT_SAVE_TEXT "logout failed: the node state could not be saved"
 
 static void settle(ts_sess *s);
-static void forget_login(ts_sess *s);
+static int forget_login(ts_sess *s);
 
 /* ---- Small helpers --------------------------------------------------- */
 
@@ -191,16 +194,25 @@ static void apply_failure(ts_sess *s)
         start_connect(s, 443);
         return;
     }
-    if (s->goal == GOAL_LOGOUT && (kind == FAIL_RETRY || kind == FAIL_RETRY_HERE)) {
-        /* Control could not be told (neither port answered, or it refused the
-         * logout): forget the login here anyway, so the state file keeps
-         * nothing usable. The key stays registered at control until it
-         * expires there. Nothing is retried. */
-        forget_login(s);
+    if (s->st.logout_pending && (kind == FAIL_RETRY || kind == FAIL_RETRY_HERE)) {
+        /* The logout register could not be delivered (neither port answered,
+         * or control answered with an error): finish the logout here with a
+         * new node key, so the state keeps nothing usable. The old key stays
+         * registered at control until it expires there. Not retried. */
+        int ok = forget_login(s) == 0;
         s->logout_unconfirmed = 1;
-        s->goal = GOAL_NONE;
-        s->retry_armed = 0;
-        return;
+        if (!ok) {
+            s->fatal = 1;
+            s->retry_armed = 0;
+            snprintf(s->reason, sizeof s->reason, "%s", NORAND_TEXT);
+            return;
+        }
+        if (s->goal == GOAL_LOGOUT) {
+            s->goal = GOAL_NONE;
+            s->retry_armed = 0;
+            return;
+        }
+        /* ts_sess_up came meanwhile: log in with the new key after a backoff. */
     }
     if (kind == FAIL_RETRY || kind == FAIL_RETRY_HERE) {
         s->retry_at = s->now + next_backoff(s);
@@ -459,18 +471,19 @@ static void login_done(ts_sess *s, int authorized)
 }
 
 /* Forget the login: a fresh node key with no old one, as upstream clears its
- * persisted state. The machine and disco keys stay. If there is no randomness
- * the node key is kept: after a logout control has expired it, so the next
- * login gets NodeKeyExpired and makes a new one then. If the save fails the
- * file still says logged in; status says so, and a restart registers the old
- * key and is sent through the same expiry path. */
-static void forget_login(ts_sess *s)
+ * persisted state, and logout_pending cleared. The machine and disco keys
+ * stay. Returns -1 if there is no randomness: the node key is then kept, and
+ * so is logout_pending, so that key never logs in again. If the save fails
+ * the file still holds logout_pending (or no login at all); status says so. */
+static int forget_login(ts_sess *s)
 {
     uint8_t k[32];
-    if (s->io->random(s->user, k, 32) == 0) {
+    int rnd = s->io->random(s->user, k, 32) == 0;
+    if (rnd) {
         ts_state_clamp_key(k);
         memcpy(s->st.node_priv, k, 32);
         ts_wipe(k, sizeof k);
+        s->st.logout_pending = 0;
     }
     ts_wipe(s->st.old_node_priv, 32);
     s->st.have_old_node = 0;
@@ -484,11 +497,16 @@ static void forget_login(ts_sess *s)
     s->reg_at = s->now;
     s->logout_unconfirmed = 0;
     ts_netmap_reset(&s->nm);
+    return rnd ? 0 : -1;
 }
 
+/* Control confirmed the logout. */
 static void logout_done(ts_sess *s)
 {
-    forget_login(s);
+    if (forget_login(s) != 0) {
+        fail(s, FAIL_STOP, "%s", NORAND_TEXT);
+        return;
+    }
     if (s->goal == GOAL_LOGOUT) {
         s->goal = GOAL_NONE;
         fail(s, FAIL_QUIET, "logged out");
@@ -840,13 +858,15 @@ static void drive(ts_sess *s)
 {
     int want_conn;
     if (s->fatal || s->pending_fail || s->goal == GOAL_NONE) return;
-    want_conn = s->goal == GOAL_LOGOUT || s->relogin != RELOGIN_EXPIRED;
+    want_conn = s->goal == GOAL_LOGOUT || s->st.logout_pending || s->relogin != RELOGIN_EXPIRED;
     if (s->phase == PH_NONE) {
         if (want_conn && !s->retry_armed) start_connect(s, 80);
         return;
     }
     if (s->phase < PH_EARLY) return;
-    if (s->goal == GOAL_LOGOUT) {
+    /* A pending logout is finished before anything else, whatever the goal:
+     * that key never logs in again. */
+    if (s->goal == GOAL_LOGOUT || s->st.logout_pending) {
         if (s->map.sid) {
             (void)ts_h2_cancel(&s->h2, s->map.sid);
             s->map.sid = 0;
@@ -1031,6 +1051,7 @@ void ts_sess_up(ts_sess *s)
     if (!s->nm_ok || !s->hostinfo) return;   /* out of memory at init: stays FAILED */
     s->fatal = 0;
     s->logout_unconfirmed = 0;
+    s->logout_failed = 0;
     s->have_exit = 0;
     if (s->relogin != RELOGIN_NONE) {
         /* Expired or removed: log in again with a new node key (as upstream). */
@@ -1053,9 +1074,10 @@ void ts_sess_up(ts_sess *s)
     settle(s);
 }
 
-void ts_sess_logout(ts_sess *s)
+int ts_sess_logout(ts_sess *s)
 {
-    if (!s->logged_in && !s->st.have_login) {
+    s->logout_failed = 0;
+    if (!s->logged_in && !s->st.have_login && !s->st.logout_pending) {
         /* Nothing registered: forget any login in progress. A saved login
          * (have_login) is expired at control and cleared below even when the
          * session is not logged in now, for instance when the refresh at
@@ -1070,8 +1092,30 @@ void ts_sess_logout(ts_sess *s)
         s->retry_armed = 0;
         if (s->phase != PH_NONE) fail(s, FAIL_QUIET, "logged out");
         settle(s);
-        return;
+        return 0;
     }
+    if (!s->st.logout_pending) {
+        /* Persist the intent before control hears anything, as upstream
+         * saves LoggedOut first: a restart from here finishes the logout and
+         * never logs in with this key. If that save fails nothing changes. */
+        ts_state n = s->st;
+        int rc;
+        n.have_login = 0;
+        n.logout_pending = 1;
+        rc = s->io->save_state(s->user, &n);
+        if (rc == 0) s->st = n;
+        ts_wipe(&n, sizeof n);
+        if (rc != 0) {
+            s->logout_failed = 1;
+            settle(s);
+            return -1;
+        }
+    }
+    s->logged_in = 0;
+    s->refresh = 0;
+    s->regen = 0;
+    s->auth_url[0] = 0;
+    s->relogin = RELOGIN_NONE;
     if (s->goal != GOAL_LOGOUT) {
         s->goal = GOAL_LOGOUT;
         s->reg_at = s->now;
@@ -1080,6 +1124,7 @@ void ts_sess_logout(ts_sess *s)
         s->retry_armed = 0;
     }
     settle(s);
+    return 0;
 }
 
 ts_sess_state ts_sess_get_state(const ts_sess *s)
@@ -1171,6 +1216,10 @@ void ts_sess_status(const ts_sess *s, char *out, size_t cap)
         len = strlen(out);
         snprintf(out + len, cap - len, "; rate limited by control, retrying in %ld s", secs_until(s, s->rate_until));
     }
+    if (s->logout_failed) {
+        len = strlen(out);
+        snprintf(out + len, cap - len, "; %s", LOGOUT_SAVE_TEXT);
+    }
     len = strlen(out);
     snprintf(out + len, cap - len, "; %u peers", s->nm_ok ? (unsigned)s->nm.npeers : 0u);
     if (s->nm_ok && s->nm.have_self && s->nm.self.key_expiry != 0) {
@@ -1184,6 +1233,26 @@ const char *ts_sess_login_url(const ts_sess *s)
 {
     if (s->state != TS_SESS_NEED_LOGIN || !s->auth_url[0] || s->relogin != RELOGIN_NONE) return NULL;
     return s->auth_url;
+}
+
+const char *ts_sess_problem(const ts_sess *s)
+{
+    if (s->logout_failed) return LOGOUT_SAVE_TEXT;
+    switch (s->state) {
+    case TS_SESS_BACKOFF:
+    case TS_SESS_FAILED:
+        return s->reason;
+    case TS_SESS_NEED_LOGIN:
+        if (s->relogin == RELOGIN_EXPIRED) return EXPIRED_TEXT;
+        if (s->relogin == RELOGIN_REMOVED) return REMOVED_TEXT;
+        return "";
+    case TS_SESS_IDLE:
+        if (s->save_failed) return "the node state could not be saved";
+        if (s->logout_unconfirmed) return "control was not reached, so the old key stays registered there until it expires";
+        return "";
+    default:
+        return "";
+    }
 }
 
 int ts_sess_want_read(const ts_sess *s)

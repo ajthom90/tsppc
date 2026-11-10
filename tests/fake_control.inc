@@ -76,6 +76,7 @@ typedef struct fake {
     ts_state saved;
     int reqs_at_save;
     int save_fail;
+    int rand_fail;            /* randomness requests of exactly 32 bytes (keys) fail */
     int send_fail;            /* the next sends fail (the connection stays open until disconnect) */
     int64_t save_at[512];     /* fake time of each save */
 
@@ -198,6 +199,7 @@ FK_FN int fk_io_random(void *u, uint8_t *out, size_t n)
 {
     fake *f = (fake *)u;
     size_t i;
+    if (f->rand_fail && n == 32) return -1;
     for (i = 0; i < n; i++) {
         f->rng ^= f->rng << 13;
         f->rng ^= f->rng >> 17;

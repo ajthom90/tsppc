@@ -141,6 +141,7 @@ typedef struct {
     int64_t last_regen;                  /* when the last new node key was made */
     int save_failed;                     /* the logout's save failed (status) */
     int logout_unconfirmed;              /* logged out here without control's answer (status) */
+    int logout_failed;                   /* the logout's first save failed (status) */
     int relogin;                         /* RELOGIN_*: waiting for ts_sess_up */
     int reg_authorized;                  /* MachineAuthorized, from the register or the map */
     char auth_url[TS_SESS_URL_MAX + 1];  /* "" when none */
@@ -228,22 +229,29 @@ void ts_sess_tick(ts_sess *s, uint64_t now_ms);
 /* Log in and stay connected (also leaves FAILED and NEED_LOGIN; after a node
  * expiry or removal the next register uses a new node key). */
 void ts_sess_up(ts_sess *s);
-/* Tell control to expire the current node key (register with Expiry in the far
- * past), then forget the login: a fresh node key, no old key, have_login
- * cleared and saved, IDLE. The register is sent whenever the session is
- * logged in or the saved state holds a login (have_login), even in NEED_LOGIN
- * after the refresh at start was answered with a login URL. If it cannot be
- * delivered (no connection on port 80 or 443, or control answers with an
- * error), the login is forgotten here all the same and not retried; status
- * says control was not reached. With no login at all nothing is sent; an old
- * key or a key with a login URL out is still dropped from the saved state. */
-void ts_sess_logout(ts_sess *s);
+/* Log out, as upstream: first save the intent (have_login cleared,
+ * logout_pending set, the node key kept), and only then send control a
+ * register of that key with Expiry in the far past. If that first save fails
+ * the logout fails: -1, nothing changes, and status says so. Otherwise 0.
+ * When control confirms, or the register cannot be delivered (no connection
+ * on port 80 or 443, or an error reply), the logout finishes: a fresh node
+ * key, no old key, logout_pending cleared, saved, IDLE. If control was not
+ * reached, status says so. A state that holds logout_pending (a restart
+ * mid-logout) is finished the same way before anything else, by
+ * ts_sess_logout or ts_sess_up: that key never logs in again.
+ * With no login at all nothing is sent; an old key or a key with a login URL
+ * out is still dropped from the saved state. */
+int ts_sess_logout(ts_sess *s);
 
 ts_sess_state ts_sess_get_state(const ts_sess *s);
 const char *ts_sess_state_name(ts_sess_state st);
 /* One line: state name, detail, peer count. Holds the login URL only in
  * NEED_LOGIN. Always NUL-terminated (cap >= 1). */
 void ts_sess_status(const ts_sess *s, char *out, size_t cap);
+/* The current problem for status (a failure reason, an expired or removed
+ * node, a failed logout or save), or "" if none. Printable ASCII. Valid until
+ * the next call. */
+const char *ts_sess_problem(const ts_sess *s);
 /* The URL to visit in NEED_LOGIN, else NULL. */
 const char *ts_sess_login_url(const ts_sess *s);
 /* 0 while control asked us to pause (Debug.SleepSeconds): stop reading the
