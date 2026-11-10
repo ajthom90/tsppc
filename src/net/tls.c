@@ -100,8 +100,9 @@ static int pump(ts_tls *t)
                 return -1;
             }
         }
-        if (st & BR_SSL_RECVREC) {
-            b = br_ssl_engine_recvrec_buf(e, &len);
+        /* Sending may have changed the state; ask again before receiving. */
+        b = br_ssl_engine_recvrec_buf(e, &len);
+        if (b != NULL && len > 0) {
             n = recv(t->fd, b, len, 0);
             if (n > 0) {
                 br_ssl_engine_recvrec_ack(e, (size_t)n);
@@ -197,6 +198,8 @@ const char *ts_tls_error(const ts_tls *t)
     return "no error";
 }
 
+#define NO_COMMON "server does not offer TLS 1.2 with ChaCha20-Poly1305 and X25519"
+
 const char *ts_tls_classify(int br_err, time_t now, time_t build_time)
 {
     int x509 = br_err >= BR_ERR_X509_OK && br_err <= BR_ERR_X509_NOT_TRUSTED;
@@ -213,10 +216,16 @@ const char *ts_tls_classify(int br_err, time_t now, time_t build_time)
         return "server certificate is not from a trusted authority";
     case BR_ERR_X509_BAD_SERVER_NAME:
         return "server certificate does not match the host name";
+    /* The server chose something not offered. A server with no common suite,
+     * curve or version usually sends an alert instead (below). */
     case BR_ERR_UNSUPPORTED_VERSION:
     case BR_ERR_BAD_CIPHER_SUITE:
-    case BR_ERR_BAD_PARAM:
-        return "server does not offer TLS 1.2 with ChaCha20-Poly1305 and X25519";
+    case BR_ERR_INVALID_ALGORITHM:
+        return NO_COMMON;
+    case BR_ERR_RECV_FATAL_ALERT + 40:   /* handshake_failure */
+    case BR_ERR_RECV_FATAL_ALERT + 70:   /* protocol_version */
+    case BR_ERR_RECV_FATAL_ALERT + 71:   /* insufficient_security */
+        return NO_COMMON;
     case BR_ERR_BAD_SIGNATURE:
         return "server key exchange signature is invalid";
     default:

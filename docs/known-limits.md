@@ -53,6 +53,9 @@ tests/test_net.c checks the engine's settings and the ClientHello it sends.
   DES record code or block cipher is set, so `br_ghash_ctmul` never runs. If the
   server stops offering ChaCha20 or X25519, the client fails with "server does
   not offer TLS 1.2 with ChaCha20-Poly1305 and X25519". It does not fall back.
+  Such a server normally answers with a `handshake_failure` or
+  `protocol_version` alert, and that message was confirmed against
+  `openssl s_server` limited to AES-GCM, to P-256 and to TLS 1.3.
 - **Curves:** the engine's EC implementation is `br_ec_c25519_m31` alone. The
   ClientHello advertises only X25519, and BearSSL rejects any other curve the
   server picks (`ssl_hs_client.c` checks `supported_curves`). The ephemeral

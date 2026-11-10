@@ -228,7 +228,16 @@ static void test_classify(void)
     t_true("classify: io, clock before build",
            strcmp(ts_tls_classify(BR_ERR_IO, built - 86400, built), clock) != 0);
     t_true("classify: alert", strlen(ts_tls_classify(BR_ERR_RECV_FATAL_ALERT + 40, built + 1, built)) > 0);
-    t_true("classify: suites", strlen(ts_tls_classify(BR_ERR_BAD_CIPHER_SUITE, built + 1, built)) > 0);
+    {
+        const char *nc = ts_tls_classify(BR_ERR_BAD_CIPHER_SUITE, built + 1, built);
+        t_true("classify: no common suite", strstr(nc, "ChaCha20") != NULL);
+        t_true("classify: handshake_failure alert",
+               strcmp(ts_tls_classify(BR_ERR_RECV_FATAL_ALERT + 40, built + 1, built), nc) == 0);
+        t_true("classify: curve not offered",
+               strcmp(ts_tls_classify(BR_ERR_INVALID_ALGORITHM, built + 1, built), nc) == 0);
+        t_true("classify: local misconfiguration is not blamed on the server",
+               strcmp(ts_tls_classify(BR_ERR_BAD_PARAM, built + 1, built), nc) != 0);
+    }
     t_true("classify: unknown", strlen(ts_tls_classify(9999, built + 1, built)) > 0);
 }
 
@@ -260,6 +269,35 @@ static const uint8_t *hello_ext(const uint8_t *m, size_t n, unsigned type, size_
     return NULL;
 }
 
+/* The engine hands its own EC code (X25519, no ECDSA) to its ECDSA verifier.
+ * The installed verifier must still check a P-256 signature. The key is a
+ * fixed test value. */
+static void check_ske_verifier(const br_ssl_engine_context *e)
+{
+    static const unsigned char x[32] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
+    };
+    br_ec_private_key sk = { BR_EC_secp256r1, (unsigned char *)x, sizeof x };
+    unsigned char q[BR_EC_KBUF_PUB_MAX_SIZE], sig[80], hash[32];
+    br_ec_public_key pk;
+    size_t qlen, slen;
+    int ok;
+
+    memset(hash, 0x42, sizeof hash);
+    qlen = br_ec_compute_pub(&br_ec_all_m31, NULL, q, &sk);
+    pk.curve = BR_EC_secp256r1;
+    pk.q = q;
+    pk.qlen = qlen;
+    slen = br_ecdsa_i31_sign_asn1(&br_ec_all_m31, &br_sha256_vtable, hash, &sk, sig);
+    ok = qlen == 65 && slen > 0 && e->iecdsa != NULL &&
+         e->iecdsa(e->iec, hash, sizeof hash, &pk, sig, slen) == 1;
+    t_true("tls: SKE ECDSA verify works with the X25519 engine", ok);
+    hash[0] ^= 1;
+    t_true("tls: SKE ECDSA verify rejects a bad signature",
+           e->iecdsa != NULL && e->iecdsa(e->iec, hash, sizeof hash, &pk, sig, slen) == 0);
+}
+
 static void test_tls_config(void)
 {
     static ts_tls t;
@@ -285,7 +323,11 @@ static void test_tls_config(void)
            e->icbc_in == 0 && e->icbc_out == 0 && e->iccm_in == 0 && e->iaes_ctr == 0 &&
            e->iaes_cbcenc == 0 && e->iaes_cbcdec == 0 && e->iaes_ctrcbc == 0 &&
            e->ides_cbcenc == 0 && e->ides_cbcdec == 0);
-    t_true("tls: i31 RSA verify", e->irsavrfy == &br_rsa_i31_pkcs1_vrfy);
+    t_true("tls: i31 RSA verify", e->irsavrfy == &br_rsa_i31_pkcs1_vrfy &&
+           t.xc.irsa == &br_rsa_i31_pkcs1_vrfy);
+    t_true("tls: x509 ECDSA on the general curves", t.xc.iec == &br_ec_all_m31 &&
+           t.xc.iecdsa == &br_ecdsa_i31_vrfy_asn1);
+    check_ske_verifier(e);
     t_true("tls: wants to write the hello", (ts_tls_want(&t) & TS_TLS_WANT_WRITE) != 0);
     t_true("tls: step sends the hello", ts_tls_step(&t) == 1);
     t_true("tls: then waits to read", ts_tls_want(&t) == TS_TLS_WANT_READ);
