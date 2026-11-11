@@ -237,12 +237,14 @@ void ts_sess_up(ts_sess *s);
 /* Disconnect and stay disconnected, logged in, across restarts: first save
  * down (with have_login), and only then close the connection, stop every
  * timer and go IDLE. If that save fails nothing changes, and status and
- * ts_sess_problem say the state could not be saved. Without a saved login
+ * ts_sess_problem say the state could not be saved: returns -1 then, else 0
+ * (also 0 when the session is FAILED from an init out-of-memory, which this
+ * call cannot change). Without a saved login
  * (a login URL out, or a new key not yet logged in) there is nothing to
  * persist: the session just goes IDLE. During a logout (logout_pending) it
  * does nothing: the logout finishes and ends IDLE. Leaves FAILED. The next
  * ts_sess_up connects with the same node key. */
-void ts_sess_down(ts_sess *s);
+int ts_sess_down(ts_sess *s);
 /* 1 if the node is logged in and saved as down, else 0. */
 int ts_sess_is_down(const ts_sess *s);
 /* Log out, as upstream: first save the intent (have_login cleared,

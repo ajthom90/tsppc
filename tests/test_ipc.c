@@ -382,9 +382,21 @@ static void fk_handler(fake *f, fk_req *r)
  * connection appends a byte to countpath. */
 static void fake_server(int lfd, fake *f, const char *countpath)
 {
+    int nul = open("/dev/null", O_RDWR);
+    /* Never hold the test's stdout open if the test dies: no orphan. */
+    if (nul >= 0) {
+        dup2(nul, 1);
+        dup2(nul, 2);
+        if (nul > 2) close(nul);
+    }
+    alarm(600);
     for (;;) {
         int fd = accept(lfd, NULL, NULL), cf;
-        if (fd < 0) continue;
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        if (getppid() == 1) return;
         cf = open(countpath, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (cf >= 0) {
             (void)write(cf, "x", 1);
@@ -420,11 +432,23 @@ static long file_size(const char *path)
     return stat(path, &sb) == 0 ? (long)sb.st_size : 0;
 }
 
+static void remove_test_files(const char *statedir, const char *sock, const char *logpath, const char *countpath)
+{
+    char p[160];
+    unlink(logpath);
+    unlink(countpath);
+    unlink(sock);
+    snprintf(p, sizeof p, "%s/%s", statedir, "state.bin");
+    unlink(p);
+    rmdir(statedir);
+    rmdir(tmpdir);
+}
+
 /* up, down and what status says about it, against the fake control server. */
 static void test_daemon_down(void)
 {
     static fake f;
-    char statedir[128], sock[128], logpath[128], countpath[128], key[65], out[8192], err[256];
+    char statedir[128], sock[128], logpath[128], countpath[128], key[65], out[8192], out2[8192], err[256];
     struct sockaddr_in sa;
     socklen_t sl = sizeof sa;
     ts_state st, after;
@@ -460,6 +484,9 @@ static void test_daemon_down(void)
     if (lfd < 0 || bind(lfd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(lfd, 4) != 0 ||
         getsockname(lfd, (struct sockaddr *)&sa, &sl) != 0) {
         t_true("down: fake control listens", 0);
+        if (lfd >= 0) close(lfd);
+        unsetenv("TSPPC_SOCKET");
+        remove_test_files(statedir, sock, logpath, countpath);
         return;
     }
     g_ctl_port = ntohs(sa.sin_port);
@@ -503,11 +530,33 @@ static void test_daemon_down(void)
 
     kill(pid, SIGTERM);
     wait_exit(pid, 60000);
+    /* A failed save of down: an error, still wanted up, nothing saved. (Root
+     * writes to a read-only directory anyway.) */
+    if (geteuid() != 0) {
+        pid = start_daemon(statedir, sock, logpath, key);
+        t_true("down: restart for the failed save", wait_socket(sock, pid, 120000) == 0);
+        t_true("down: running again", wait_status(sock, "state RUNNING\n", out, sizeof out, 120000));
+        chmod(statedir, 0500);
+        raw_request(sock, "down\n", 5, out, sizeof out);
+        rc = run_cli("down", out2, sizeof out2);
+        chmod(statedir, 0700);
+        t_true("down: a failed save is an error line", strncmp(out, "error ", 6) == 0 && strstr(out, "down failed"));
+        t_true("down: tsppc down exits 1 and says so", rc == 1 && strstr(out2, "down failed"));
+        raw_request(sock, "status\n", 7, out, sizeof out);
+        t_true("down: failed save left it up", strstr(out, "\nwanted up\n") && strstr(out, "\nstate RUNNING\n"));
+        t_true("down: failed save saved nothing", load_state(statedir, &after) == 0 && after.have_login && !after.down);
+        kill(pid, SIGTERM);
+        wait_exit(pid, 60000);
+    } else {
+        printf("SKIP: failed-save down (root)\n");
+    }
+
     kill(srv, SIGKILL);
     waitpid(srv, NULL, 0);
     ts_wipe(&st, sizeof st);
     ts_wipe(&after, sizeof after);
     unsetenv("TSPPC_SOCKET");
+    remove_test_files(statedir, sock, logpath, countpath);
 }
 
 static void test_daemon(void)

@@ -1154,14 +1154,14 @@ int ts_sess_logout(ts_sess *s)
     return 0;
 }
 
-void ts_sess_down(ts_sess *s)
+int ts_sess_down(ts_sess *s)
 {
-    if (!s->nm_ok || !s->hostinfo) return;   /* out of memory at init: stays FAILED */
+    if (!s->nm_ok || !s->hostinfo) return 0;   /* out of memory at init: stays FAILED */
     s->down_failed = 0;
     s->logout_failed = 0;
     if (s->goal == GOAL_LOGOUT || s->st.logout_pending) {
         settle(s);   /* the logout finishes on its own and ends IDLE */
-        return;
+        return 0;
     }
     if (s->st.have_login && !s->st.down) {
         /* Persist it before anything changes, as ts_sess_logout does. */
@@ -1177,7 +1177,7 @@ void ts_sess_down(ts_sess *s)
         if (rc != 0) {
             s->down_failed = 1;
             settle(s);
-            return;
+            return -1;
         }
     }
     s->goal = GOAL_NONE;
@@ -1188,6 +1188,7 @@ void ts_sess_down(ts_sess *s)
     s->rate_limited = 0;
     if (s->phase != PH_NONE) fail(s, FAIL_QUIET, "disconnected");
     settle(s);
+    return 0;
 }
 
 int ts_sess_is_down(const ts_sess *s)

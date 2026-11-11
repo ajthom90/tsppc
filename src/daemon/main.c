@@ -567,13 +567,8 @@ static int down_before_session(void)
  * save failed (nothing changed). */
 static int do_down(void)
 {
-    const ts_state *st;
-    int needs_save;
     if (!D.sess) return down_before_session();
-    st = ts_sess_node_state(D.sess);
-    needs_save = st->have_login && !st->down && !st->logout_pending;
-    ts_sess_down(D.sess);
-    return needs_save && !ts_sess_is_down(D.sess) ? -1 : 0;
+    return ts_sess_down(D.sess);
 }
 
 /* ---- Replies ---------------------------------------------------------- */

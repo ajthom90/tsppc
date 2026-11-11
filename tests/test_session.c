@@ -689,7 +689,7 @@ static void test_sess_down_disconnects(void)
     memcpy(key, ts_sess_node_state(S)->node_priv, 32);
     saves = F.nsave;
     reqs = F.nreq;
-    ts_sess_down(S);
+    t_true("down: returns 0", ts_sess_down(S) == 0);
     fk_pump(&F);
     t_true("down: saved once, down and still logged in", F.nsave == saves + 1 && F.saved.down == 1 &&
            F.saved.have_login == 1 && !F.saved.logout_pending && memcmp(F.saved.node_priv, key, 32) == 0);
@@ -758,7 +758,7 @@ static void test_sess_down_save_fails(void)
     char st[512];
     begin_running();
     F.save_fail = 1;
-    ts_sess_down(S);
+    t_true("down save fails: returns -1", ts_sess_down(S) == -1);
     fk_pump(&F);
     t_true("down save fails: still RUNNING and connected", ts_sess_get_state(S) == TS_SESS_RUNNING && F.up &&
            F.ndisconnect == 0);
@@ -767,7 +767,7 @@ static void test_sess_down_save_fails(void)
     ts_sess_status(S, st, sizeof st);
     t_true("down save fails: status says so", strstr(st, "could not be saved") != NULL);
     F.save_fail = 0;
-    ts_sess_down(S);
+    t_true("down save fails: a later down returns 0", ts_sess_down(S) == 0);
     fk_pump(&F);
     t_true("down save fails: a later down works", ts_sess_get_state(S) == TS_SESS_IDLE && ts_sess_is_down(S) &&
            strcmp(ts_sess_problem(S), "") == 0);
