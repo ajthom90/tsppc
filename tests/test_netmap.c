@@ -326,13 +326,18 @@ static void test_limits(void)
     s = many_peers("Peers", TS_MAX_PEERS + 1, 100);
     t_unchanged("257 peers", &m, s);
     t_true("limit named", strstr(m.last_error, "256") != NULL);
+    t_true("limit flagged", m.last_limit == 1);
     free(s);
     s = many_peers("Peers", TS_MAX_PEERS, 100);
     t_true("256 peers fit", apply(&m, s) == 0 && m.npeers == TS_MAX_PEERS);
+    t_true("success clears the limit flag", m.last_limit == 0);
     free(s);
     s = many_peers("PeersChanged", 1, 5000);
     t_unchanged("257th peer by PeersChanged", &m, s);
+    t_true("257th peer flagged as the limit", m.last_limit == 1);
     free(s);
+    t_unchanged("other rejection after the limit", &m, "{\"PeersRemoved\":[\"x\"]}");
+    t_true("other rejection is not the limit", m.last_limit == 0);
 
     /* Names: 255 bytes kept, 256 rejected. */
     ts_netmap_reset(&m);

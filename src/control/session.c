@@ -24,7 +24,9 @@ enum { REG_LOGIN, REG_FOLLOWUP, REG_LOGOUT };
 
 /* What a failure does once the connection is closed. */
 enum {
-    FAIL_RETRY = 1,   /* BACKOFF and reconnect; before the handshake on port 80, try 443 first */
+    FAIL_RETRY = 1,   /* BACKOFF and reconnect; before the handshake on port 80, try 443 first
+                       * (nothing on port 80 is authenticated until the Noise response verifies,
+                       * so even an answer from "control" there falls back) */
     FAIL_RETRY_HERE,  /* BACKOFF and reconnect, no port fallback (control answered) */
     FAIL_STOP,        /* FAILED, never retried */
     FAIL_QUIET        /* no retry: the goal no longer needs a connection */
@@ -38,6 +40,8 @@ enum {
 #define NORAND_TEXT "logged out, but there is no randomness for a new node key; the old key stays " \
     "marked as logged out"
 #define LOGOUT_SAVE_TEXT "logout failed: the node state could not be saved"
+#define LOGIN_SAVE_TEXT "logged in, but the node state could not be saved; a restart will need `tsppc up`"
+#define HS80_TEXT "handshake on port 80 failed; trying port 443"
 
 static void settle(ts_sess *s);
 static int forget_login(ts_sess *s);
@@ -69,6 +73,26 @@ static void fail(ts_sess *s, int kind, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(s->pending_reason, sizeof s->pending_reason, fmt, ap);
     va_end(ap);
+}
+
+/* Save the node state. Any successful save also has the login on disk, so it
+ * clears an earlier failed save of the login. */
+static int save(ts_sess *s, const ts_state *st)
+{
+    if (s->io->save_state(s->user, st) != 0) return -1;
+    s->login_save_failed = 0;
+    return 0;
+}
+
+/* The handshake failed before control was authenticated. On port 80 nothing
+ * is authenticated until the Noise response verifies (no TLS), so the reply
+ * may not be control's: fall back to 443 and show none of its text. On 443
+ * the text came over TLS, so it is shown (sanitised). */
+static void handshake_failed(ts_sess *s, const char *text)
+{
+    if (s->port == 80) fail(s, FAIL_RETRY, "%s", HS80_TEXT);
+    else if (text) fail(s, FAIL_RETRY_HERE, "control rejected the handshake: %s", text);
+    else fail(s, FAIL_RETRY_HERE, "the Noise handshake with control failed");
 }
 
 static void pub_hex(char out[65], const uint8_t priv[32])
@@ -234,7 +258,6 @@ static void send_register(ts_sess *s, int kind)
     size_t nh = 0;
     char oldlb[80], newlb[80], hex[65];
     uint32_t sid;
-    ts_state prev = s->st;
     int regen = 0;
 
     if (kind == REG_LOGIN && s->regen) {
@@ -242,14 +265,17 @@ static void send_register(ts_sess *s, int kind)
          * state to disk, so a control that keeps expiring them is not
          * followed more than once a minute. */
         uint8_t k[32];
+        ts_state prev;   /* restored if the save fails; copied only once it can be */
         if (s->have_regen && s->now - s->last_regen < TS_SESS_REGEN_MIN_MS) {
             fail(s, FAIL_RETRY_HERE, "control keeps expiring new node keys");
             return;
         }
         if (s->io->random(s->user, k, 32) != 0) {
+            ts_wipe(k, sizeof k);
             fail(s, FAIL_RETRY_HERE, "no randomness for a new node key");
             return;
         }
+        prev = s->st;
         ts_state_clamp_key(k);
         /* The old key is the last one that completed a login (as upstream,
          * which only replaces its key once a login completes): a key that
@@ -262,18 +288,18 @@ static void send_register(ts_sess *s, int kind)
         s->st.have_login = 0;
         memcpy(s->st.node_priv, k, 32);
         ts_wipe(k, sizeof k);
-        if (s->io->save_state(s->user, &s->st) != 0) {
+        if (save(s, &s->st) != 0) {
             s->st = prev;
             fail(s, FAIL_RETRY_HERE, "could not save the node state");
             ts_wipe(&prev, sizeof prev);
             return;
         }
+        ts_wipe(&prev, sizeof prev);
         s->regen = 0;
         s->have_regen = 1;
         s->last_regen = s->now;
         regen = 1;
     }
-    ts_wipe(&prev, sizeof prev);
 
     b.cap = strlen(s->hostinfo) + 6 * TS_SESS_URL_MAX + 512;
     b.p = (char *)malloc(b.cap);
@@ -403,7 +429,10 @@ static void on_map_msg(void *user, const char *json, size_t len)
     ts_sess *s = (ts_sess *)user;
     if (s->pending_fail) return;
     if (ts_netmap_apply(&s->nm, json, len) != 0) {
-        fail(s, FAIL_RETRY_HERE, "map message rejected: %s", s->nm.last_error);
+        /* Over the peer limit control sends the same map again on every
+         * reconnect: stop until `tsppc up`. Anything else may be a lost
+         * delta, which a fresh map session repairs. */
+        fail(s, s->nm.last_limit ? FAIL_STOP : FAIL_RETRY_HERE, "map message rejected: %s", s->nm.last_error);
         return;
     }
     s->map_live = 1;
@@ -464,8 +493,9 @@ static void login_done(ts_sess *s, int authorized)
     s->relogin = RELOGIN_NONE;
     if (!s->st.have_login) {
         s->st.have_login = 1;
-        /* Not fatal: control has the login; a restart registers again. */
-        (void)s->io->save_state(s->user, &s->st);
+        /* Not fatal: control has the login and this session runs on. Status
+         * says so until a later save succeeds. */
+        if (save(s, &s->st) != 0) s->login_save_failed = 1;
     }
     s->map_at = s->now;
 }
@@ -488,7 +518,8 @@ static int forget_login(ts_sess *s)
     ts_wipe(s->st.old_node_priv, 32);
     s->st.have_old_node = 0;
     s->st.have_login = 0;
-    s->save_failed = s->io->save_state(s->user, &s->st) != 0;
+    s->save_failed = save(s, &s->st) != 0;
+    s->login_save_failed = 0;   /* no login to lose any more */
     s->logged_in = 0;
     s->refresh = 0;
     s->auth_url[0] = 0;
@@ -659,7 +690,8 @@ static void cb_data(void *u, uint32_t sid, const uint8_t *d, size_t n)
     if (r == &s->map && r->status == 200) {
         if (ts_map_stream_feed(&s->ms, d, n) != 0 && !s->pending_fail) {
             if (s->ms.failed == TS_MAP_STREAM_TOO_BIG)
-                fail(s, FAIL_RETRY_HERE, "a map message is over the %u-byte limit", (unsigned)TS_MAP_MSG_MAX);
+                /* Control would send it again: stop until `tsppc up`. */
+                fail(s, FAIL_STOP, "a map message is over the %u-byte limit", (unsigned)TS_MAP_MSG_MAX);
             else
                 fail(s, FAIL_RETRY_HERE, "out of memory for a map message");
         }
@@ -776,11 +808,11 @@ static size_t handshake_input(ts_sess *s, const uint8_t *p, size_t n)
     if (s->hs[0] == 3) {
         char text[200];
         clean_text(text, sizeof text, (const char *)s->hs + 3, s->hslen - 3);
-        fail(s, FAIL_RETRY_HERE, "control rejected the handshake: %s", text);
+        handshake_failed(s, text);
         return n;
     }
     if (ts_noise_read_response(&s->noise, s->hs) != 0) {
-        fail(s, FAIL_RETRY_HERE, "the Noise handshake with control failed");
+        handshake_failed(s, NULL);
         return n;
     }
     ts_h2_init(&s->h2, &H2_CBS, s);
@@ -1013,7 +1045,7 @@ void ts_sess_disconnected(ts_sess *s, const char *why)
     if (s->phase == PH_NOISE && s->hslen > 3 && s->hs[0] == 3) {
         char text[200];
         clean_text(text, sizeof text, (const char *)s->hs + 3, s->hslen - 3);
-        fail(s, FAIL_RETRY_HERE, "control rejected the handshake: %s", text);
+        handshake_failed(s, text);
     } else {
         char text[120];
         clean_text(text, sizeof text, why ? why : "connection closed", why ? strlen(why) : 17);
@@ -1102,7 +1134,7 @@ int ts_sess_logout(ts_sess *s)
         int rc;
         n.have_login = 0;
         n.logout_pending = 1;
-        rc = s->io->save_state(s->user, &n);
+        rc = save(s, &n);
         if (rc == 0) s->st = n;
         ts_wipe(&n, sizeof n);
         if (rc != 0) {
@@ -1220,6 +1252,10 @@ void ts_sess_status(const ts_sess *s, char *out, size_t cap)
         len = strlen(out);
         snprintf(out + len, cap - len, "; %s", LOGOUT_SAVE_TEXT);
     }
+    if (s->login_save_failed) {
+        len = strlen(out);
+        snprintf(out + len, cap - len, "; %s", LOGIN_SAVE_TEXT);
+    }
     len = strlen(out);
     snprintf(out + len, cap - len, "; %u peers", s->nm_ok ? (unsigned)s->nm.npeers : 0u);
     if (s->nm_ok && s->nm.have_self && s->nm.self.key_expiry != 0) {
@@ -1245,13 +1281,13 @@ const char *ts_sess_problem(const ts_sess *s)
     case TS_SESS_NEED_LOGIN:
         if (s->relogin == RELOGIN_EXPIRED) return EXPIRED_TEXT;
         if (s->relogin == RELOGIN_REMOVED) return REMOVED_TEXT;
-        return "";
+        return s->login_save_failed ? LOGIN_SAVE_TEXT : "";
     case TS_SESS_IDLE:
         if (s->save_failed) return "the node state could not be saved";
         if (s->logout_unconfirmed) return "control was not reached, so the old key stays registered there until it expires";
         return "";
     default:
-        return "";
+        return s->login_save_failed ? LOGIN_SAVE_TEXT : "";
     }
 }
 

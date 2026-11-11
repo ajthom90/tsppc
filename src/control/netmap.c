@@ -189,6 +189,7 @@ static int legacy_derp(const ts_json_tok *t)
 
 typedef struct {
     const char *err;   /* static text naming the field or limit */
+    int limit;         /* err is the TS_MAX_PEERS limit */
 } ctx;
 
 static int bad(ctx *c, const char *msg)
@@ -307,7 +308,10 @@ static int upsert(ts_node *v, size_t *n, const ts_node *node, ctx *c)
         *p = *node;
         return 0;
     }
-    if (*n >= TS_MAX_PEERS) return bad(c, "more than " STR(TS_MAX_PEERS) " peers (TS_MAX_PEERS)");
+    if (*n >= TS_MAX_PEERS) {
+        if (!c->err) c->limit = 1;
+        return bad(c, "more than " STR(TS_MAX_PEERS) " peers (TS_MAX_PEERS)");
+    }
     v[(*n)++] = *node;
     return 0;
 }
@@ -716,6 +720,8 @@ int ts_netmap_apply(ts_netmap *m, const char *json, size_t len)
 {
     ctx c;
     c.err = NULL;
+    c.limit = 0;
+    m->last_limit = 0;
     if (!m->peers || !m->stage) {
         set_error(m, "netmap not initialised");
         return -1;
@@ -723,6 +729,7 @@ int ts_netmap_apply(ts_netmap *m, const char *json, size_t len)
     if (!json) len = 0;
     if (apply_inner(m, json ? json : "", len, &c) != 0) {
         set_error(m, c.err ? c.err : "invalid map message");
+        m->last_limit = c.limit;
         return -1;
     }
     m->last_error[0] = 0;
