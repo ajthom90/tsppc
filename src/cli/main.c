@@ -19,18 +19,17 @@
 #include <unistd.h>
 
 #include "src/daemon/ipc.h"
+#include "src/daemon/ipc_reply.h"
 
-#define REPLY_TIMEOUT_S 30
+#define REPLY_TIMEOUT_MS 10000
 #define UP_TIMEOUT_S 900        /* up gives up waiting after this (tsppcd keeps going) */
 #define LOGOUT_TIMEOUT_S 90
 #define POLL_MS 1000
 
-typedef struct {
-    char *buf;                  /* the reply, NUL-terminated */
-    size_t len;
-} reply;
-
+/* ts_reply and its peers are large: kept off the stack. */
 static char *rbuf;
+static ts_reply R;
+static ts_reply_peer *peers;
 static mach_timebase_info_data_t tb;
 
 /* Monotonic seconds, for timeouts (mach_absolute_time exists from 10.0 on). */
@@ -54,160 +53,99 @@ static void sleep_ms(int ms)
     (void)select(0, NULL, NULL, NULL, &tv);
 }
 
-/* Send one request and read the whole reply. 0, or -1 (message printed). */
-static int request(ts_ipc_cmd cmd, reply *r)
+/* Send one request and parse the reply into R. 0, or -1 (message printed). */
+static int request(ts_ipc_cmd cmd)
 {
     const char *path = ts_ipc_socket_path();
-    const char *line = ts_ipc_cmd_line(cmd);
-    long until = mono_s() + REPLY_TIMEOUT_S;
-    size_t off = 0, n = strlen(line);
-    int fd = ts_ipc_connect(path);
+    size_t len = 0;
     char safe[256];
+    ts_req_result rc = ts_ipc_request(path, cmd, REPLY_TIMEOUT_MS, rbuf, TS_IPC_RESP_MAX, &len);
 
-    r->buf = rbuf;
-    r->len = 0;
-    rbuf[0] = 0;
-    if (fd < 0) {
+    switch (rc) {
+    case TS_REQ_OK:
+        break;
+    case TS_REQ_NO_DAEMON:
+    case TS_REQ_DENIED:
         ts_ipc_clean(safe, sizeof safe, path, strlen(path), 0);
         fprintf(stderr, "tsppc: cannot reach tsppcd at %s: %s\n", safe, strerror(errno));
         return -1;
-    }
-    if (fd >= FD_SETSIZE) {
-        close(fd);
-        fprintf(stderr, "tsppc: out of descriptors\n");
+    case TS_REQ_TIMEOUT:
+        fprintf(stderr, "tsppc: tsppcd did not answer\n");
+        return -1;
+    default:
+        fprintf(stderr, "tsppc: cannot talk to tsppcd: %s\n", errno ? strerror(errno) : "failed");
         return -1;
     }
-    while (off < n) {
-        ssize_t w = write(fd, line + off, n - off);
-        if (w <= 0) {
-            if (w < 0 && errno == EINTR) continue;
-            fprintf(stderr, "tsppc: cannot send to tsppcd\n");
-            close(fd);
-            return -1;
-        }
-        off += (size_t)w;
-    }
-    for (;;) {
-        fd_set rs;
-        struct timeval tv = { 1, 0 };
-        ssize_t k;
-        if (mono_s() > until) {
-            fprintf(stderr, "tsppc: tsppcd did not answer\n");
-            close(fd);
-            return -1;
-        }
-        FD_ZERO(&rs);
-        FD_SET(fd, &rs);
-        if (select(fd + 1, &rs, NULL, NULL, &tv) <= 0) continue;
-        if (r->len == TS_IPC_RESP_MAX) break;   /* the daemon never sends more */
-        k = read(fd, rbuf + r->len, TS_IPC_RESP_MAX - r->len);
-        if (k < 0 && errno == EINTR) continue;
-        if (k <= 0) break;
-        r->len += (size_t)k;
-    }
-    close(fd);
-    rbuf[r->len] = 0;
-    if (r->len == 0) {
+    if (len == 0) {
         fprintf(stderr, "tsppc: tsppcd closed the connection (busy?)\n");
         return -1;
     }
-    return 0;
-}
-
-/* Iterate the reply's lines: on each call, the next line with key and value
- * (both cleaned into the caller's buffers). Returns 0 at the end. Malformed
- * lines are skipped. */
-static int next_line(const reply *r, size_t *pos, char *key, size_t kcap, char *val, size_t vcap)
-{
-    while (*pos < r->len) {
-        const char *l = r->buf + *pos;
-        const char *nl = memchr(l, '\n', r->len - *pos);
-        size_t n = nl ? (size_t)(nl - l) : r->len - *pos, k, v;
-        *pos += n + (nl ? 1 : 0);
-        if (ts_ipc_split(l, n, &k, &v) != 0) continue;
-        ts_ipc_clean(key, kcap, l, k, 0);
-        ts_ipc_clean(val, vcap, l + v, n - v, 0);
-        return 1;
+    if (ts_reply_parse(&R, peers, rbuf, len) != 0) {
+        fprintf(stderr, "tsppc: unexpected reply from tsppcd\n");
+        return -1;
     }
     return 0;
 }
 
-/* The value of the first line with this key, cleaned, or "" if none. */
-static int field(const reply *r, const char *want, char *val, size_t vcap)
+/* The request went through and the daemon said ok; else say why not. */
+static int check_ok(void)
 {
-    size_t pos = 0;
-    char key[32];
-    while (next_line(r, &pos, key, sizeof key, val, vcap))
-        if (strcmp(key, want) == 0) return 1;
-    val[0] = 0;
-    return 0;
+    if (R.ok) return 0;
+    fprintf(stderr, "tsppc: %s\n", R.error);
+    return -1;
 }
 
-static int check_ok(const reply *r)
+static void fmt_ip(char *out, size_t cap, uint32_t a)
 {
-    char v[256];
-    if (field(r, "ok", v, sizeof v)) return 0;
-    if (field(r, "error", v, sizeof v)) fprintf(stderr, "tsppc: %s\n", v);
-    else fprintf(stderr, "tsppc: unexpected reply from tsppcd\n");
-    return -1;
+    snprintf(out, cap, "%u.%u.%u.%u", (unsigned)(a >> 24), (unsigned)(a >> 16 & 255),
+             (unsigned)(a >> 8 & 255), (unsigned)(a & 255));
 }
 
 static int cmd_status(void)
 {
-    reply r;
-    size_t pos = 0;
-    char key[32], val[TS_IPC_VALUE_MAX];
-    int peers = 0, down = 0;
-    if (request(TS_IPC_STATUS, &r) != 0 || check_ok(&r) != 0) return 1;
-    field(&r, "wanted", val, sizeof val);
-    if (strcmp(val, "down") == 0) {
-        field(&r, "login", val, sizeof val);
-        down = strcmp(val, "yes") == 0;
+    size_t i;
+    int down;
+    if (request(TS_IPC_STATUS) != 0 || check_ok() != 0) return 1;
+    down = strcmp(R.wanted, "down") == 0 && strcmp(R.login, "yes") == 0;
+    if (down) printf("Disconnected (tsppc up to connect)\n");
+    else if (R.status[0]) printf("%s\n", R.status);
+    if (R.url[0]) printf("Log in at: %s\n", R.url);
+    if (R.problem[0]) printf("Problem: %s\n", R.problem);
+    if (R.have_ipv4) {
+        char ip[16];
+        fmt_ip(ip, sizeof ip, R.ipv4);
+        printf("Tailnet IP: %s\n", ip);
     }
-    while (next_line(&r, &pos, key, sizeof key, val, sizeof val)) {
-        if (strcmp(key, "status") == 0) printf("%s\n", down ? "Disconnected (tsppc up to connect)" : val);
-        else if (strcmp(key, "ip") == 0) printf("Tailnet IP: %s\n", val);
-        else if (strcmp(key, "problem") == 0) printf("Problem: %s\n", val);
-        else if (strcmp(key, "url") == 0) printf("Log in at: %s\n", val);
-        else if (strcmp(key, "truncated") == 0) printf("(list truncated)\n");
-        else if (strcmp(key, "peer") == 0) {
-            char ip[32], on[16];
-            const char *name;
-            if (!peers++) printf("Peers:\n");
-            if (sscanf(val, "%31s %15s", ip, on) != 2) continue;
-            name = strchr(val, ' ');
-            name = name ? strchr(name + 1, ' ') : NULL;
-            printf("  %-15s  %-7s  %s\n", ip, on, name ? name + 1 : "");
-        }
+    if (R.npeers) printf("Peers:\n");
+    for (i = 0; i < R.npeers; i++) {
+        char ip[16] = "-";
+        if (R.peers[i].have_ipv4) fmt_ip(ip, sizeof ip, R.peers[i].ipv4);
+        printf("  %-15s  %-7s  %s\n", ip, R.peers[i].online ? "online" : "offline", R.peers[i].name);
     }
+    if (R.truncated) printf("(list truncated)\n");
     return 0;
 }
 
 static int cmd_ip(void)
 {
-    reply r;
-    char v[64], st[32];
-    if (request(TS_IPC_IP, &r) != 0 || check_ok(&r) != 0) return 1;
-    if (field(&r, "ip", v, sizeof v)) {
-        printf("%s\n", v);
+    if (request(TS_IPC_IP) != 0 || check_ok() != 0) return 1;
+    if (R.have_ipv4) {
+        char ip[16];
+        fmt_ip(ip, sizeof ip, R.ipv4);
+        printf("%s\n", ip);
         return 0;
     }
-    field(&r, "state", st, sizeof st);
-    fprintf(stderr, "tsppc: no tailnet IP yet (%s)\n", st[0] ? st : "unknown state");
+    fprintf(stderr, "tsppc: no tailnet IP yet (%s)\n", R.state[0] ? R.state : "unknown state");
     return 1;
 }
 
 static int cmd_up(void)
 {
-    reply r;
-    char st[32], last[32] = "", status[TS_IPC_VALUE_MAX], url[TS_IPC_VALUE_MAX], shown[TS_IPC_VALUE_MAX] = "",
-        prob[TS_IPC_VALUE_MAX], lastprob[TS_IPC_VALUE_MAX] = "";
+    char last[32] = "", shown[TS_IPC_VALUE_MAX] = "", lastprob[TS_IPC_VALUE_MAX] = "";
     long until = mono_s() + UP_TIMEOUT_S;
-    if (request(TS_IPC_UP, &r) != 0 || check_ok(&r) != 0) return 1;
+    if (request(TS_IPC_UP) != 0 || check_ok() != 0) return 1;
     for (;;) {
-        field(&r, "state", st, sizeof st);
-        field(&r, "status", status, sizeof status);
-        field(&r, "problem", prob, sizeof prob);
+        const char *st = R.state;
         if (strcmp(st, "RUNNING") == 0) {
             printf("Logged in and connected.\n");
             return 0;
@@ -218,20 +156,20 @@ static int cmd_up(void)
             return 0;
         }
         if (strcmp(st, "FAILED") == 0) {
-            fprintf(stderr, "tsppc: %s\n", status);
+            fprintf(stderr, "tsppc: %s\n", R.status);
             return 1;
         }
-        if (field(&r, "url", url, sizeof url) && strcmp(url, shown) != 0) {
-            printf("\nTo log in, visit:\n\n\t%s\n\n", url);
+        if (R.url[0] && strcmp(R.url, shown) != 0) {
+            printf("\nTo log in, visit:\n\n\t%s\n\n", R.url);
             fflush(stdout);
-            memcpy(shown, url, sizeof shown);
+            memcpy(shown, R.url, sizeof shown);
         } else if (strcmp(st, last) != 0 && strcmp(st, "NEED_LOGIN") != 0) {
             printf("%s\n", strcmp(st, "BACKOFF") == 0 ? "Waiting to reconnect..." : "Connecting...");
             fflush(stdout);
         }
-        if (prob[0] && strcmp(prob, lastprob) != 0) {
-            fprintf(stderr, "tsppc: %s\n", prob);
-            memcpy(lastprob, prob, sizeof lastprob);
+        if (R.problem[0] && strcmp(R.problem, lastprob) != 0) {
+            fprintf(stderr, "tsppc: %s\n", R.problem);
+            memcpy(lastprob, R.problem, sizeof lastprob);
         }
         memcpy(last, st, sizeof last);
         if (mono_s() > until) {
@@ -239,31 +177,25 @@ static int cmd_up(void)
             return 1;
         }
         sleep_ms(POLL_MS);
-        if (request(TS_IPC_STATUS, &r) != 0 || check_ok(&r) != 0) return 1;
+        if (request(TS_IPC_STATUS) != 0 || check_ok() != 0) return 1;
     }
 }
 
 static int cmd_down(void)
 {
-    reply r;
     /* A failed first save comes back as an error: nothing was changed. */
-    if (request(TS_IPC_DOWN, &r) != 0 || check_ok(&r) != 0) return 1;
+    if (request(TS_IPC_DOWN) != 0 || check_ok() != 0) return 1;
     printf("Disconnected. Run tsppc up to connect again.\n");
     return 0;
 }
 
 static int cmd_logout(void)
 {
-    reply r;
-    char login[32], st[32], status[TS_IPC_VALUE_MAX], prob[TS_IPC_VALUE_MAX];
     long until = mono_s() + LOGOUT_TIMEOUT_S;
     /* A failed first save comes back as an error: nothing was changed. */
-    if (request(TS_IPC_LOGOUT, &r) != 0 || check_ok(&r) != 0) return 1;
+    if (request(TS_IPC_LOGOUT) != 0 || check_ok() != 0) return 1;
     for (;;) {
-        field(&r, "login", login, sizeof login);
-        field(&r, "state", st, sizeof st);
-        field(&r, "status", status, sizeof status);
-        field(&r, "problem", prob, sizeof prob);
+        const char *login = R.login, *st = R.state, *status = R.status, *prob = R.problem;
         if (strcmp(login, "no") == 0) {
             /* Anything but a plain logout is shown as the daemon put it. */
             if (prob[0]) printf("%s\n", status);
@@ -281,7 +213,7 @@ static int cmd_logout(void)
             return 1;
         }
         sleep_ms(POLL_MS);
-        if (request(TS_IPC_STATUS, &r) != 0 || check_ok(&r) != 0) return 1;
+        if (request(TS_IPC_STATUS) != 0 || check_ok() != 0) return 1;
     }
 }
 
@@ -293,8 +225,9 @@ int main(int argc, char **argv)
         usage();
         return 2;
     }
-    rbuf = (char *)malloc(TS_IPC_RESP_MAX + 1);
-    if (!rbuf) {
+    rbuf = (char *)malloc(TS_IPC_RESP_MAX);
+    peers = (ts_reply_peer *)malloc(TS_MAX_PEERS * sizeof *peers);
+    if (!rbuf || !peers) {
         fprintf(stderr, "tsppc: out of memory\n");
         return 1;
     }

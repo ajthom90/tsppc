@@ -170,9 +170,9 @@ KFOBJS := $(OBJDIR)/tools/keyfetch_check.o $(LIBOBJS)
 $(OBJDIR)/tsppcd: $(OBJDIR)/src/daemon/main.o $(LIBOBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(OBJDIR)/src/daemon/main.o $(LIBOBJS) $(VOBJS)
 
-# The CLI needs only the socket code.
-$(OBJDIR)/tsppc: $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/daemon/ipc.o
-	$(CC) $(ARCH) $(SAN) -o $@ $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/daemon/ipc.o
+# The CLI needs only the socket and reply code.
+$(OBJDIR)/tsppc: $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/daemon/ipc.o $(OBJDIR)/src/daemon/ipc_reply.o
+	$(CC) $(ARCH) $(SAN) -o $@ $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/daemon/ipc.o $(OBJDIR)/src/daemon/ipc_reply.o
 
 $(OBJDIR)/keyfetch_check: $(KFOBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(KFOBJS) $(VOBJS)

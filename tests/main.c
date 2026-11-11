@@ -14,6 +14,7 @@ void test_store(void);
 void test_netmap(void);
 void test_session(void);
 void test_ipc(void);
+void test_ipc_reply(void);
 
 int main(void)
 {
@@ -31,5 +32,6 @@ int main(void)
     test_netmap();
     test_session();
     test_ipc();
+    test_ipc_reply();
     return t_summary();
 }
