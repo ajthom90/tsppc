@@ -26,6 +26,7 @@ int main(int argc, char *argv[])
     }
     [NSApp setDelegate:controller];
     [NSApp run];
+    /* Not reached: terminate: exits the process. */
     [controller release];
     [pool release];
     return 0;

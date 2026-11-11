@@ -70,6 +70,9 @@ static int isState(const ts_reply *r, const char *s)
 - (void)scheduleIn:(NSTimeInterval)seconds;
 - (void)tick:(NSTimer *)t;
 - (void)redraw;
+- (void)redrawMenu;
+- (void)menuDidEndTracking:(NSNotification *)note;
+- (void)applyStale;
 - (NSMenuItem *)itemFor:(const ts_menu_item *)it;
 - (BOOL)alert:(NSString *)message info:(NSString *)info first:(NSString *)b1 second:(NSString *)b2;
 - (void)send:(ts_ipc_cmd)cmd failure:(NSString *)failure;
@@ -116,6 +119,8 @@ static int isState(const ts_reply *r, const char *s)
         cur = next;
         next = t;
         haveMenu = 1;
+        [self redraw];
+    } else if (menuStale) {
         [self redraw];
     }
 }
@@ -167,16 +172,40 @@ static int isState(const ts_reply *r, const char *s)
     return mi;
 }
 
-/* Draw cur. The menu is changed in place, so an open menu updates. */
+/* Draw cur: the icon at once, the menu only while it is not open (rebuilding
+ * an open menu would move items under the pointer). An open menu is redrawn
+ * when it closes (NSMenuDidEndTrackingNotification, 10.3+) or at the next poll. */
 - (void)redraw
+{
+    [statusItem setImage:icons[cur->icon]];
+    [statusItem setAlternateImage:altIcons[cur->icon]];
+    if ([[[NSRunLoop currentRunLoop] currentMode] isEqualToString:NSEventTrackingRunLoopMode]) {
+        menuStale = 1;
+        return;
+    }
+    [self redrawMenu];
+}
+
+- (void)menuDidEndTracking:(NSNotification *)note
+{
+    (void)note;
+    /* Later, once the run loop has left tracking mode. */
+    [self performSelector:@selector(applyStale) withObject:nil afterDelay:0.0];
+}
+
+- (void)applyStale
+{
+    if (menuStale) [self redraw];
+}
+
+- (void)redrawMenu
 {
     NSMenu *sub = nil;
     NSMenuItem *mi;
     size_t i;
     int inTail = 0;
 
-    [statusItem setImage:icons[cur->icon]];
-    [statusItem setAlternateImage:altIcons[cur->icon]];
+    menuStale = 0;
 
     while ([menu numberOfItems] > 0) [menu removeItemAtIndex:0];
 
@@ -245,7 +274,7 @@ static int isState(const ts_reply *r, const char *s)
     case TS_REQ_OK:
         if (len > 0 && ts_reply_parse(reply, peers, buf, len) == 0) {
             if (reply->ok) return;
-            why = str(reply->error);
+            why = reply->error[0] ? str(reply->error) : @"tsppcd refused the request.";
         } else {
             why = @"tsppcd sent a reply that could not be read.";
         }
@@ -296,10 +325,12 @@ static int isState(const ts_reply *r, const char *s)
     return self;
 }
 
+/* Never runs in practice: the timer retains its target and terminate: exits. */
 - (void)dealloc
 {
     int i;
 
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     [timer invalidate];
     [timer release];
     [[NSStatusBar systemStatusBar] removeStatusItem:statusItem];
@@ -327,6 +358,8 @@ static int isState(const ts_reply *r, const char *s)
     [statusItem setHighlightMode:YES];
     [statusItem setToolTip:@"tsppc"];
     [statusItem setMenu:menu];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(menuDidEndTracking:)
+                                                 name:NSMenuDidEndTrackingNotification object:menu];
     [statusItem setImage:icons[TS_ICON_BUSY]];
     [statusItem setAlternateImage:altIcons[TS_ICON_BUSY]];
     [self pollNow];

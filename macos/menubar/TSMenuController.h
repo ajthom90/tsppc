@@ -16,6 +16,7 @@
     ts_menu *cur;                  /* the model the menu shows */
     ts_menu *next;                 /* the model being built */
     int haveMenu;                  /* cur has been drawn once */
+    int menuStale;                 /* cur changed while the menu was open; redraw it once closed */
 
     ts_reply *reply;
     ts_reply_peer *peers;          /* TS_MAX_PEERS */
