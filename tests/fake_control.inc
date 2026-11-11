@@ -90,6 +90,8 @@ typedef struct fake {
     size_t rx_chunk;          /* deliver to the session in pieces of this size (0: whole) */
     int phase;                /* 0: HTTP upgrade, 1: Noise transport, 2: silent */
     const char *hs_error;     /* answer the handshake with this error frame */
+    uint16_t hs_error_port;   /* ... only on this port (0: any) */
+    uint16_t hs_corrupt_port; /* send a handshake response that fails to verify on this port (0: none) */
     const char *early;        /* early payload JSON to send before HTTP/2 */
     int no_preface;           /* send no frames of our own: the caller writes the whole stream */
     r_session rs;
@@ -523,6 +525,7 @@ FK_FN size_t fk_upgrade(fake *f)
     static const char ok[] = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: tailscale-control-protocol\r\n"
                              "Connection: upgrade\r\n\r\n";
     size_t i;
+    uint16_t port;
     for (i = 0; i + 4 <= f->c2s_len; i++)
         if (memcmp(b + i, "\r\n\r\n", 4) == 0) { end = b + i + 4; break; }
     if (!end) return 0;
@@ -534,8 +537,9 @@ FK_FN size_t fk_upgrade(fake *f)
     le = hv;
     while (le < end && *le != '\r') le++;
     if (fk_b64dec(init, sizeof init, hv, (size_t)(le - hv)) != TS_NOISE_INIT_LEN) f->bad = 1;
+    port = f->nconnect > 0 && f->nconnect <= 256 ? f->ports[f->nconnect - 1] : 0;
     fk_append(&f->s2c, &f->s2c_len, &f->s2c_cap, ok, sizeof ok - 1);
-    if (f->hs_error) {
+    if (f->hs_error && (f->hs_error_port == 0 || f->hs_error_port == port)) {
         uint8_t h[3];
         size_t n = strlen(f->hs_error);
         h[0] = 3;
@@ -547,6 +551,12 @@ FK_FN size_t fk_upgrade(fake *f)
     }
     if (responder(&f->rs, resp, init, f->control_priv, f->resp_eph) != 0) {
         f->bad = 1;
+        f->phase = 2;
+        return (size_t)(end - b);
+    }
+    if (f->hs_corrupt_port != 0 && f->hs_corrupt_port == port) {
+        resp[sizeof resp - 1] ^= 1;   /* in the tag: the client cannot verify it */
+        fk_append(&f->s2c, &f->s2c_len, &f->s2c_cap, resp, sizeof resp);
         f->phase = 2;
         return (size_t)(end - b);
     }

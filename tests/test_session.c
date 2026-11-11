@@ -1230,15 +1230,61 @@ static void test_connect_timeout(void)
     end();
 }
 
+/* Port 80 has no TLS: until the Noise response verifies, an error frame or a
+ * bad response there may not be control's. Fall back to 443 and show none of
+ * the text. Over 443 (TLS) the text is control's and is shown. */
 static void test_handshake_error(void)
 {
+    begin(h_std);
+    F.hold_followup = 1;
+    F.hs_error = "client version too old\x1b[2J";
+    F.hs_error_port = 80;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("hs error on 80: tries 443", F.nconnect == 2 && F.ports[0] == 80 && F.ports[1] == 443);
+    t_true("hs error on 80: logged in over 443", ts_sess_get_state(S) == TS_SESS_NEED_LOGIN);
+    t_true("hs error on 80: text not in status", !status_has("version too old"));
+    t_true("hs error on 80: text not in problem", !has(ts_sess_problem(S), "version too old"));
+    end();
+
+    begin(h_std);
+    F.hs_error = "client version too old\x1b[2J";
+    F.refuse_port = 80;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("hs error on 443: BACKOFF", F.nconnect == 2 && ts_sess_get_state(S) == TS_SESS_BACKOFF);
+    t_true("hs error on 443: sanitised text in status", status_has("rejected the handshake: client version too old?[2J"));
+    t_true("hs error on 443: text in problem", has(ts_sess_problem(S), "client version too old?[2J"));
+    end();
+
     begin(h_std);
     F.hs_error = "client version too old";
     ts_sess_up(S);
     fk_pump(&F);
-    t_true("hs error: BACKOFF", ts_sess_get_state(S) == TS_SESS_BACKOFF);
-    t_true("hs error: message in status", status_has("client version too old"));
-    t_true("hs error: no fallback to 443", F.nconnect == 1);
+    t_true("hs error on both: 80 then 443", F.nconnect == 2 && F.ports[1] == 443);
+    t_true("hs error on both: BACKOFF with 443's text", ts_sess_get_state(S) == TS_SESS_BACKOFF &&
+           status_has("client version too old"));
+    end();
+}
+
+static void test_handshake_unverified(void)
+{
+    begin(h_std);
+    F.hold_followup = 1;
+    F.hs_corrupt_port = 80;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("bad hs response on 80: tries 443", F.nconnect == 2 && F.ports[1] == 443);
+    t_true("bad hs response on 80: logged in over 443", ts_sess_get_state(S) == TS_SESS_NEED_LOGIN);
+    end();
+
+    begin(h_std);
+    F.hs_corrupt_port = 443;
+    F.refuse_port = 80;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("bad hs response on 443: BACKOFF", F.nconnect == 2 && ts_sess_get_state(S) == TS_SESS_BACKOFF);
+    t_true("bad hs response on 443: says so", status_has("Noise handshake with control failed"));
     end();
 }
 
@@ -1351,6 +1397,51 @@ static void test_rejected_message(void)
     fk_advance(&F, 1000, 100);
     t_true("rejected: reconnected with a fresh map", F.nconnect == 2 && maps() == 2);
     t_true("rejected: RUNNING again", ts_sess_get_state(S) == TS_SESS_RUNNING && status_has("2 peers"));
+    end();
+}
+
+/* Over the peer limit control would send the same map on every reconnect:
+ * FAILED, no retry until ts_sess_up. */
+static void test_peer_limit(void)
+{
+    static char big[TS_MAX_PEERS * 200 + 1024];
+    size_t n;
+    int i;
+    n = (size_t)snprintf(big, sizeof big, "{\"Node\":" SELF("true", "") ",\"Peers\":[");
+    for (i = 0; i <= TS_MAX_PEERS; i++)
+        n += (size_t)snprintf(big + n, sizeof big - n, "%s{\"ID\":%d,\"Name\":\"n%d.example.test.\","
+                              "\"Addresses\":[\"100.64.%d.%d/32\"]}", i ? "," : "",
+                              100 + i, i, 1 + (i >> 8), i & 255);
+    snprintf(big + n, sizeof big - n, "]}");
+    begin(h_auto);
+    F.map_first = big;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("peer limit: FAILED", ts_sess_get_state(S) == TS_SESS_FAILED);
+    t_true("peer limit: says so", status_has("more than 256 peers") && has(ts_sess_problem(S), "256 peers"));
+    t_true("peer limit: disconnected", F.ndisconnect == 1);
+    fk_advance(&F, 600000, 5000);
+    t_true("peer limit: no reconnect in 10 min", F.nconnect == 1 && ts_sess_get_state(S) == TS_SESS_FAILED);
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("peer limit: up tries again", F.nconnect == 2 && maps() == 2);
+    end();
+}
+
+static void test_map_too_big(void)
+{
+    uint8_t h[4];
+    begin_running();
+    ts_put_le32(h, (uint32_t)TS_MAP_MSG_MAX + 1);
+    fk_data(&F, fk_last(&F, "/machine/map"), h, 4, 0);
+    fk_pump(&F);
+    t_true("map too big: FAILED", ts_sess_get_state(S) == TS_SESS_FAILED);
+    t_true("map too big: says so", status_has("over the 4194304-byte limit"));
+    fk_advance(&F, 600000, 5000);
+    t_true("map too big: no reconnect in 10 min", F.nconnect == 1 && ts_sess_get_state(S) == TS_SESS_FAILED);
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("map too big: up reconnects", F.nconnect == 2 && ts_sess_get_state(S) == TS_SESS_RUNNING);
     end();
 }
 
@@ -1518,6 +1609,25 @@ static void test_save_failure(void)
     end();
 }
 
+/* The login's save fails: keep running, say so until a save succeeds. */
+static void test_login_save_failure(void)
+{
+    begin(h_auto);
+    F.map_first = MAP_OK;
+    F.save_fail = 1;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("login save failure: RUNNING", ts_sess_get_state(S) == TS_SESS_RUNNING);
+    t_true("login save failure: in status", status_has("could not be saved") && status_has("tsppc up"));
+    t_true("login save failure: problem", has(ts_sess_problem(S), "logged in, but the node state could not be saved"));
+    F.save_fail = 0;
+    t_true("login save failure: logout saves", ts_sess_logout(S) == 0 && F.nsave >= 1);
+    t_true("login save failure: cleared by the save", !status_has("could not be saved") &&
+           !has(ts_sess_problem(S), "could not be saved"));
+    fk_pump(&F);
+    end();
+}
+
 static int parse_str(ts_reg_resp *r, const char *s)
 {
     return ts_reg_resp_parse(r, s, strlen(s));
@@ -1624,17 +1734,21 @@ void test_session(void)
     test_port_fallback();
     test_connect_timeout();
     test_handshake_error();
+    test_handshake_unverified();
     test_ping_request();
     test_debug_exit();
     test_tailnet_lock();
     test_tailnet_lock_register();
     test_rejected_message();
+    test_peer_limit();
+    test_map_too_big();
     test_self_expired();
     test_bad_auth_url();
     test_server_text_clean();
     test_sleep();
     test_window_update();
     test_save_failure();
+    test_login_save_failure();
     test_set_host();
     free(S);
 }

@@ -44,7 +44,9 @@
  * Caller contract:
  * - A rejected message means our view of the map may now differ from
  *   control's (a delta was lost), so the caller must end the map session and
- *   reconnect, which starts again with a full map (ts_netmap_reset first).
+ *   reconnect, which starts again with a full map (ts_netmap_reset first) --
+ *   unless last_limit is set: a full map would be rejected again, so the
+ *   caller stops instead of reconnecting.
  * - Read the per-message fields (have_exit, exit_code, sleep_ms) only after
  *   apply returned 0; after -1 they still describe the previous message.
  * - m->peers is swapped with an internal buffer by every successful apply, so
@@ -108,6 +110,8 @@ typedef struct {
     uint32_t sleep_ms;          /* Debug.SleepSeconds, clamped to TS_MAP_SLEEP_MAX_MS; 0 if absent,
                                  * non-positive or not finite */
     char last_error[128];
+    int last_limit;             /* the last rejection was the TS_MAX_PEERS limit, which
+                                 * control will hit again on a fresh map */
     ts_node *stage;             /* internal: second TS_MAX_PEERS buffer for all-or-nothing apply */
 } ts_netmap;
 

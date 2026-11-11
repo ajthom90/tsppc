@@ -22,9 +22,13 @@
  * streaming map.
  *
  * Connections go to port 80 first; a failure before the Noise handshake
- * completes there (refused, timed out, not upgraded) tries port 443 at once.
- * For 443 the I/O layer adds TLS and still hands the session plain bytes.
- * Any other failure ends the connection and waits in BACKOFF: 1 s doubling to
+ * completes there (refused, timed out, not upgraded, an error frame, or a
+ * response that does not verify) tries port 443 at once. Nothing on port 80
+ * is authenticated before the Noise response verifies, so an error frame's
+ * text is shown only when it came over 443. For 443 the I/O layer adds TLS
+ * and still hands the session plain bytes. Limits control would hit again
+ * on every reconnect (over TS_MAX_PEERS peers, a map message over
+ * TS_MAP_MSG_MAX) leave the session FAILED until ts_sess_up. Any other failure ends the connection and waits in BACKOFF: 1 s doubling to
  * 60 s, minus up to 25 percent jitter, reset after 60 s of RUNNING. Keys are
  * kept across reconnects.
  *
@@ -144,6 +148,7 @@ typedef struct {
     int logout_failed;                   /* the logout's first save failed (status) */
     int down_failed;                     /* the down's save failed (status) */
     int up_save_failed;                  /* up cleared down, the save failed (status) */
+    int login_save_failed;               /* the completed login is not saved (status) */
     int relogin;                         /* RELOGIN_*: waiting for ts_sess_up */
     int reg_authorized;                  /* MachineAuthorized, from the register or the map */
     char auth_url[TS_SESS_URL_MAX + 1];  /* "" when none */

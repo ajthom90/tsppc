@@ -1,15 +1,24 @@
 #!/bin/sh
-# Check that a release tsppcd has no test hooks: no test-only symbols, none
-# of the environment overrides, and no getenv at all (it reads no environment). With a second argument (a hooked tsppcd from
-# the same tree), also check that the hooked one has them, so the check cannot
-# pass because it looks in the wrong place.
-# Usage: tools/check-release.sh <release tsppcd> [<hooked tsppcd>]
+# Check that a release program has no test hooks: no test-only symbols, none
+# of the environment overrides (no TSPPC_ string at all), and no getenv (it
+# reads no environment). With a second argument (the hooked build of the same
+# program from the same tree), also check that the hooked one has them, so the
+# check cannot pass because it looks in the wrong place.
+# --cli checks the tsppc command line program (its only hook is TSPPC_SOCKET,
+# in the socket code it shares with the daemon) instead of tsppcd.
+# Usage: tools/check-release.sh [--cli] <release program> [<hooked program>]
 set -u
 
-REL=${1:?usage: $0 <release tsppcd> [<hooked tsppcd>]}
+if [ "${1:-}" = --cli ]; then
+    shift
+    SYMS="getenv"
+    STRS="TSPPC_SOCKET"
+else
+    SYMS="ts_noise_init_eph ts_resolve_test_delay getenv"
+    STRS="TSPPC_STATE_DIR TSPPC_SOCKET TSPPC_CONTROL TSPPC_CONTROL_KEY"
+fi
+REL=${1:?usage: $0 [--cli] <release program> [<hooked program>]}
 HOOKED=${2:-}
-SYMS="ts_noise_init_eph ts_resolve_test_delay getenv"
-STRS="TSPPC_STATE_DIR TSPPC_SOCKET TSPPC_CONTROL TSPPC_CONTROL_KEY"
 fail=0
 
 tmp=$(mktemp -t tsppcnm) || exit 1
@@ -49,6 +58,11 @@ check() {   # check <binary> <want: 0 absent, 1 present>
 }
 
 check "$REL" 0
+# Any other TSPPC_ name is an override this script does not know yet.
+if LC_ALL=C grep -a -q TSPPC_ "$REL"; then
+    echo "check-release: $REL: a TSPPC_ string is present" >&2
+    fail=1
+fi
 if [ -n "$HOOKED" ]; then check "$HOOKED" 1; fi
 if [ "$fail" != 0 ]; then exit 1; fi
 echo "check-release: $REL has no test hooks"

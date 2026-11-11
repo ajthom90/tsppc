@@ -9,7 +9,8 @@
 # PowerPC, with the ppc-test compiler and flags).
 # test, asan and ppc-test also build their own tsppcd and tsppc (with test
 # hooks, for the daemon tests) and the matching release programs, and check
-# with tools/check-release.sh that the release daemon has no test hooks.
+# with tools/check-release.sh that the release daemon and CLI have no test
+# hooks (and that the hooked ones do).
 # GNU make 3.81 and /bin/sh compatible.
 # New src/**/*.c files are picked up automatically; src/daemon/main.c and
 # src/cli/main.c are the programs' mains and stay out of the test binaries.
@@ -33,6 +34,7 @@ test asan ppc-test:
 	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all build/$@/tsppcd build/$@/tsppc $(if $(filter ppc-test,$@),build/ppc-test/tun_check build/ppc-test/keyfetch_check)
 	@$(MAKE) --no-print-directory TARGET=$(rel_$@) build/$(rel_$@)/tsppcd build/$(rel_$@)/tsppc
 	@sh tools/check-release.sh build/$(rel_$@)/tsppcd build/$@/tsppcd
+	@sh tools/check-release.sh --cli build/$(rel_$@)/tsppc build/$@/tsppc
 	@./build/$@/test_all
 
 ct-test:
@@ -42,6 +44,7 @@ ct-test:
 release ppc:
 	@$(MAKE) --no-print-directory TARGET=$@ build/$@/tsppcd build/$@/tsppc
 	@sh tools/check-release.sh build/$@/tsppcd
+	@sh tools/check-release.sh --cli build/$@/tsppc
 
 keyfetch-check:
 	@$(MAKE) --no-print-directory TARGET=test build/test/keyfetch_check
