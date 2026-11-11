@@ -9,6 +9,7 @@ Every decision is tagged with where it came from.
 - **[Owner]**: the project owner said this.
 - **[Agreed]**: proposed to the owner in writing and accepted without change.
 - **[Call]**: chosen by the design author. The owner has not weighed in. Treat these as defaults that can be challenged.
+- **[Open]**: not decided yet. The owner decides.
 
 Protocol facts are in Appendix A, each labelled as proven or only read from source.
 
@@ -32,7 +33,9 @@ Nothing like this exists. Tailscale's client is written in Go, and neither Go no
 
 ## Non-goals for the first version
 
-**[Agreed]**: Tailscale SSH (ordinary `sshd` over the tunnel is the point), exit nodes, Taildrop, Funnel, a menu bar app, and MagicDNS beyond the basics defined below.
+**[Agreed]**: Tailscale SSH (ordinary `sshd` over the tunnel is the point), Taildrop, Funnel, and MagicDNS beyond the basics defined below.
+
+Exit nodes (using one, not being one) and a menu bar app were in this list. The owner added them back on 2026-11-11 as milestones 12 and 13. **[Owner]** Acting as an exit node for other devices stays out of scope. **[Call]**
 
 **[Call]**, also out of scope:
 
@@ -109,13 +112,84 @@ Device approval arrives here. Upstream decides whether a node is waiting from th
 
 **Tunnel.** tuntaposx 20090913 (`/dev/tunN`, raw IP packets), patched as in Appendix A. **[Agreed, proposed as the expected approach]** Build one kext against the 10.4u SDK, and use it on both OS versions if testing allows. If it can't load on both, ship one per OS. Kexts on PowerPC are 32-bit, including on G5.
 
-**Interface and routes.** Assign the tailnet IP point-to-point, set MTU 1280, and route `100.64.0.0/10` into the tunnel. Remove the routes on exit. Don't touch the default route.
+**Interface and routes.** Assign the tailnet IP point-to-point, set MTU 1280, and route `100.64.0.0/10` into the tunnel. Remove the routes on exit. Don't touch the default route. With an exit node set, the routes change as described in "Using an exit node".
 
 **Names (what "MagicDNS basics" means).** Keep a clearly delimited block of peer names in `/etc/hosts`, rewritten atomically and removed on exit, and respect `NodeAttrDisableHostsFileUpdates`. There's no 100.100.100.100 resolver. Peers' short and full names resolve on the Mac, and nothing else is promised. **[Call]**
 
 **State and keys.** Machine, node and disco private keys live in one file under `/var/db/`, in a directory owned by root with mode 0700, and the file itself has mode 0600. Writes use a temp file, `fsync`, and rename. The System keychain was rejected as less predictable from a boot-time daemon on Tiger. **[Call]**
 
 **Install layout.** Binaries in `/usr/local/`, kext in `/Library/Extensions`, a LaunchDaemon plist that uses only keys Tiger understands, and an uninstall script. Packaging is covered in "Open source release". **[Call]**
+
+### Using an exit node
+
+**What it's for.** The owner sometimes needs all of the Mac's traffic to go out through one chosen tailnet machine. **[Owner]** The Mac only *uses* an exit node. It never offers itself as one. **[Call]**
+
+Everything below was played back to the owner and accepted, except where marked. **[Agreed]**
+
+- **Choosing.** The owner picks a peer that offers itself as an exit node, by name or tailnet IP, or picks none. The choice can be made from the CLI and from the menu bar app. It is saved in the state file and survives restarts and reboots.
+- **Traffic.** While an exit node is set, all IPv4 traffic leaves through it, apart from the daemon's own connections and, if the option below is on, the local network.
+- **DNS.** Lookups also go through the exit node, so they don't leak to the local network's resolver. The system's DNS settings are put back exactly when the exit node is turned off, the daemon stops, or it's uninstalled.
+- **Local network access.** An option, off by default, keeps the Mac's directly attached LAN subnets reachable outside the tunnel, for printers and file shares.
+- **Fail closed.** If the chosen exit node goes offline, is removed, or the tunnel is down, traffic stops instead of quietly going out directly. `status` and the menu bar say why. The owner can always turn the exit node off.
+
+The builder's notes below are all **[Call]**.
+
+- **Which peers are exit nodes.** Upstream treats a peer as an exit node when its `AllowedIPs` include `0.0.0.0/0`. So the network map must also parse `AllowedIPs`, which it doesn't yet. A peer with only `::/0` doesn't count, because IPv6 is out of scope. Whether the owner may use a given exit node is decided by the tailnet's access rules (`autogroup:internet`). If the rules forbid it, traffic just fails, so `status` should suggest checking the access rules once no traffic has come back for a while.
+- **Routes.**
+  - Leave the default route itself alone. Instead, route `0.0.0.0/1` and `128.0.0.0/1` into the tunnel, as upstream does on macOS.
+  - Pin host routes through the original gateway for everything the daemon itself must reach: control, the DERP servers in the current DERP map, direct-path peer endpoints, and the DNS server the daemon uses for its own lookups.
+  - Update these pins when the DERP map, the endpoints or the network change.
+  - The daemon must be able to look up and reach control at boot with an exit node already set.
+- **DNS.** Upstream sends DNS through the exit node's PeerAPI DNS-over-HTTPS endpoint (`/dns-query`), so do the same.
+  - PeerAPI is plain HTTP to the exit node's tailnet IP. The port comes from the `peerapi4` service in the peer's Hostinfo. An ordinary kernel TCP socket reaches it through the tunnel, so no userspace TCP is needed.
+  - The daemon runs a small DNS stub on `127.0.0.1:53`. It answers apps' UDP queries by forwarding each one as a DoH request. It has hard limits on query size, outstanding queries and per-query time.
+  - The system resolver points at the stub while an exit node is set. On 10.4 and 10.5 that is set through SystemConfiguration, not `/etc/resolv.conf`.
+  - Save the original resolver settings before the first change, in a form that survives a daemon crash, so they can be put back.
+  - The stub and the DoH client are new work inside milestone 13. They are network parsers, so the "Testing" rules apply: sanitizers and fuzzing.
+  - If the exit node has no `peerapi4`, DNS fails closed like everything else, and `status` says so.
+- **Local network access.** "Directly attached subnets" means those of the Mac's current interfaces. The routes follow network changes, through the same polling as the "Network change" row in the conditions table.
+- **The daemon's own lookups.**
+  - Control's hostname is resolved with the original system resolver, captured before any change and kept up to date across network changes. The last good address is also stored in the state file, so a boot with an exit node set can reach control even if resolving fails.
+  - DERP nodes are pinned by the IPv4 addresses in the DERP map, which already carries them. Their hostnames are used only for TLS names.
+- **Boot and crashes, in more detail.** Until `tsppcd` starts at boot, traffic goes out directly. Fail-closed starts when the daemon installs its routes, early in its start-up and before the tunnel is up. If the daemon crashes, its routes point at a tunnel interface that is gone, so traffic is blocked. launchd restarts the daemon, which clears the old routes and sets them up again. No separate cleanup job is needed.
+- **Packet filter.** Replies from the internet arrive from the exit-node peer with arbitrary source IPs. The `0.0.0.0/0` entry in that peer's `AllowedIPs` makes them valid for WireGuard. They're admitted only as replies to flows the Mac started, which is the outbound state the filter already needs. Unsolicited packets from the internet are denied.
+- **Crashes.** A daemon crash with an exit node set leaves traffic blocked, which is fail-closed and acceptable. It must not leave the Mac broken after the next start or an uninstall. On start, the daemon removes any routes and DNS changes from an earlier run before applying its own, and uninstall does the same. This extends the "Leaving a Mac broken" anti-goal.
+- **CLI.** `tsppc exit-node list` lists the exit-node peers and whether each is online. `tsppc set --exit-node=<name|IP|none>` and `tsppc set --exit-node-allow-lan-access=<true|false>` change the settings. `status` shows the current exit node and its state.
+
+### Menu bar app
+
+**What it's for.** It does day-to-day control without Terminal. **[Owner]**
+
+**What it does.** **[Agreed]**
+
+- An icon shows whether tsppc is connected, needs login, is waiting for approval, or has a problem.
+- Connect and disconnect, which are `up` and `down`.
+- A list of tailnet devices with name, IP and online status. Clicking a device copies its IP.
+- Settings, including the exit node and LAN access.
+- When login is needed, the menu shows the login link and can copy it, because the Mac's own browser can't load Tailscale's login page.
+
+**How it's built.** **[Agreed]** It's a small native Cocoa app (Objective-C, `NSStatusItem`) that runs on both 10.4 and 10.5. It talks to `tsppcd` over the same Unix socket as the CLI. It holds no keys, needs no root, and makes no network connections of its own.
+
+The builder's notes below are all **[Call]**.
+
+- **Toolchain.** Build it with the same gcc-4.0 and 10.4u SDK flags as the daemon. Milestone 11 adds Intel slices to it as well. It must run on a G3 without being noticeably slow.
+- **Who can use it.** The socket is limited to root and the `admin` group, so the app works for admin users only. For anyone else it shows a clear "needs an administrator account" message. Widening the socket's access is a separate decision for the owner.
+- **Talking to the daemon.**
+  - The app needs a machine-readable form of status, the peer list and the exit-node list, not the CLI's text. Add one to the IPC protocol with explicit limits.
+  - The app treats every string from the daemon as untrusted, just as the CLI does.
+  - It polls every few seconds while it runs, and more slowly when nothing changes. It must not keep a G3 busy.
+  - "Connect" sends `up` and returns at once. The app then reads the login link and state changes from status as it polls. The daemon already keeps the link after the CLI's `up` exits.
+- **Menu shape.**
+  - This device's name and IP at the top. Clicking copies the IP.
+  - A Connect or Disconnect toggle.
+  - A "Devices" submenu sorted online first, then by name.
+  - An "Exit Node" submenu with "None", the exit-node peers and a "Allow local network access" check item.
+  - When login is needed, "Log in…", which shows and copies the link.
+  - "Log out…", with a confirmation.
+  - "Quit".
+  - There's no separate preferences window in the first version.
+- **Starting at login.** The installer offers to add the app to the user's Login Items. Quitting the app leaves the daemon and the tunnel running.
+- **Identity.** It must use its own icon and name, never Tailscale's logo or app name. This is the "Passing off" anti-goal.
 
 ### How it reports itself **[Call]**
 
@@ -158,6 +232,18 @@ If the driver can't be made to work on Tiger, the project continues as a Leopard
 10. **Public release.** The checklist in "Open source release". *Passes when:* someone following only the published instructions can install the client on a clean Leopard VM and join a tailnet.
 
 11. **Intel Macs on 10.4–10.6.** **[Owner]** The same code ships as a universal binary: `ppc` and `i386` from the 10.4u SDK, plus `x86_64` for 10.6. The tunnel driver also gets Intel slices, i386 and x86_64 for 10.6's 64-bit kernel. The PowerPC constant-time multiply checks don't apply to Intel, where the multiply instruction is already constant-time. *Passes when:* milestones 4 and 5 pass on an Intel 10.6 VM, or on Intel hardware if the owner has some, and the universal binary still passes on the PowerPC VMs. Intel 10.7 through 11 can follow later, using the built-in `utun` interface instead of a kernel driver. Official Tailscale needs macOS 12 or later, so those Macs are left out too. **[Call]**
+
+12. **Menu bar app.** **[Owner]** This needs only the daemon and its IPC, so it can be built any time after milestone 7. *Passes when:* on both Leopard and Tiger, as an admin user, the app shows the right state through each step: not logged in, login needed (link shown and copied), waiting for approval, connected, and disconnected. The device list matches `tsppc status`. Clicking a device copies its IP. Connect, Disconnect and Log out work. The app uses little CPU while idle on the slowest VM. **[Call]**
+13. **Using an exit node.** **[Owner]** This needs the tunnel (milestone 4) and the install and cleanup work (milestone 7). The owner must have a tailnet machine offering itself as an exit node, approved in the admin console, and access rules that allow it. Arrange this with the owner. *Passes when:*
+    - with an exit node set, a check of the Mac's public IP shows the exit node's, and name lookups work with LAN access off;
+    - with LAN access on, a device on the Mac's LAN is reachable;
+    - turning the exit node off restores the original routes and DNS exactly;
+    - stopping the exit node blocks traffic and `status` says why;
+    - a daemon restart and a reboot keep the setting and connect again with no login;
+    - killing the daemon with `kill -9` and then starting it, or uninstalling, leaves no stray routes or DNS changes;
+    - all of the above works on Leopard and Tiger, and from the CLI and the menu bar app. **[Call]**
+
+**Order and first release.** It is not yet decided whether milestones 12 and 13 go into the first public release (milestone 10) or come after it. The owner decides. **[Open]**
 
 G3 and real G5 support are designed for but can't be verified by the owner. The release must say so, and ask for reports from people with those machines.
 
