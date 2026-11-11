@@ -678,7 +678,6 @@ static void test_logout_pending_restart(void)
     end();
 }
 
-/* Approval arrives through the map. */
 /* Down from RUNNING: saved first (still logged in), disconnected, IDLE, and
  * nothing reconnects. */
 static void test_sess_down_disconnects(void)
@@ -697,7 +696,7 @@ static void test_sess_down_disconnects(void)
     t_true("down: connection closed", F.ndisconnect == 1 && !F.up);
     t_true("down: IDLE and down", ts_sess_get_state(S) == TS_SESS_IDLE && ts_sess_is_down(S));
     t_true("down: no problem", strcmp(ts_sess_problem(S), "") == 0);
-    t_true("down: status says logged in", status_has("IDLE") && status_has("logged in"));
+    t_true("down: status says down", status_has("IDLE: logged in, disconnected (down)"));
     fk_advance(&F, 600000, 1000);
     t_true("down: no reconnect in 10 minutes", F.nconnect == 1 && F.nreq == reqs &&
            ts_sess_get_state(S) == TS_SESS_IDLE);
@@ -736,7 +735,7 @@ static void test_sess_up_after_down(void)
     F.st = saved;
     fk_start(&F, HOSTINFO);
     t_true("down restart: IDLE, down, logged in", ts_sess_get_state(S) == TS_SESS_IDLE && ts_sess_is_down(S) &&
-           status_has("logged in"));
+           status_has("logged in, disconnected (down)"));
     fk_advance(&F, 600000, 1000);
     t_true("down restart: nothing connects", F.nconnect == 0);
     key_hex(nk, saved.node_priv);
@@ -772,6 +771,49 @@ static void test_sess_down_save_fails(void)
     fk_pump(&F);
     t_true("down save fails: a later down works", ts_sess_get_state(S) == TS_SESS_IDLE && ts_sess_is_down(S) &&
            strcmp(ts_sess_problem(S), "") == 0);
+    end();
+}
+
+/* Up after down, but the save of down=0 fails: it connects anyway and says a
+ * restart would stay disconnected, until a save succeeds. */
+static void test_sess_up_save_fails(void)
+{
+    char st[512];
+    int saves;
+    begin_running();
+    ts_sess_down(S);
+    fk_pump(&F);
+    F.save_fail = 1;
+    ts_sess_up(S);
+    fk_pump(&F);
+    F.save_fail = 0;
+    t_true("up save fails: connects anyway", ts_sess_get_state(S) == TS_SESS_RUNNING && !ts_sess_is_down(S) &&
+           F.saved.down == 1);
+    t_true("up save fails: problem says so", strstr(ts_sess_problem(S), "could not be saved") != NULL &&
+           strstr(ts_sess_problem(S), "restart will stay disconnected") != NULL);
+    ts_sess_status(S, st, sizeof st);
+    t_true("up save fails: status says so", strstr(st, "RUNNING: connected") != NULL &&
+           strstr(st, "restart will stay disconnected") != NULL);
+    saves = F.nsave;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("up save fails: the next up saves it", F.nsave == saves + 1 && F.saved.down == 0 &&
+           F.saved.have_login == 1 && strcmp(ts_sess_problem(S), "") == 0 && !status_has("could not be saved"));
+    end();
+
+    /* Any later successful save also writes down=0 and clears it. */
+    begin_running();
+    ts_sess_down(S);
+    fk_pump(&F);
+    F.save_fail = 1;
+    ts_sess_up(S);
+    fk_pump(&F);
+    F.save_fail = 0;
+    t_true("up save fails, then down: problem set first", strstr(ts_sess_problem(S), "restart") != NULL);
+    ts_sess_down(S);
+    fk_pump(&F);
+    t_true("up save fails, then down: saved, problem cleared", F.saved.down == 1 &&
+           strcmp(ts_sess_problem(S), "") == 0 && ts_sess_get_state(S) == TS_SESS_IDLE);
     end();
 }
 
@@ -834,8 +876,37 @@ static void test_sess_down_edges(void)
     t_true("down in logout: ignored", F.nsave == saves && F.up && fk_open(&F, "/machine/register") == 1 &&
            !ts_sess_is_down(S));
     end();
+
+    /* From FAILED (Tailnet Lock): the failure is dropped, IDLE, down saved. */
+    begin_running();
+    fk_map_msg(&F, fk_last(&F, "/machine/map"), "{\"TKAInfo\":{\"Head\":\"h\"}}");
+    fk_pump(&F);
+    t_true("down from FAILED: FAILED first", ts_sess_get_state(S) == TS_SESS_FAILED);
+    ts_sess_down(S);
+    fk_pump(&F);
+    t_true("down from FAILED: IDLE, down saved, reason dropped", ts_sess_get_state(S) == TS_SESS_IDLE &&
+           ts_sess_is_down(S) && F.saved.down == 1 && F.saved.have_login == 1 &&
+           strcmp(ts_sess_problem(S), "") == 0 && !status_has("Tailnet Lock"));
+    fk_advance(&F, 600000, 1000);
+    t_true("down from FAILED: no reconnect", F.nconnect == 1);
+    end();
+
+    /* From NEED_LOGIN after the node expired: still logged in, so down is saved. */
+    begin_running();
+    F.handler = h_std;
+    fk_map_msg(&F, fk_last(&F, "/machine/map"), "{\"Node\":" SELF("true", ",\"Expired\":true") "}");
+    fk_pump(&F);
+    t_true("down from expired: NEED_LOGIN first", ts_sess_get_state(S) == TS_SESS_NEED_LOGIN);
+    saves = F.nsave;
+    ts_sess_down(S);
+    fk_pump(&F);
+    t_true("down from expired: down saved with the login", F.nsave == saves + 1 && F.saved.down == 1 &&
+           F.saved.have_login == 1 && memcmp(F.saved.node_priv, F.st.node_priv, 32) == 0);
+    t_true("down from expired: IDLE, closed", ts_sess_get_state(S) == TS_SESS_IDLE && !F.up);
+    end();
 }
 
+/* Approval arrives through the map. */
 static void h_unauth(fake *f, fk_req *r)
 {
     if (strcmp(r->path, "/machine/register") == 0) fk_reply(f, r, 200, "{\"MachineAuthorized\":false}");
@@ -1538,6 +1609,7 @@ void test_session(void)
     test_sess_down_disconnects();
     test_sess_up_after_down();
     test_sess_down_save_fails();
+    test_sess_up_save_fails();
     test_sess_logout_clears_down();
     test_sess_down_edges();
     test_followup_expired_loop();

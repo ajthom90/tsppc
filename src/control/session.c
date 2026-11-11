@@ -39,9 +39,11 @@ enum {
     "marked as logged out"
 #define LOGOUT_SAVE_TEXT "logout failed: the node state could not be saved"
 #define DOWN_SAVE_TEXT "disconnect failed: the node state could not be saved"
+#define UP_SAVE_TEXT "the node state could not be saved; a restart will stay disconnected until up"
 
 static void settle(ts_sess *s);
 static int forget_login(ts_sess *s);
+static int save_st(ts_sess *s);
 
 /* ---- Small helpers --------------------------------------------------- */
 
@@ -94,6 +96,15 @@ static void resp_open(ts_sess_resp *r, uint32_t sid)
     memset(r, 0, sizeof *r);
     r->sid = sid;
     r->retry_after_ms = -1;
+}
+
+/* Save s->st. Any successful save writes down as it is in memory, so the file
+ * no longer holds a down that up cleared. */
+static int save_st(ts_sess *s)
+{
+    if (s->io->save_state(s->user, &s->st) != 0) return -1;
+    s->up_save_failed = 0;
+    return 0;
 }
 
 /* ---- JSON output ------------------------------------------------------ */
@@ -264,7 +275,7 @@ static void send_register(ts_sess *s, int kind)
         s->st.down = 0;
         memcpy(s->st.node_priv, k, 32);
         ts_wipe(k, sizeof k);
-        if (s->io->save_state(s->user, &s->st) != 0) {
+        if (save_st(s) != 0) {
             s->st = prev;
             fail(s, FAIL_RETRY_HERE, "could not save the node state");
             ts_wipe(&prev, sizeof prev);
@@ -467,7 +478,7 @@ static void login_done(ts_sess *s, int authorized)
     if (!s->st.have_login) {
         s->st.have_login = 1;
         /* Not fatal: control has the login; a restart registers again. */
-        (void)s->io->save_state(s->user, &s->st);
+        (void)save_st(s);
     }
     s->map_at = s->now;
 }
@@ -491,7 +502,7 @@ static int forget_login(ts_sess *s)
     s->st.have_old_node = 0;
     s->st.have_login = 0;
     s->st.down = 0;
-    s->save_failed = s->io->save_state(s->user, &s->st) != 0;
+    s->save_failed = save_st(s) != 0;
     s->logged_in = 0;
     s->refresh = 0;
     s->auth_url[0] = 0;
@@ -1057,11 +1068,12 @@ void ts_sess_up(ts_sess *s)
     s->logout_failed = 0;
     s->down_failed = 0;
     s->have_exit = 0;
-    if (s->st.down) {
+    if (s->st.down || s->up_save_failed) {
         /* Cleared in memory whatever the save does, so it never outlives the
-         * login. Not fatal: a restart would only wait for up again. */
+         * login. Not fatal: connect anyway, and say a restart would wait for
+         * up again until some save succeeds. */
         s->st.down = 0;
-        (void)s->io->save_state(s->user, &s->st);
+        s->up_save_failed = save_st(s) != 0;
     }
     if (s->relogin != RELOGIN_NONE) {
         /* Expired or removed: log in again with a new node key (as upstream). */
@@ -1115,7 +1127,10 @@ int ts_sess_logout(ts_sess *s)
         n.down = 0;
         n.logout_pending = 1;
         rc = s->io->save_state(s->user, &n);
-        if (rc == 0) s->st = n;
+        if (rc == 0) {
+            s->st = n;
+            s->up_save_failed = 0;
+        }
         ts_wipe(&n, sizeof n);
         if (rc != 0) {
             s->logout_failed = 1;
@@ -1154,7 +1169,10 @@ void ts_sess_down(ts_sess *s)
         int rc;
         n.down = 1;
         rc = s->io->save_state(s->user, &n);
-        if (rc == 0) s->st = n;
+        if (rc == 0) {
+            s->st = n;
+            s->up_save_failed = 0;
+        }
         ts_wipe(&n, sizeof n);
         if (rc != 0) {
             s->down_failed = 1;
@@ -1234,7 +1252,8 @@ void ts_sess_status(const ts_sess *s, char *out, size_t cap)
     detail[0] = 0;
     switch (s->state) {
     case TS_SESS_IDLE:
-        snprintf(detail, sizeof detail, "%s", s->logged_in ? "logged in, not connected"
+        snprintf(detail, sizeof detail, "%s", ts_sess_is_down(s) ? "logged in, disconnected (down)"
+                 : s->logged_in ? "logged in, not connected"
                  : s->save_failed ? "logged out, but the node state could not be saved"
                  : s->logout_unconfirmed ? "logged out here; control was not reached, so the old key stays "
                                            "registered there until it expires"
@@ -1270,6 +1289,10 @@ void ts_sess_status(const ts_sess *s, char *out, size_t cap)
         len = strlen(out);
         snprintf(out + len, cap - len, "; %s", s->logout_failed ? LOGOUT_SAVE_TEXT : DOWN_SAVE_TEXT);
     }
+    if (s->up_save_failed) {
+        len = strlen(out);
+        snprintf(out + len, cap - len, "; %s", UP_SAVE_TEXT);
+    }
     len = strlen(out);
     snprintf(out + len, cap - len, "; %u peers", s->nm_ok ? (unsigned)s->nm.npeers : 0u);
     if (s->nm_ok && s->nm.have_self && s->nm.self.key_expiry != 0) {
@@ -1289,6 +1312,7 @@ const char *ts_sess_problem(const ts_sess *s)
 {
     if (s->logout_failed) return LOGOUT_SAVE_TEXT;
     if (s->down_failed) return DOWN_SAVE_TEXT;
+    if (s->up_save_failed) return UP_SAVE_TEXT;
     switch (s->state) {
     case TS_SESS_BACKOFF:
     case TS_SESS_FAILED:

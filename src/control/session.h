@@ -143,6 +143,7 @@ typedef struct {
     int logout_unconfirmed;              /* logged out here without control's answer (status) */
     int logout_failed;                   /* the logout's first save failed (status) */
     int down_failed;                     /* the down's save failed (status) */
+    int up_save_failed;                  /* up cleared down, the save failed (status) */
     int relogin;                         /* RELOGIN_*: waiting for ts_sess_up */
     int reg_authorized;                  /* MachineAuthorized, from the register or the map */
     char auth_url[TS_SESS_URL_MAX + 1];  /* "" when none */
@@ -229,8 +230,9 @@ void ts_sess_tick(ts_sess *s, uint64_t now_ms);
 
 /* Log in and stay connected (also leaves FAILED and NEED_LOGIN; after a node
  * expiry or removal the next register uses a new node key). A saved down is
- * cleared and saved first; if that save fails the session connects anyway
- * (a restart then stays down until the next up). */
+ * cleared and saved first; if that save fails the session connects anyway,
+ * and status and ts_sess_problem say a restart will stay disconnected, until
+ * a later save succeeds (the next up retries it). */
 void ts_sess_up(ts_sess *s);
 /* Disconnect and stay disconnected, logged in, across restarts: first save
  * down (with have_login), and only then close the connection, stop every
