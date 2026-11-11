@@ -4,8 +4,10 @@
 # leopard: copy the tree, build with make ppc-test CC=gcc-4.0 (which also builds
 #          tsppcd and tsppc, hooked and release, checks with
 #          tools/check-release.sh that the release tsppcd has no test hooks,
-#          and runs the binary, daemon tests included), then check the built
-#          objects with tools/check-ct.sh.
+#          and runs the binary, daemon tests included), check the built
+#          objects with tools/check-ct.sh, build the menu bar app with
+#          make menubar and check it with tools/check-app.sh (after checking
+#          that check-app.sh rejects /bin/ls).
 # leopard-root: run the Leopard-built binary under sudo (after a leopard run).
 # tiger:   fetch the Leopard-built binary via the host, copy to Tiger, run it
 #          (without tsppcd and tsppc beside it, the daemon tests print SKIP).
@@ -52,13 +54,16 @@ leopard)
     # Remove the old sources first so files deleted on the host are not built.
     # build/ is kept. The id file records what this tree was.
     ID="$(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null || echo nogit)"
-    if [ -n "$(cd "$ROOT" && git status --porcelain --untracked-files=no -- src tests tools vendor Makefile 2>/dev/null)" ]; then
+    if [ -n "$(cd "$ROOT" && git status --porcelain --untracked-files=no -- src tests tools vendor macos Makefile 2>/dev/null)" ]; then
         ID="$ID+modified"
     fi
     ID="$ID archive-cksum $(cksum <"$arc" | cut -d' ' -f1,2 | tr ' ' :)"
-    vmssh leopard 'mkdir -p "$HOME/tsppc" && cd "$HOME/tsppc" && rm -rf src tests tools vendor Makefile && tar -xf -' <"$arc" || exit 1
+    vmssh leopard 'mkdir -p "$HOME/tsppc" && cd "$HOME/tsppc" && rm -rf src tests tools vendor macos Makefile && tar -xf -' <"$arc" || exit 1
     vmssh leopard 'mkdir -p "$HOME/tsppc/build/ppc-test" && echo '"'$ID'"' >"$HOME/tsppc/build/ppc-test/SOURCE_ID"' || exit 1
-    vmssh leopard 'cd "$HOME/tsppc" && make ppc-test CC=gcc-4.0 && sh tools/check-ct.sh'
+    vmssh leopard 'cd "$HOME/tsppc" && make ppc-test CC=gcc-4.0 && sh tools/check-ct.sh' || exit 1
+    vmssh leopard 'cd "$HOME/tsppc" &&
+        if sh tools/check-app.sh /bin/ls >/dev/null 2>&1; then echo "vm-test.sh: check-app.sh passed /bin/ls" >&2; exit 1; fi &&
+        make menubar CC=gcc-4.0 && sh tools/check-app.sh build/ppc/tsppc.app'
     exit $?
     ;;
 tiger)

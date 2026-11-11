@@ -6,7 +6,10 @@
 # tun_check driver check tool, which tools/driver.sh runs, and the
 # keyfetch_check live TLS check), keyfetch-check (host build of keyfetch_check),
 # release (host tsppcd and tsppc without test hooks), ppc (the same for
-# PowerPC, with the ppc-test compiler and flags).
+# PowerPC, with the ppc-test compiler and flags), menubar (the PowerPC menu bar
+# app, build/ppc/tsppc.app, from macos/menubar and the release socket, reply
+# and menu model objects; needs gcc-4.0 and the 10.4u SDK, so it builds on the
+# PowerPC VM, not on the host; check it there with tools/check-app.sh).
 # test, asan and ppc-test also build their own tsppcd and tsppc (with test
 # hooks, for the daemon tests) and the matching release programs, and check
 # with tools/check-release.sh that the release daemon and CLI have no test
@@ -25,7 +28,7 @@ ALLTESTS := $(wildcard tests/*.c)
 BSRCS   := $(shell find $(BEARSSL)/src -name '*.c' | sort)
 
 ifeq ($(TARGET),)
-.PHONY: test asan ct-test ppc-test fuzz keyfetch-check release ppc clean
+.PHONY: test asan ct-test ppc-test fuzz keyfetch-check release ppc menubar clean
 # The release build that goes with each test target.
 rel_test := release
 rel_asan := release
@@ -45,6 +48,11 @@ release ppc:
 	@$(MAKE) --no-print-directory TARGET=$@ build/$@/tsppcd build/$@/tsppc
 	@sh tools/check-release.sh build/$@/tsppcd
 	@sh tools/check-release.sh --cli build/$@/tsppc
+
+menubar:
+	@if ! command -v gcc-4.0 >/dev/null 2>&1 || [ ! -d /Developer/SDKs/MacOSX10.4u.sdk ]; then \
+	  echo "make menubar: needs gcc-4.0 and /Developer/SDKs/MacOSX10.4u.sdk (Xcode 2.5 or 3.1); build it on a PowerPC Mac or the VM" >&2; exit 1; fi
+	@$(MAKE) --no-print-directory TARGET=ppc app
 
 keyfetch-check:
 	@$(MAKE) --no-print-directory TARGET=test build/test/keyfetch_check
@@ -109,6 +117,9 @@ endif
 
 OPT    := -O1 -g
 CFLAGS := $(ARCH) $(CTMUL) $(FZDEF) $(HOOKS) -DTS_BIN_DIR=\"build/$(TARGET)\" $(OPT) $(SAN) -Wall -Wextra -Werror -MMD -MP -I. -I$(BEARSSL)/inc
+# String literals as NSConstantString (Foundation), not CFString: otherwise the
+# app also links CoreServices and CoreFoundation for one class reference.
+OBJCFLAGS := -fno-constant-cfstrings
 VFLAGS := $(ARCH) $(CTMUL) $(VSAN) -O2 -w -I$(BEARSSL)/inc -I$(BEARSSL)/src
 
 OBJDIR  := build/$(TARGET)
@@ -135,7 +146,7 @@ update_stamp = mkdir -p $(dir $@); printf '%s\n' '$(1)' >$@.new; \
 	if cmp -s $@.new $@; then rm -f $@.new; else sleep 1; mv $@.new $@; touch $@; fi
 
 $(FLAGSTAMP): FORCE
-	@$(call update_stamp,$(CC) $(CFLAGS))
+	@$(call update_stamp,$(CC) $(CFLAGS) objc $(OBJCFLAGS))
 
 $(VFLAGSTAMP): FORCE
 	@$(call update_stamp,$(CC) $(VFLAGS) headers $(VHEADERSUM))
@@ -180,6 +191,35 @@ $(OBJDIR)/tsppc: $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/daemon/ipc.o $(OBJDIR)/s
 $(OBJDIR)/keyfetch_check: $(KFOBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(KFOBJS) $(VOBJS)
 
+# The menu bar app (TARGET=ppc only): its Objective-C files and the release
+# objects of the socket, reply and menu model code, so the socket path is the
+# fixed one.
+APPDIR  := $(OBJDIR)/tsppc.app
+MSRCS   := $(wildcard macos/menubar/*.m)
+MOBJS   := $(patsubst %.m,$(OBJDIR)/%.o,$(MSRCS))
+APPOBJS := $(MOBJS) $(OBJDIR)/src/daemon/ipc.o $(OBJDIR)/src/daemon/ipc_reply.o $(OBJDIR)/src/menubar/model.o
+
+.PHONY: app
+app: $(APPDIR)/Contents/MacOS/tsppc $(APPDIR)/Contents/Info.plist $(APPDIR)/Contents/PkgInfo
+
+# -dead_strip drops the daemon-side socket code in ipc.o (ts_ipc_listen and
+# its bind and listen), which the app never calls.
+$(APPDIR)/Contents/MacOS/tsppc: $(APPOBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(ARCH) -Wl,-dead_strip -framework Cocoa -o $@ $(APPOBJS)
+
+$(APPDIR)/Contents/Info.plist: macos/menubar/Info.plist
+	@mkdir -p $(dir $@)
+	cp macos/menubar/Info.plist $@
+
+$(APPDIR)/Contents/PkgInfo:
+	@mkdir -p $(dir $@)
+	printf 'APPL????' >$@
+
+$(OBJDIR)/%.o: %.m $(FLAGSTAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(OBJCFLAGS) -c -o $@ $<
+
 $(OBJDIR)/%.o: %.c $(FLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -188,5 +228,5 @@ $(VOBJDIR)/%.o: %.c $(VFLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(VFLAGS) -c -o $@ $<
 
--include $(OBJS:.o=.d) $(CHECKOBJS:.o=.d) $(OBJDIR)/tools/keyfetch_check.d $(patsubst %.c,$(OBJDIR)/%.d,$(MAINS))
+-include $(OBJS:.o=.d) $(MOBJS:.o=.d) $(CHECKOBJS:.o=.d) $(OBJDIR)/tools/keyfetch_check.d $(patsubst %.c,$(OBJDIR)/%.d,$(MAINS))
 endif
