@@ -34,8 +34,8 @@ typedef struct {
 /* Parse a whole reply (bytes up to the daemon's close). Unknown keys and
  * malformed lines are skipped; values are cleaned with ts_ipc_clean. For a key
  * that occurs more than once, the first occurrence wins (peer lines add). A
- * peer line needs a valid a.b.c.d or "-", "online" or "offline", and a
- * non-empty name, or it is skipped. Returns 0, or -1 if the reply holds no
+ * peer line needs a valid a.b.c.d or "-", "online" or "offline", and a space
+ * after the status (the name after it may be empty), or it is skipped. Returns 0, or -1 if the reply holds no
  * "ok" and no "error" line. */
 int ts_reply_parse(ts_reply *r, ts_reply_peer *peers, const char *buf, size_t len);
 
@@ -49,7 +49,9 @@ typedef enum { TS_REQ_OK = 0, TS_REQ_NO_DAEMON, TS_REQ_DENIED, TS_REQ_TIMEOUT, T
  * the result is still TS_REQ_OK (a daemon reply never exceeds
  * TS_IPC_RESP_MAX, so a cap of that size never cuts one). The buffer is not
  * NUL-terminated. On NO_DAEMON, DENIED and a failed connect, errno holds the
- * connect error. */
+ * connect error. A listener whose backlog is full reads as NO_DAEMON (Darwin
+ * refuses the connection). Not thread-safe (the clock's timebase is set up on
+ * first use): call it from one thread, such as the app's main thread. */
 ts_req_result ts_ipc_request(const char *path, ts_ipc_cmd cmd, int timeout_ms, char *buf, size_t cap, size_t *len);
 
 #endif

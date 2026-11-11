@@ -67,7 +67,6 @@ static void add_peer(ts_reply *r, const char *v, size_t n)
     if (stlen == 6 && memcmp(sp1 + 1, "online", 6) == 0) online = 1;
     else if (stlen == 7 && memcmp(sp1 + 1, "offline", 7) == 0) online = 0;
     else return;
-    if (sp2 + 1 >= v + n) return;                   /* no name */
     memset(&p, 0, sizeof p);
     if (iplen == 1 && v[0] == '-') p.have_ipv4 = 0;
     else if (parse_ipv4(v, iplen, &p.ipv4) == 0) p.have_ipv4 = 1;
@@ -218,16 +217,6 @@ ts_req_result ts_ipc_request(const char *path, ts_ipc_cmd cmd, int timeout_ms, c
     for (;;) {
         if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) break;
         if (errno == EINTR) continue;
-        if (errno == EINPROGRESS || errno == EAGAIN) {
-            /* A full backlog; wait a little and try again until the deadline. */
-            struct timeval tv = { 0, 10000 };
-            if (mono_ms() >= deadline) {
-                close(fd);
-                return TS_REQ_TIMEOUT;
-            }
-            (void)select(0, NULL, NULL, NULL, &tv);
-            continue;
-        }
         e = errno;
         close(fd);
         errno = e;

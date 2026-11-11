@@ -82,7 +82,8 @@ static void test_parse(void)
     rc = parse("ok\npeer 100.64.0.1 online\npeer 100.64.0.2 online \npeer 100.64.0.3\npeer\npeer 1.2.3 online x\n"
                "peer 256.0.0.1 online x\npeer 1.2.3.4.5 online x\npeer 01.2.3.4 online x\npeer 1..2.3 online x\n"
                "peer 1.2.3.4 maybe x\npeer 100.64.0.9 online good\n");
-    t_true("reply: bad peer lines skipped", rc == 0 && g_r.npeers == 1 && strcmp(g_peers[0].name, "good") == 0);
+    t_true("reply: bad peer lines skipped, an empty name kept", rc == 0 && g_r.npeers == 2 && g_peers[0].name[0] == 0 &&
+           g_peers[0].ipv4 == 0x64400002u && strcmp(g_peers[1].name, "good") == 0);
 
     rc = parse("ok\nip 1.2.3\nip 300.1.1.1\n");
     t_true("reply: bad own address ignored", rc == 0 && !g_r.have_ipv4);
@@ -177,7 +178,8 @@ static void stop(pid_t pid, int lfd)
 
 static void test_request(void)
 {
-    char path[128], buf[TS_IPC_RESP_MAX], *small;
+    static char buf[TS_IPC_RESP_MAX];
+    char path[128], *small;
     size_t len = 99;
     ts_req_result rc;
     int lfd;

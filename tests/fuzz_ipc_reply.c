@@ -1,6 +1,7 @@
 #include "fuzz.h"
 #include "../src/daemon/ipc_reply.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -36,10 +37,13 @@ static void target(const uint8_t *data, size_t len)
     TS_FUZZ_ASSERT(printable(g_r.problem, sizeof g_r.problem) && printable(g_r.login, sizeof g_r.login));
     TS_FUZZ_ASSERT(printable(g_r.wanted, sizeof g_r.wanted) && printable(g_r.self, sizeof g_r.self));
     for (i = 0; i < g_r.npeers; i++) {
-        TS_FUZZ_ASSERT(printable(g_peers[i].name, sizeof g_peers[i].name) && g_peers[i].name[0]);
+        TS_FUZZ_ASSERT(printable(g_peers[i].name, sizeof g_peers[i].name));
         TS_FUZZ_ASSERT(g_peers[i].have_ipv4 || g_peers[i].ipv4 == 0);
     }
 }
+
+/* Over 256 peers and a value longer than its field, for the cut paths. */
+static char g_big[8192];   /* the harness inputs are at most 8192 bytes */
 
 void ts_fuzz_ipc_reply(void)
 {
@@ -50,11 +54,22 @@ void ts_fuzz_ipc_reply(void)
         "error request too long\n",
         "ok\nexitnode x\nPeer 1.2.3.4 online x\npeer 1.2.3 online x\npeer 256.0.0.1 offline \x1b[2Jq\npeer\n",
     };
-    const uint8_t *seeds[4];
-    size_t lens[4], i;
+    const uint8_t *seeds[5];
+    size_t lens[5], i, n;
     for (i = 0; i < 4; i++) {
         seeds[i] = (const uint8_t *)s[i];
         lens[i] = strlen(s[i]);
     }
-    ts_fuzz_run("ipc_reply", target, seeds, lens, 4, TS_FUZZ_DEFAULT_ITERS);
+    n = (size_t)snprintf(g_big, sizeof g_big, "ok\nstate RUNNING\nstatus ");
+    memset(g_big + n, 's', 40);
+    n += 40;
+    n += (size_t)snprintf(g_big + n, sizeof g_big - n, "\nlogin yes\nproblem ");
+    memset(g_big + n, 'p', 2100);
+    n += 2100;
+    n += (size_t)snprintf(g_big + n, sizeof g_big - n, "\n");
+    for (i = 0; i < TS_MAX_PEERS + 1; i++)
+        n += (size_t)snprintf(g_big + n, sizeof g_big - n, "peer %s online n\n", i & 1 ? "-" : "9.9.9.9");
+    seeds[4] = (const uint8_t *)g_big;
+    lens[4] = n;
+    ts_fuzz_run("ipc_reply", target, seeds, lens, 5, TS_FUZZ_DEFAULT_ITERS);
 }

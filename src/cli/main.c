@@ -59,7 +59,10 @@ static int request(ts_ipc_cmd cmd)
     const char *path = ts_ipc_socket_path();
     size_t len = 0;
     char safe[256];
-    ts_req_result rc = ts_ipc_request(path, cmd, REPLY_TIMEOUT_MS, rbuf, TS_IPC_RESP_MAX, &len);
+    ts_req_result rc;
+
+    errno = 0;
+    rc = ts_ipc_request(path, cmd, REPLY_TIMEOUT_MS, rbuf, TS_IPC_RESP_MAX, &len);
 
     switch (rc) {
     case TS_REQ_OK:
