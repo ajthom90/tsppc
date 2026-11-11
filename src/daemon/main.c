@@ -545,6 +545,37 @@ static const char *login_word(void)
     return st->have_login ? "yes" : st->logout_pending ? "leaving" : "no";
 }
 
+/* Down before the session exists (no control key yet): save it, as
+ * ts_sess_down does first. Returns 0, or -1 if the save failed (nothing
+ * changed). With no login, or a logout pending, there is nothing to save. */
+static int down_before_session(void)
+{
+    ts_state n;
+    char err[256];
+    int rc;
+    if (!D.st.have_login || D.st.down || D.st.logout_pending) return 0;
+    n = D.st;
+    n.down = 1;
+    rc = ts_state_save(&n, D.state_dir, err, sizeof err);
+    if (rc == 0) D.st = n;
+    else logline("cannot save the node state: %s", err);
+    ts_wipe(&n, sizeof n);
+    return rc;
+}
+
+/* Down, with the session if there is one. Returns 0, or -1 if the first
+ * save failed (nothing changed). */
+static int do_down(void)
+{
+    const ts_state *st;
+    int needs_save;
+    if (!D.sess) return down_before_session();
+    st = ts_sess_node_state(D.sess);
+    needs_save = st->have_login && !st->down && !st->logout_pending;
+    ts_sess_down(D.sess);
+    return needs_save && !ts_sess_is_down(D.sess) ? -1 : 0;
+}
+
 /* ---- Replies ---------------------------------------------------------- */
 
 typedef struct {
@@ -589,11 +620,13 @@ static void build_status(rbuild *b)
     put(b, "state", v.name);
     put(b, "status", v.status);
     put(b, "login", login_word());
+    put(b, "wanted", D.want_up ? "up" : "down");
     if (D.sess && (url = ts_sess_login_url(D.sess)) != NULL) put(b, "url", url);
     if (v.problem[0]) put(b, "problem", v.problem);
     if (D.sess) {
         const ts_netmap *nm = ts_sess_netmap(D.sess);
         size_t i;
+        if (nm->have_self && nm->self.name[0]) put(b, "self", nm->self.name);
         if (nm->have_self && nm->self.have_ipv4) {
             fmt_ip(ip, sizeof ip, nm->self.ipv4);
             put(b, "ip", ip);
@@ -633,6 +666,15 @@ static void do_request(client *c, ts_ipc_cmd cmd)
         if ((D.sess ? ts_sess_logout(D.sess) : logout_before_session()) != 0) {
             logline("logout failed: the node state could not be saved");
             client_error(c, "logout failed: the node state could not be saved; nothing was changed");
+            return;
+        }
+        D.want_up = 0;
+        break;
+    case TS_IPC_DOWN:
+        logline("down requested");
+        if (do_down() != 0) {
+            logline("down failed: the node state could not be saved");
+            client_error(c, "down failed: the node state could not be saved; nothing was changed");
             return;
         }
         D.want_up = 0;

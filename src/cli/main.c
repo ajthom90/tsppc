@@ -3,6 +3,7 @@
  *   tsppc up       log in and connect; prints the login URL when one is needed
  *   tsppc status   state, tailnet IP, any problem, and the peers
  *   tsppc ip       the tailnet IPv4 address
+ *   tsppc down     disconnect, stay logged in (tsppc up connects again)
  *   tsppc logout   expire this node's key at control and forget the login
  *
  * Exit status: 0 done, 1 failed or tsppcd not reachable, 2 usage.
@@ -42,7 +43,7 @@ static long mono_s(void)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: tsppc <up|status|ip|logout>\n");
+    fprintf(stderr, "usage: tsppc <up|down|status|ip|logout>\n");
 }
 
 static void sleep_ms(int ms)
@@ -156,10 +157,15 @@ static int cmd_status(void)
     reply r;
     size_t pos = 0;
     char key[32], val[TS_IPC_VALUE_MAX];
-    int peers = 0;
+    int peers = 0, down = 0;
     if (request(TS_IPC_STATUS, &r) != 0 || check_ok(&r) != 0) return 1;
+    field(&r, "wanted", val, sizeof val);
+    if (strcmp(val, "down") == 0) {
+        field(&r, "login", val, sizeof val);
+        down = strcmp(val, "yes") == 0;
+    }
     while (next_line(&r, &pos, key, sizeof key, val, sizeof val)) {
-        if (strcmp(key, "status") == 0) printf("%s\n", val);
+        if (strcmp(key, "status") == 0) printf("%s\n", down ? "Disconnected (tsppc up to connect)" : val);
         else if (strcmp(key, "ip") == 0) printf("Tailnet IP: %s\n", val);
         else if (strcmp(key, "problem") == 0) printf("Problem: %s\n", val);
         else if (strcmp(key, "url") == 0) printf("Log in at: %s\n", val);
@@ -237,6 +243,15 @@ static int cmd_up(void)
     }
 }
 
+static int cmd_down(void)
+{
+    reply r;
+    /* A failed first save comes back as an error: nothing was changed. */
+    if (request(TS_IPC_DOWN, &r) != 0 || check_ok(&r) != 0) return 1;
+    printf("Disconnected. Run tsppc up to connect again.\n");
+    return 0;
+}
+
 static int cmd_logout(void)
 {
     reply r;
@@ -286,6 +301,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "status") == 0) return cmd_status();
     if (strcmp(argv[1], "ip") == 0) return cmd_ip();
     if (strcmp(argv[1], "up") == 0) return cmd_up();
+    if (strcmp(argv[1], "down") == 0) return cmd_down();
     if (strcmp(argv[1], "logout") == 0) return cmd_logout();
     usage();
     return 2;

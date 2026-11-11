@@ -15,7 +15,7 @@
 #define STALE_TRIES 5
 #define STALE_WAIT_US 200000
 
-static const char *const cmd_lines[] = { "status\n", "up\n", "ip\n", "logout\n" };
+static const char *const cmd_lines[] = { "status\n", "up\n", "ip\n", "logout\n", "down\n" };
 #define NCMDS (sizeof cmd_lines / sizeof cmd_lines[0])
 
 const char *ts_ipc_socket_path(void)

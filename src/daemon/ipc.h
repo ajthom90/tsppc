@@ -21,6 +21,11 @@
  *   problem <text>          a current problem, such as "system clock is wrong"
  *   login <yes|no|leaving>  whether the saved state holds a login, and
  *                           whether a logout is still being sent
+ *   wanted <up|down>        whether the node is meant to be connected: down
+ *                           when logged out, or after "down" (kept across
+ *                           restarts)
+ *   self <name>             the node's own name as control sent it (an FQDN
+ *                           with a trailing dot), when known
  *   ip <a.b.c.d>            the node's tailnet IPv4 address, when known
  *   peer <a.b.c.d|-> <online|offline> <name>
  *   truncated               the reply hit TS_IPC_RESP_MAX
@@ -45,15 +50,16 @@ typedef enum {
     TS_IPC_STATUS,
     TS_IPC_UP,
     TS_IPC_IP,
-    TS_IPC_LOGOUT
+    TS_IPC_LOGOUT,
+    TS_IPC_DOWN
 } ts_ipc_cmd;
 
 /* The socket path: TS_IPC_PATH. In builds with -DTS_TEST_HOOKS only, the
  * TSPPC_SOCKET environment variable overrides it. */
 const char *ts_ipc_socket_path(void);
 
-/* Parse one request line of len bytes: "status\n", "up\n", "ip\n" or
- * "logout\n" exactly. Returns 0 with *out set, or -1 for anything else
+/* Parse one request line of len bytes: "status\n", "up\n", "ip\n",
+ * "logout\n" or "down\n" exactly. Returns 0 with *out set, or -1 for anything else
  * (unknown command, missing newline, a NUL or other byte, len over
  * TS_IPC_LINE_MAX). */
 int ts_ipc_parse_request(const char *line, size_t len, ts_ipc_cmd *out);

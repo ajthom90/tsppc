@@ -11,14 +11,18 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <netinet/in.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "../src/control/session.h"
 #include "../src/daemon/ipc.h"
 #include "../src/core/bytes.h"
 #include "../src/proto/encoding.h"
 #include "../src/state/store.h"
+
+#include "fake_control.inc"
 
 /* Where the Makefile put tsppcd and tsppc for this target. */
 #ifndef TS_BIN_DIR
@@ -44,7 +48,8 @@ static void test_parse(void)
     t_true("ipc: up", parse("up\n", 3, &c) == 0 && c == TS_IPC_UP);
     t_true("ipc: ip", parse("ip\n", 3, &c) == 0 && c == TS_IPC_IP);
     t_true("ipc: logout", parse("logout\n", 7, &c) == 0 && c == TS_IPC_LOGOUT);
-    t_true("ipc: unknown", parse("down\n", 5, &c) == -1);
+    t_true("ipc: down", parse("down\n", 5, &c) == 0 && c == TS_IPC_DOWN);
+    t_true("ipc: unknown", parse("sideways\n", 9, &c) == -1);
     t_true("ipc: prefix of a command", parse("stat\n", 5, &c) == -1);
     t_true("ipc: command with more", parse("statusx\n", 8, &c) == -1);
     t_true("ipc: trailing space", parse("status \n", 8, &c) == -1);
@@ -235,8 +240,11 @@ static int run_cli(const char *arg, char *out, size_t cap)
 /* Start tsppcd with the test overrides: control at localhost:1 (refused), and
  * control's key given (no key fetch) when key is not NULL. Its output is
  * appended to logpath. */
+static int g_ctl_port = 1;
+
 static pid_t start_daemon(const char *statedir, const char *sock, const char *logpath, const char *key)
 {
+    char ctl[64];
     pid_t pid = fork();
     if (pid == 0) {
         int fd = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0600);
@@ -247,7 +255,8 @@ static pid_t start_daemon(const char *statedir, const char *sock, const char *lo
         }
         setenv("TSPPC_STATE_DIR", statedir, 1);
         setenv("TSPPC_SOCKET", sock, 1);
-        setenv("TSPPC_CONTROL", "localhost:1", 1);
+        snprintf(ctl, sizeof ctl, "localhost:%d", g_ctl_port);
+        setenv("TSPPC_CONTROL", ctl, 1);
         if (key) setenv("TSPPC_CONTROL_KEY", key, 1);
         else unsetenv("TSPPC_CONTROL_KEY");
         execl(TS_BIN_DIR "/tsppcd", "tsppcd", (char *)NULL);
@@ -351,6 +360,156 @@ static int log_has_key(const char *logpath, const uint8_t *const *keys, int n)
 
 #define FAKE_CONTROL_KEY "4c3d1a8e0f2b7c6d5e4f30211203f4e5d6c7b8a99a8b7c6d5e4f3021120314e5"
 
+
+/* ---- A fake control server on a real socket --------------------------- */
+
+#define SELFNAME "self.example.test"
+#define HA "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+#define MAP_JSON "{\"Node\":{\"ID\":1,\"Name\":\"" SELFNAME ".\",\"Key\":\"nodekey:" HA "\"," \
+    "\"Addresses\":[\"100.64.0.1/32\"],\"MachineAuthorized\":true},\"Peers\":[]}"
+
+static void fk_handler(fake *f, fk_req *r)
+{
+    if (strcmp(r->path, "/machine/register") == 0) fk_reply(f, r, 200, "{\"MachineAuthorized\":true}");
+    else if (strcmp(r->path, "/machine/map") == 0) {
+        fk_headers(f, r, 200, NULL, 0, 0);
+        fk_map_msg(f, r, MAP_JSON);
+    }
+}
+
+/* The server child: one connection at a time on lfd, each answered by the
+ * fake (plain TCP: the daemon uses TLS only on port 443). Every accepted
+ * connection appends a byte to countpath. */
+static void fake_server(int lfd, fake *f, const char *countpath)
+{
+    for (;;) {
+        int fd = accept(lfd, NULL, NULL), cf;
+        if (fd < 0) continue;
+        cf = open(countpath, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (cf >= 0) {
+            (void)write(cf, "x", 1);
+            close(cf);
+        }
+        f->up = 1;
+        f->conn++;
+        fk_conn_reset(f);
+        f->nreq = 0;
+        for (;;) {
+            uint8_t buf[4096];
+            ssize_t n = read(fd, buf, sizeof buf);
+            if (n <= 0) break;
+            fk_append(&f->c2s, &f->c2s_len, &f->c2s_cap, buf, (size_t)n);
+            while (fk_process(f)) {}
+            if (f->s2c_len) {
+                size_t off = 0;
+                while (off < f->s2c_len) {
+                    ssize_t w = write(fd, f->s2c + off, f->s2c_len - off);
+                    if (w <= 0) break;
+                    off += (size_t)w;
+                }
+                fk_consume(f->s2c, &f->s2c_len, f->s2c_len);
+            }
+        }
+        close(fd);
+    }
+}
+
+static long file_size(const char *path)
+{
+    struct stat sb;
+    return stat(path, &sb) == 0 ? (long)sb.st_size : 0;
+}
+
+/* up, down and what status says about it, against the fake control server. */
+static void test_daemon_down(void)
+{
+    static fake f;
+    char statedir[128], sock[128], logpath[128], countpath[128], key[65], out[8192], err[256];
+    struct sockaddr_in sa;
+    socklen_t sl = sizeof sa;
+    ts_state st, after;
+    pid_t pid, srv;
+    int lfd, rc;
+    long conns;
+
+    if (access(TS_BIN_DIR "/tsppcd", X_OK) != 0 || access(TS_BIN_DIR "/tsppc", X_OK) != 0) {
+        printf("SKIP: down tests (no " TS_BIN_DIR "/tsppcd or tsppc here)\n");
+        return;
+    }
+    if (make_tmpdir() != 0) {
+        t_true("down: temp dir", 0);
+        return;
+    }
+    snprintf(statedir, sizeof statedir, "%s/state", tmpdir);
+    snprintf(sock, sizeof sock, "%s/sock", tmpdir);
+    snprintf(logpath, sizeof logpath, "%s/log", tmpdir);
+    snprintf(countpath, sizeof countpath, "%s/conns", tmpdir);
+    setenv("TSPPC_SOCKET", sock, 1);
+
+    rc = load_state(statedir, &st);
+    st.have_login = 1;
+    t_true("down: saved login written", rc == 0 && ts_state_save(&st, statedir, err, sizeof err) == 0);
+
+    fk_init(&f, NULL, "");
+    f.handler = fk_handler;
+    ts_hex_encode(key, sizeof key, f.control_pub, 32);
+    lfd = socket(AF_INET, SOCK_STREAM, 0);
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (lfd < 0 || bind(lfd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&sa, &sl) != 0) {
+        t_true("down: fake control listens", 0);
+        return;
+    }
+    g_ctl_port = ntohs(sa.sin_port);
+    srv = fork();
+    if (srv == 0) {
+        fake_server(lfd, &f, countpath);
+        _exit(0);
+    }
+    close(lfd);
+
+    pid = start_daemon(statedir, sock, logpath, key);
+    t_true("down: socket appears", wait_socket(sock, pid, 120000) == 0);
+    t_true("down: logged in, connects and runs", wait_status(sock, "state RUNNING\n", out, sizeof out, 120000));
+    t_true("down: running, wanted up", strstr(out, "\nwanted up\n") != NULL);
+    t_true("down: status has the self name", strstr(out, "\nself " SELFNAME ".\n") != NULL);
+    t_true("down: no url while running", strstr(out, "\nurl ") == NULL);
+
+    rc = run_cli("down", out, sizeof out);
+    t_true("down: the command says so and exits 0", rc == 0 && strstr(out, "Disconnected. Run tsppc up to connect again.") != NULL);
+    t_true("down: goes IDLE", wait_status(sock, "state IDLE\n", out, sizeof out, 60000));
+    t_true("down: wanted down, still logged in", strstr(out, "\nwanted down\n") && strstr(out, "\nlogin yes\n"));
+    rc = run_cli("status", out, sizeof out);
+    t_true("down: tsppc status says disconnected", rc == 0 && strstr(out, "Disconnected (tsppc up to connect)") != NULL);
+    t_true("down: saved as down", load_state(statedir, &after) == 0 && after.have_login && after.down);
+
+    kill(pid, SIGTERM);
+    t_true("down: daemon exits", wait_exit(pid, 60000) == 0);
+    conns = file_size(countpath);
+    pid = start_daemon(statedir, sock, logpath, key);
+    t_true("down: restart", wait_socket(sock, pid, 120000) == 0);
+    t_true("down: restart stays down", wait_status(sock, "state IDLE\n", out, sizeof out, 60000) &&
+           strstr(out, "\nwanted down\n") && strstr(out, "\nlogin yes\n"));
+    nap_ms(1500);
+    t_true("down: restart makes no connection", file_size(countpath) == conns);
+
+    raw_request(sock, "up\n", 3, out, sizeof out);
+    t_true("down: up accepted", strncmp(out, "ok\n", 3) == 0);
+    t_true("down: up reaches RUNNING", wait_status(sock, "state RUNNING\n", out, sizeof out, 120000));
+    t_true("down: up shows wanted up and no url", strstr(out, "\nwanted up\n") && !strstr(out, "\nurl "));
+    t_true("down: up cleared the saved down", load_state(statedir, &after) == 0 && after.have_login && !after.down);
+
+    kill(pid, SIGTERM);
+    wait_exit(pid, 60000);
+    kill(srv, SIGKILL);
+    waitpid(srv, NULL, 0);
+    ts_wipe(&st, sizeof st);
+    ts_wipe(&after, sizeof after);
+    unsetenv("TSPPC_SOCKET");
+}
+
 static void test_daemon(void)
 {
     char statedir[128], sock[128], logpath[128], out[8192], longreq[100];
@@ -418,7 +577,7 @@ static void test_daemon(void)
     memset(longreq, 'x', sizeof longreq);
     raw_request(sock, longreq, sizeof longreq, out, sizeof out);
     t_true("daemon: an over-long request is an error", strncmp(out, "error ", 6) == 0 && !strstr(out, "state"));
-    raw_request(sock, "down\n", 5, out, sizeof out);
+    raw_request(sock, "sideways\n", 9, out, sizeof out);
     t_true("daemon: an unknown request is an error", strncmp(out, "error ", 6) == 0);
     raw_request(sock, "st\0us\n", 6, out, sizeof out);
     t_true("daemon: a request with a NUL is an error", strncmp(out, "error ", 6) == 0);
@@ -533,4 +692,5 @@ void test_ipc(void)
     test_split();
     test_listen();
     test_daemon();
+    test_daemon_down();
 }
