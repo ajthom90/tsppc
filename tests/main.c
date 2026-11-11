@@ -15,6 +15,7 @@ void test_netmap(void);
 void test_session(void);
 void test_ipc(void);
 void test_ipc_reply(void);
+void test_menu_model(void);
 
 int main(void)
 {
@@ -33,5 +34,6 @@ int main(void)
     test_session();
     test_ipc();
     test_ipc_reply();
+    test_menu_model();
     return t_summary();
 }
