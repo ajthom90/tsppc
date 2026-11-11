@@ -44,7 +44,7 @@ static void seterr(char *err, size_t cap, const char *fmt, ...)
 void ts_state_encode(uint8_t out[TS_STATE_FILE_LEN], const ts_state *s)
 {
     uint16_t flags = (uint16_t)((s->have_old_node ? 1 : 0) | (s->have_login ? 2 : 0) |
-                                (s->logout_pending ? 4 : 0));
+                                (s->logout_pending ? 4 : 0) | (s->have_login && s->down ? 8 : 0));
     memcpy(out, "TSPS", 4);
     ts_put_be16(out + 4, TS_STATE_VERSION);
     ts_put_be16(out + 6, flags);
@@ -78,8 +78,9 @@ int ts_state_parse(ts_state *s, const uint8_t *buf, size_t len)
     ts_blake2s(sum, buf, 136);
     if (!ct_equal(sum, buf + 136, 32)) return -1;
     flags = ts_get_be16(buf + 6);
-    if (flags & ~(uint16_t)7) return -1;
+    if (flags & ~(uint16_t)15) return -1;
     if ((flags & 2) && (flags & 4)) return -1;   /* logged in and logging out */
+    if ((flags & 8) && !(flags & 2)) return -1;  /* down without a login */
     for (i = 0; i < 32; i++) z |= buf[72 + i];
     if (!(flags & 1) && z != 0) return -1;
     memcpy(s->machine_priv, buf + 8, 32);
@@ -89,6 +90,7 @@ int ts_state_parse(ts_state *s, const uint8_t *buf, size_t len)
     s->have_old_node = (flags & 1) ? 1 : 0;
     s->have_login = (flags & 2) ? 1 : 0;
     s->logout_pending = (flags & 4) ? 1 : 0;
+    s->down = (flags & 8) ? 1 : 0;
     return 0;
 }
 

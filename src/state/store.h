@@ -16,7 +16,10 @@
  *   0   4  magic "TSPS"
  *   4   2  version (1)
  *   6   2  flags: bit 0 have_old_node, bit 1 have_login, bit 2 logout_pending
- *          (never with have_login); other bits must be 0
+ *          (never with have_login), bit 3 down (only with have_login);
+ *          other bits must be 0. Bit 3 was added without a version change:
+ *          files without it load unchanged, and an older build refuses a file
+ *          that has it.
  *  8  32  machine private key
  *  40 32  node private key
  *  72 32  old node private key (all zero unless have_old_node)
@@ -57,6 +60,9 @@ typedef struct {
     /* A logout was started and control has not confirmed it: node_priv is
      * the key to expire at control, and must never log in again. */
     int logout_pending;
+    /* Logged in, but the operator disconnected: do not connect at start.
+     * Only with have_login; encoded only then. */
+    int down;
 } ts_state;
 
 /* Clamp 32 random bytes into an X25519 private key, as every key in the state

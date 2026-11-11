@@ -142,6 +142,7 @@ typedef struct {
     int save_failed;                     /* the logout's save failed (status) */
     int logout_unconfirmed;              /* logged out here without control's answer (status) */
     int logout_failed;                   /* the logout's first save failed (status) */
+    int down_failed;                     /* the down's save failed (status) */
     int relogin;                         /* RELOGIN_*: waiting for ts_sess_up */
     int reg_authorized;                  /* MachineAuthorized, from the register or the map */
     char auth_url[TS_SESS_URL_MAX + 1];  /* "" when none */
@@ -227,12 +228,26 @@ void ts_sess_disconnected(ts_sess *s, const char *why);
 void ts_sess_tick(ts_sess *s, uint64_t now_ms);
 
 /* Log in and stay connected (also leaves FAILED and NEED_LOGIN; after a node
- * expiry or removal the next register uses a new node key). */
+ * expiry or removal the next register uses a new node key). A saved down is
+ * cleared and saved first; if that save fails the session connects anyway
+ * (a restart then stays down until the next up). */
 void ts_sess_up(ts_sess *s);
+/* Disconnect and stay disconnected, logged in, across restarts: first save
+ * down (with have_login), and only then close the connection, stop every
+ * timer and go IDLE. If that save fails nothing changes, and status and
+ * ts_sess_problem say the state could not be saved. Without a saved login
+ * (a login URL out, or a new key not yet logged in) there is nothing to
+ * persist: the session just goes IDLE. During a logout (logout_pending) it
+ * does nothing: the logout finishes and ends IDLE. Leaves FAILED. The next
+ * ts_sess_up connects with the same node key. */
+void ts_sess_down(ts_sess *s);
+/* 1 if the node is logged in and saved as down, else 0. */
+int ts_sess_is_down(const ts_sess *s);
 /* Log out, as upstream: first save the intent (have_login cleared,
  * logout_pending set, the node key kept), and only then send control a
  * register of that key with Expiry in the far past. If that first save fails
  * the logout fails: -1, nothing changes, and status says so. Otherwise 0.
+ * A saved down is cleared with the login.
  * When control confirms, or the register cannot be delivered (no connection
  * on port 80 or 443, or an error reply), the logout finishes: a fresh node
  * key, no old key, logout_pending cleared, saved, IDLE. If control was not

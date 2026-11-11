@@ -8,8 +8,8 @@
  * Start: load (or create) the node state, compute Hostinfo, listen on the
  * socket, fetch control's Noise key (retried with backoff; status shows why it
  * fails, "system clock is wrong" included), then run the control session. The
- * session is started at once if the saved state is logged in, as upstream's
- * daemon does; otherwise it waits for `tsppc up`.
+ * session is started at once if the saved state is logged in and not down
+ * (ts_sess_down), as upstream's daemon does; otherwise it waits for `tsppc up`.
  *
  * Logout follows ts_sess_logout: the intent (logout_pending) is saved first,
  * also before the control key is in, and the key is expired at control once
@@ -529,6 +529,7 @@ static int logout_before_session(void)
     if (!D.st.have_login || D.st.logout_pending) return 0;
     n = D.st;
     n.have_login = 0;
+    n.down = 0;
     n.logout_pending = 1;
     rc = ts_state_save(&n, D.state_dir, err, sizeof err);
     if (rc == 0) D.st = n;
@@ -873,9 +874,11 @@ int main(int argc, char **argv)
         shutdown_all();
         return 1;
     }
-    D.want_up = D.st.have_login;
+    D.want_up = D.st.have_login && !D.st.down;
     if (D.have_key) session_start();   /* test hook: key given */
-    logline("started (%s)", D.st.have_login ? "logged in: connecting" : "logged out: waiting for tsppc up");
+    logline("started (%s)", D.want_up ? "logged in: connecting"
+                            : D.st.have_login ? "logged in: disconnected (down)"
+                            : "logged out: waiting for tsppc up");
 
     while (!got_signal) {
         fd_set r, w;

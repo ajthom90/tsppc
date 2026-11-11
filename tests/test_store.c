@@ -352,12 +352,93 @@ static void test_parse(void)
     memcpy(bad, buf, sizeof buf);
     bad[7] |= 8;
     ts_blake2s(bad + 136, bad, 136);
-    t_true("parse: bit 3 still reserved", ts_state_parse(&b, bad, sizeof bad) != 0);
+    t_true("parse: down with logout_pending rejected", ts_state_parse(&b, bad, sizeof bad) != 0);
     a.logout_pending = 0;
     ts_state_encode(buf, &a);
     t_true("parse: failure zeroes output", !nonzero(b.machine_priv) && !nonzero(b.node_priv) && !b.have_login);
     t_true("parse: short", ts_state_parse(&b, buf, sizeof buf - 1) != 0);
     t_true("parse: empty", ts_state_parse(&b, buf, 0) != 0);
+}
+
+/* A state file written by the control-session build (version 1, have_login),
+ * before down existed. Invented keys: machine 0x20.., node 0x60.., disco
+ * 0xa0.., each clamped. Files like it are on real nodes and must keep loading. */
+static const uint8_t V1_LOGGED_IN[TS_STATE_FILE_LEN] = {
+    0x54, 0x53, 0x50, 0x53, 0x00, 0x01, 0x00, 0x02, 0x20, 0x21, 0x22, 0x23,
+    0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b,
+    0x3c, 0x3d, 0x3e, 0x7f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
+    0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73,
+    0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa0, 0xa1, 0xa2, 0xa3,
+    0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+    0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb,
+    0xbc, 0xbd, 0xbe, 0x7f, 0xf2, 0x33, 0xa1, 0x1e, 0xb2, 0x99, 0x88, 0x99,
+    0xb3, 0xbf, 0x4c, 0x8f, 0x15, 0xc2, 0xfe, 0xc3, 0x0a, 0x77, 0xec, 0x1f,
+    0xf4, 0x69, 0xea, 0x44, 0x62, 0x7b, 0xae, 0xf1, 0xc5, 0x3f, 0x39, 0xfb,
+};
+
+static void test_store_v1_fixture_loads(void)
+{
+    ts_state s;
+    uint8_t want[32], enc[TS_STATE_FILE_LEN];
+    size_t i;
+    int keys_ok = 1;
+
+    t_true("v1 fixture: parses", ts_state_parse(&s, V1_LOGGED_IN, sizeof V1_LOGGED_IN) == 0);
+    t_true("v1 fixture: logged in, not down", s.have_login == 1 && s.down == 0 && !s.logout_pending &&
+           !s.have_old_node);
+    for (i = 0; i < 32; i++) want[i] = (uint8_t)(0x20 + i);
+    ts_state_clamp_key(want);
+    keys_ok &= !memcmp(s.machine_priv, want, 32);
+    for (i = 0; i < 32; i++) want[i] = (uint8_t)(0x60 + i);
+    ts_state_clamp_key(want);
+    keys_ok &= !memcmp(s.node_priv, want, 32);
+    for (i = 0; i < 32; i++) want[i] = (uint8_t)(0xa0 + i);
+    ts_state_clamp_key(want);
+    keys_ok &= !memcmp(s.disco_priv, want, 32);
+    t_true("v1 fixture: same keys", keys_ok && !nonzero(s.old_node_priv));
+    ts_state_encode(enc, &s);
+    t_true("v1 fixture: re-encodes byte for byte", !memcmp(enc, V1_LOGGED_IN, sizeof enc));
+}
+
+static void test_store_down_roundtrip(void)
+{
+    ts_state a, b;
+    uint8_t buf[TS_STATE_FILE_LEN], bad[TS_STATE_FILE_LEN];
+    size_t i;
+
+    memset(&a, 0, sizeof a);
+    for (i = 0; i < 32; i++) {
+        a.machine_priv[i] = (uint8_t)(3 + i);
+        a.node_priv[i] = (uint8_t)(40 + i);
+        a.disco_priv[i] = (uint8_t)(120 + i);
+    }
+    a.have_login = 1;
+    a.down = 1;
+    ts_state_encode(buf, &a);
+    t_true("down: flag is bit 3", buf[6] == 0 && buf[7] == (2 | 8));
+    t_true("down: version stays 1", buf[4] == 0 && buf[5] == 1);
+    memset(&b, 0, sizeof b);
+    t_true("down: round trip", ts_state_parse(&b, buf, sizeof buf) == 0 && b.down == 1 && b.have_login == 1 &&
+           !memcmp(b.node_priv, a.node_priv, 32));
+
+    /* down without have_login is rejected. */
+    memcpy(bad, buf, sizeof buf);
+    bad[7] = 8;
+    ts_blake2s(bad + 136, bad, 136);
+    t_true("down: without have_login rejected", ts_state_parse(&b, bad, sizeof bad) != 0);
+    /* Bit 4 (and the rest) stay reserved. */
+    memcpy(bad, buf, sizeof buf);
+    bad[7] |= 16;
+    ts_blake2s(bad + 136, bad, 136);
+    t_true("down: bit 4 rejected", ts_state_parse(&b, bad, sizeof bad) != 0);
+    memcpy(bad, buf, sizeof buf);
+    bad[6] |= 0x01;
+    ts_blake2s(bad + 136, bad, 136);
+    t_true("down: bit 8 rejected", ts_state_parse(&b, bad, sizeof bad) != 0);
 }
 
 static int find_str(const char *json, const char *key, char *out, size_t cap)
@@ -490,6 +571,8 @@ void test_store(void)
     test_stale_and_fifo();
     test_wrong_owner();
     test_parse();
+    test_store_v1_fixture_loads();
+    test_store_down_roundtrip();
     test_osversion_helpers();
     test_hostinfo();
     rm_tree(ROOT);

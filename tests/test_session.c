@@ -679,6 +679,163 @@ static void test_logout_pending_restart(void)
 }
 
 /* Approval arrives through the map. */
+/* Down from RUNNING: saved first (still logged in), disconnected, IDLE, and
+ * nothing reconnects. */
+static void test_sess_down_disconnects(void)
+{
+    uint8_t key[32];
+    int saves, reqs;
+    begin_running();
+    t_true("down: RUNNING first", ts_sess_get_state(S) == TS_SESS_RUNNING && !ts_sess_is_down(S));
+    memcpy(key, ts_sess_node_state(S)->node_priv, 32);
+    saves = F.nsave;
+    reqs = F.nreq;
+    ts_sess_down(S);
+    fk_pump(&F);
+    t_true("down: saved once, down and still logged in", F.nsave == saves + 1 && F.saved.down == 1 &&
+           F.saved.have_login == 1 && !F.saved.logout_pending && memcmp(F.saved.node_priv, key, 32) == 0);
+    t_true("down: connection closed", F.ndisconnect == 1 && !F.up);
+    t_true("down: IDLE and down", ts_sess_get_state(S) == TS_SESS_IDLE && ts_sess_is_down(S));
+    t_true("down: no problem", strcmp(ts_sess_problem(S), "") == 0);
+    t_true("down: status says logged in", status_has("IDLE") && status_has("logged in"));
+    fk_advance(&F, 600000, 1000);
+    t_true("down: no reconnect in 10 minutes", F.nconnect == 1 && F.nreq == reqs &&
+           ts_sess_get_state(S) == TS_SESS_IDLE);
+    t_true("down: no protocol violation", !F.bad);
+    end();
+}
+
+/* Up after down, in the same session and after a restart from the saved state:
+ * down is cleared and saved, and the same node logs in without a login URL. */
+static void test_sess_up_after_down(void)
+{
+    char nk[65], want[128];
+    uint8_t key[32];
+    ts_state saved;
+    fk_req *r;
+
+    begin_running();
+    memcpy(key, ts_sess_node_state(S)->node_priv, 32);
+    ts_sess_down(S);
+    fk_pump(&F);
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("up after down: down cleared and saved", F.saved.down == 0 && F.saved.have_login == 1 &&
+           !ts_sess_is_down(S));
+    t_true("up after down: RUNNING again, same key", ts_sess_get_state(S) == TS_SESS_RUNNING && F.nconnect == 2 &&
+           memcmp(ts_sess_node_state(S)->node_priv, key, 32) == 0 && ts_sess_login_url(S) == NULL);
+    ts_sess_down(S);
+    fk_pump(&F);
+    saved = F.saved;
+    end();
+
+    /* Restart: the session starts from a state saved down. */
+    fk_init(&F, S, HOSTINFO);
+    F.handler = h_auto;
+    F.map_first = MAP_OK;
+    F.st = saved;
+    fk_start(&F, HOSTINFO);
+    t_true("down restart: IDLE, down, logged in", ts_sess_get_state(S) == TS_SESS_IDLE && ts_sess_is_down(S) &&
+           status_has("logged in"));
+    fk_advance(&F, 600000, 1000);
+    t_true("down restart: nothing connects", F.nconnect == 0);
+    key_hex(nk, saved.node_priv);
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("down restart up: saved before control heard anything", F.nsave == 1 && F.reqs_at_save == 0 &&
+           F.saved.down == 0 && F.saved.have_login == 1 && memcmp(F.saved.node_priv, saved.node_priv, 32) == 0);
+    r = F.nreq ? &F.req[0] : NULL;
+    snprintf(want, sizeof want, "\"NodeKey\":\"nodekey:%s\"", nk);
+    t_true("down restart up: register of the same key", r && strcmp(r->path, "/machine/register") == 0 &&
+           has(r->body, want) && !has(r->body, "OldNodeKey") && !has(r->body, "Followup"));
+    t_true("down restart up: RUNNING, no login URL", ts_sess_get_state(S) == TS_SESS_RUNNING &&
+           ts_sess_login_url(S) == NULL && !ts_sess_is_down(S));
+    end();
+}
+
+/* The down save fails: nothing changes and the problem says why. */
+static void test_sess_down_save_fails(void)
+{
+    char st[512];
+    begin_running();
+    F.save_fail = 1;
+    ts_sess_down(S);
+    fk_pump(&F);
+    t_true("down save fails: still RUNNING and connected", ts_sess_get_state(S) == TS_SESS_RUNNING && F.up &&
+           F.ndisconnect == 0);
+    t_true("down save fails: not down", !ts_sess_is_down(S) && !ts_sess_node_state(S)->down);
+    t_true("down save fails: problem says so", strstr(ts_sess_problem(S), "could not be saved") != NULL);
+    ts_sess_status(S, st, sizeof st);
+    t_true("down save fails: status says so", strstr(st, "could not be saved") != NULL);
+    F.save_fail = 0;
+    ts_sess_down(S);
+    fk_pump(&F);
+    t_true("down save fails: a later down works", ts_sess_get_state(S) == TS_SESS_IDLE && ts_sess_is_down(S) &&
+           strcmp(ts_sess_problem(S), "") == 0);
+    end();
+}
+
+/* Logout from down: down is cleared with the login, starting with the intent
+ * save, and every saved image is a valid state file. */
+static void test_sess_logout_clears_down(void)
+{
+    uint8_t img[TS_STATE_FILE_LEN];
+    ts_state chk;
+    fk_req *r;
+    int i, at = -1;
+    begin_running();
+    ts_sess_down(S);
+    fk_pump(&F);
+    F.handler = h_hold_logout;
+    t_true("logout from down: 0", ts_sess_logout(S) == 0);
+    fk_pump(&F);
+    t_true("logout from down: intent saved without down", F.saved.logout_pending && !F.saved.have_login &&
+           F.saved.down == 0);
+    ts_state_encode(img, &F.saved);
+    t_true("logout from down: intent image loads", ts_state_parse(&chk, img, sizeof img) == 0);
+    for (i = 0; i < F.nreq; i++)
+        if (is_logout(&F.req[i])) at = i;
+    r = at >= 0 ? &F.req[at] : NULL;
+    t_true("logout from down: logout register sent", r != NULL);
+    if (r) fk_reply(&F, r, 200, "{}");
+    fk_pump(&F);
+    t_true("logout from down: done, not down", ts_sess_get_state(S) == TS_SESS_IDLE && !F.saved.logout_pending &&
+           !F.saved.have_login && F.saved.down == 0 && !ts_sess_is_down(S));
+    end();
+}
+
+/* Down where nothing can be persisted, or while a logout is under way. */
+static void test_sess_down_edges(void)
+{
+    int saves;
+    /* A login URL out: no login to keep, so IDLE without a save. */
+    begin(h_std);
+    F.hold_followup = 1;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("down at login: NEED_LOGIN first", ts_sess_get_state(S) == TS_SESS_NEED_LOGIN);
+    saves = F.nsave;
+    ts_sess_down(S);
+    fk_pump(&F);
+    t_true("down at login: IDLE, closed, nothing saved", ts_sess_get_state(S) == TS_SESS_IDLE && !F.up &&
+           F.nsave == saves && !ts_sess_is_down(S));
+    fk_advance(&F, 600000, 1000);
+    t_true("down at login: no reconnect", F.nconnect == 1);
+    end();
+
+    /* A logout in flight is not interrupted. */
+    begin_running();
+    F.handler = h_hold_logout;
+    ts_sess_logout(S);
+    fk_pump(&F);
+    saves = F.nsave;
+    ts_sess_down(S);
+    fk_pump(&F);
+    t_true("down in logout: ignored", F.nsave == saves && F.up && fk_open(&F, "/machine/register") == 1 &&
+           !ts_sess_is_down(S));
+    end();
+}
+
 static void h_unauth(fake *f, fk_req *r)
 {
     if (strcmp(r->path, "/machine/register") == 0) fk_reply(f, r, 200, "{\"MachineAuthorized\":false}");
@@ -1378,6 +1535,11 @@ void test_session(void)
     test_logout_save_fails();
     test_logout_intent_first();
     test_logout_pending_restart();
+    test_sess_down_disconnects();
+    test_sess_up_after_down();
+    test_sess_down_save_fails();
+    test_sess_logout_clears_down();
+    test_sess_down_edges();
     test_followup_expired_loop();
     test_up_during_logout();
     test_approval();

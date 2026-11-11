@@ -44,6 +44,8 @@ static void check(const uint8_t *data, size_t len)
     TS_FUZZ_ASSERT(s.have_login == 0 || s.have_login == 1);
     TS_FUZZ_ASSERT(s.logout_pending == 0 || s.logout_pending == 1);
     TS_FUZZ_ASSERT(!(s.logout_pending && s.have_login));
+    TS_FUZZ_ASSERT(s.down == 0 || s.down == 1);
+    TS_FUZZ_ASSERT(!s.down || s.have_login);
     TS_FUZZ_ASSERT(s.have_old_node || all_zero(s.old_node_priv, 32));
     ts_state_encode(enc, &s);
     TS_FUZZ_ASSERT(memcmp(enc, data, len) == 0);
