@@ -29,6 +29,8 @@
  *   ip <a.b.c.d>            the node's tailnet IPv4 address, when known
  *   peer <a.b.c.d|-> <online|offline> <name>
  *   truncated               the reply hit TS_IPC_RESP_MAX
+ * self, ip and peer come from the current map, and are left out while wanted
+ * is down (the last map is stale then).
  * The daemon replaces control bytes in every value. Clients still treat the
  * reply as untrusted and clean it (ts_ipc_clean) before printing it.
  *

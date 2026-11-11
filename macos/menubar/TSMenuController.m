@@ -11,7 +11,8 @@
 #define REQUEST_MS 2000
 #define POLL_FAST_S 5.0
 #define POLL_SLOW_S 15.0
-#define SLOW_AFTER_SAME 6          /* identical replies in a row before polling slowly */
+#define SLOW_AFTER_SAME 6          /* identical menus in a row before polling slowly */
+#define ALERT_TEXT_MAX 300         /* characters of daemon text shown in an alert */
 
 /* The model's strings are printable ASCII (ts_ipc_clean and ts_menu_build). */
 static NSString *str(const char *s)
@@ -58,9 +59,12 @@ static NSImage *makeIcon(ts_menu_icon kind, NSColor *color)
     return img;
 }
 
-static int isState(const ts_reply *r, const char *s)
+/* Daemon text for an alert, cut to ALERT_TEXT_MAX characters ("..." added).
+ * The strings are ASCII, so no character is split. */
+static NSString *capped(NSString *s)
 {
-    return strcmp(r->state, s) == 0;
+    if (s == nil || [s length] <= ALERT_TEXT_MAX) return s;
+    return [[s substringToIndex:ALERT_TEXT_MAX - 3] stringByAppendingString:@"..."];
 }
 
 @interface TSMenuController (Private)
@@ -75,7 +79,7 @@ static int isState(const ts_reply *r, const char *s)
 - (void)applyStale;
 - (NSMenuItem *)itemFor:(const ts_menu_item *)it;
 - (BOOL)alert:(NSString *)message info:(NSString *)info first:(NSString *)b1 second:(NSString *)b2;
-- (void)send:(ts_ipc_cmd)cmd failure:(NSString *)failure;
+- (BOOL)send:(ts_ipc_cmd)cmd failure:(NSString *)failure;
 - (void)copyString:(NSString *)s;
 @end
 
@@ -89,32 +93,28 @@ static int isState(const ts_reply *r, const char *s)
     ts_req_result res;
     const ts_reply *r = NULL;
     ts_menu *t;
+    int same;
 
     res = ts_ipc_request(ts_ipc_socket_path(), TS_IPC_STATUS, REQUEST_MS, buf, TS_IPC_RESP_MAX, &len);
-
-    /* Count identical replies in a row (sameCount 0: nothing to compare with). */
-    if (sameCount > 0 && res == prevRes && len == prevLen && memcmp(buf, prevBuf, len) == 0) {
-        sameCount++;
-    } else {
-        sameCount = 1;
-    }
-    prevRes = res;
-    prevLen = len;
-    memcpy(prevBuf, buf, len);
-
     if (res == TS_REQ_OK) {
         if (len > 0 && ts_reply_parse(reply, peers, buf, len) == 0) r = reply;
         else res = TS_REQ_FAILED;
-    }
-    /* While the state is moving, keep polling quickly. */
-    if (r != NULL && (isState(r, "CONNECTING") || isState(r, "NEED_LOGIN") || isState(r, "AWAIT_APPROVAL"))) {
-        if (sameCount > 1) sameCount = 1;
     }
 
     /* Zero first, so bytes past each string compare equal. */
     memset(next, 0, sizeof *next);
     ts_menu_build(next, res, r);
-    if (!haveMenu || memcmp(next, cur, sizeof *cur) != 0) {
+    same = haveMenu && memcmp(next, cur, sizeof *cur) == 0;
+
+    /* Count identical menus in a row (sameCount 0: nothing to compare with).
+     * The menu, not the reply: status text such as a retry countdown changes
+     * every poll without changing anything shown. While the state is moving
+     * (ts_menu_moving), keep polling quickly. */
+    if (sameCount > 0 && same) sameCount++;
+    else sameCount = 1;
+    if (ts_menu_moving(res, r) && sameCount > 1) sameCount = 1;
+
+    if (!same) {
         t = cur;
         cur = next;
         next = t;
@@ -150,10 +150,15 @@ static int isState(const ts_reply *r, const char *s)
     [rl addTimer:timer forMode:NSEventTrackingRunLoopMode];
 }
 
+/* Timer and delayed-perform entry points get their own pool: an idle
+ * LSUIElement app handles no events, so nothing else would drain it. */
 - (void)tick:(NSTimer *)t
 {
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+
     (void)t;
     [self pollAndSchedule];
+    [pool release];
 }
 
 /* ---- the menu ---- */
@@ -168,6 +173,9 @@ static int isState(const ts_reply *r, const char *s)
         [mi setTag:(int)it->action];
         [mi setRepresentedObject:str(it->arg)];
     }
+    /* A NONE line with arg (the problem, an error status) shows the whole text
+     * as a tooltip: its title may be cut (setToolTip:, 10.3+). */
+    if (it->action == TS_ACT_NONE && it->arg[0]) [mi setToolTip:str(it->arg)];
     [mi setEnabled:(it->enabled ? YES : NO)];
     return mi;
 }
@@ -195,7 +203,10 @@ static int isState(const ts_reply *r, const char *s)
 
 - (void)applyStale
 {
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+
     if (menuStale) [self redraw];
+    [pool release];
 }
 
 - (void)redrawMenu
@@ -245,7 +256,7 @@ static int isState(const ts_reply *r, const char *s)
     [NSApp activateIgnoringOtherApps:YES];
     /* Plain setters, never a format: a daemon string may hold '%'. */
     [a setMessageText:message];
-    if (info != nil) [a setInformativeText:info];
+    if (info != nil) [a setInformativeText:capped(info)];
     [a addButtonWithTitle:b1];
     if (b2 != nil) [a addButtonWithTitle:b2];
     rc = [a runModal];
@@ -262,8 +273,10 @@ static int isState(const ts_reply *r, const char *s)
 }
 
 /* Send cmd; on an error reply or a failed request, say so in an alert. The
- * daemon's error text was cleaned by ts_reply_parse (printable ASCII only). */
-- (void)send:(ts_ipc_cmd)cmd failure:(NSString *)failure
+ * daemon's error text was cleaned by ts_reply_parse (printable ASCII only).
+ * Returns NO when the request timed out (an immediate poll would most likely
+ * block for another REQUEST_MS), else YES. */
+- (BOOL)send:(ts_ipc_cmd)cmd failure:(NSString *)failure
 {
     size_t len = 0;
     ts_req_result res;
@@ -273,7 +286,7 @@ static int isState(const ts_reply *r, const char *s)
     switch (res) {
     case TS_REQ_OK:
         if (len > 0 && ts_reply_parse(reply, peers, buf, len) == 0) {
-            if (reply->ok) return;
+            if (reply->ok) return YES;
             why = reply->error[0] ? str(reply->error) : @"tsppcd refused the request.";
         } else {
             why = @"tsppcd sent a reply that could not be read.";
@@ -293,6 +306,7 @@ static int isState(const ts_reply *r, const char *s)
         break;
     }
     [self alert:failure info:why first:@"OK" second:nil];
+    return res != TS_REQ_TIMEOUT;
 }
 
 @end
@@ -310,8 +324,7 @@ static int isState(const ts_reply *r, const char *s)
     reply = malloc(sizeof *reply);
     peers = malloc(TS_MAX_PEERS * sizeof *peers);
     buf = malloc(TS_IPC_RESP_MAX);
-    prevBuf = malloc(TS_IPC_RESP_MAX);
-    if (cur == NULL || next == NULL || reply == NULL || peers == NULL || buf == NULL || prevBuf == NULL) {
+    if (cur == NULL || next == NULL || reply == NULL || peers == NULL || buf == NULL) {
         [self release];
         return nil;
     }
@@ -345,7 +358,6 @@ static int isState(const ts_reply *r, const char *s)
     free(reply);
     free(peers);
     free(buf);
-    free(prevBuf);
     [super dealloc];
 }
 
@@ -372,6 +384,7 @@ static int isState(const ts_reply *r, const char *s)
     /* Copy what the item carries first: a poll may rebuild the menu. */
     int act = (int)[sender tag];
     NSString *arg = [[[sender representedObject] retain] autorelease];
+    BOOL pollAfter = YES;
 
     if (arg == nil) arg = @"";
     switch (act) {
@@ -379,10 +392,10 @@ static int isState(const ts_reply *r, const char *s)
         [self copyString:arg];
         break;
     case TS_ACT_UP:
-        [self send:TS_IPC_UP failure:@"Could not connect."];
+        pollAfter = [self send:TS_IPC_UP failure:@"Could not connect."];
         break;
     case TS_ACT_DOWN:
-        [self send:TS_IPC_DOWN failure:@"Could not disconnect."];
+        pollAfter = [self send:TS_IPC_DOWN failure:@"Could not disconnect."];
         break;
     case TS_ACT_LOGIN:
         if ([self alert:@"Open this link on any other device to log in:" info:arg first:@"Copy Link" second:@"Close"])
@@ -390,7 +403,7 @@ static int isState(const ts_reply *r, const char *s)
         break;
     case TS_ACT_LOGOUT:
         if ([self alert:@"Log out of the tailnet?" info:nil first:@"Log Out" second:@"Cancel"])
-            [self send:TS_IPC_LOGOUT failure:@"Could not log out."];
+            pollAfter = [self send:TS_IPC_LOGOUT failure:@"Could not log out."];
         break;
     case TS_ACT_QUIT:
         /* Only the app quits; tsppcd keeps running. */
@@ -399,7 +412,13 @@ static int isState(const ts_reply *r, const char *s)
     default:
         return;
     }
-    [self pollNow];
+    if (pollAfter) {
+        [self pollNow];
+    } else {
+        /* Timed out: no poll now, the next one at the fast interval. */
+        sameCount = 0;
+        [self scheduleIn:POLL_FAST_S];
+    }
 }
 
 @end

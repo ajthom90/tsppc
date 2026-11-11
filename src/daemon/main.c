@@ -563,6 +563,27 @@ static int down_before_session(void)
     return rc;
 }
 
+/* Up before the session exists (no control key yet): clear a saved down
+ * first, so a restart before the key is in still connects. Returns 0, or -1
+ * if the save failed (nothing changed). With no login, no saved down, or a
+ * logout pending, there is nothing to save. (The session's ts_sess_up
+ * connects even when its save fails; here nothing is connected yet, so a
+ * failed save is the reply instead.) */
+static int up_before_session(void)
+{
+    ts_state n;
+    char err[256];
+    int rc;
+    if (!D.st.have_login || !D.st.down || D.st.logout_pending) return 0;
+    n = D.st;
+    n.down = 0;
+    rc = ts_state_save(&n, D.state_dir, err, sizeof err);
+    if (rc == 0) D.st = n;
+    else logline("cannot save the node state: %s", err);
+    ts_wipe(&n, sizeof n);
+    return rc;
+}
+
 /* Down, with the session if there is one. Returns 0, or -1 if the first
  * save failed (nothing changed). */
 static int do_down(void)
@@ -618,7 +639,8 @@ static void build_status(rbuild *b)
     put(b, "wanted", D.want_up ? "up" : "down");
     if (D.sess && (url = ts_sess_login_url(D.sess)) != NULL) put(b, "url", url);
     if (v.problem[0]) put(b, "problem", v.problem);
-    if (D.sess) {
+    /* Wanted down: the session keeps its last map, which is stale. */
+    if (D.sess && D.want_up) {
         const ts_netmap *nm = ts_sess_netmap(D.sess);
         size_t i;
         if (nm->have_self && nm->self.name[0]) put(b, "self", nm->self.name);
@@ -647,6 +669,11 @@ static void do_request(client *c, ts_ipc_cmd cmd)
     rbuild b;
     switch (cmd) {
     case TS_IPC_UP:
+        if (!D.sess && up_before_session() != 0) {
+            logline("up failed: the node state could not be saved");
+            client_error(c, "up failed: the node state could not be saved; nothing was changed");
+            return;
+        }
         D.want_up = 1;
         if (D.sess) ts_sess_up(D.sess);
         else if (!D.kf_active) {

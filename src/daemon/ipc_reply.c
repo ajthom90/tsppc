@@ -73,7 +73,7 @@ static void add_peer(ts_reply *r, const char *v, size_t n)
     else return;
     p.online = online;
     copy_clean(p.name, sizeof p.name, sp2 + 1, (size_t)(v + n - (sp2 + 1)));
-    if (r->npeers >= TS_MAX_PEERS) {
+    if (r->peers == NULL || r->npeers >= TS_MAX_PEERS) {   /* no array: valid peers count as cut */
         r->truncated = 1;
         return;
     }

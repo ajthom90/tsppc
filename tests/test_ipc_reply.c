@@ -55,6 +55,15 @@ static void test_parse(void)
     t_true("reply: url and problem", rc == 0 && strcmp(g_r.url, "https://login.example.test/a/x") == 0 &&
            strcmp(g_r.problem, "system clock is wrong") == 0 && g_r.npeers == 0 && !g_r.have_ipv4);
 
+    {
+        static const char nopeers[] = "ok\npeer 100.64.0.10 online a.example.test.\n";
+        rc = ts_reply_parse(&g_r, NULL, nopeers, sizeof nopeers - 1);
+        t_true("reply: NULL peers stores nothing and marks truncated", rc == 0 && g_r.peers == NULL &&
+               g_r.npeers == 0 && g_r.truncated == 1);
+        rc = ts_reply_parse(&g_r, NULL, "ok\npeer bad line\n", 17);
+        t_true("reply: NULL peers, an invalid peer line is just skipped", rc == 0 && g_r.npeers == 0 && g_r.truncated == 0);
+    }
+
     rc = parse("ok\nexitnode x\nState FOO\nstate A\nstate B\nbad line here\n\n \nPeer 100.64.0.1 online x\nstatus s\n");
     t_true("reply: unknown and upper-case keys skipped, first state wins",
            rc == 0 && strcmp(g_r.state, "A") == 0 && strcmp(g_r.status, "s") == 0 && g_r.npeers == 0);

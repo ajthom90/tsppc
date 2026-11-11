@@ -273,8 +273,10 @@ const char *ts_sess_state_name(ts_sess_state st);
  * NEED_LOGIN. Always NUL-terminated (cap >= 1). */
 void ts_sess_status(const ts_sess *s, char *out, size_t cap);
 /* The current problem for status (a failure reason, an expired or removed
- * node, a failed logout or save), or "" if none. Printable ASCII. Valid until
- * the next call. */
+ * node, a failed logout or save), or "" if none. The state's own problem
+ * comes first; a failed logout, down or up save is returned only when the
+ * state has none (status holds both). Printable ASCII. Valid until the next
+ * call. */
 const char *ts_sess_problem(const ts_sess *s);
 /* The URL to visit in NEED_LOGIN, else NULL. */
 const char *ts_sess_login_url(const ts_sess *s);

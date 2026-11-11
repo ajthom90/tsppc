@@ -5,32 +5,37 @@
 
 /* ---- helpers ---- */
 
-/* Copy s into a title: bytes outside 0x20-0x7e become '?', and a string that
- * does not fit ends in "..." (three ASCII dots). */
-static void set_title(ts_menu_item *it, const char *s)
+/* Copy s into dst (cap bytes, NUL included): bytes outside 0x20-0x7e become
+ * '?', and a string that does not fit ends in "..." (three ASCII dots). */
+static void clean_cut(char *dst, size_t cap, const char *s)
 {
     size_t n = strlen(s), i;
     int cut = 0;
-    if (n >= TS_MENU_TITLE_MAX) {
-        n = TS_MENU_TITLE_MAX - 1 - 3;
+    if (n >= cap) {
+        n = cap - 1 - 3;
         cut = 1;
     }
     for (i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
-        it->title[i] = (c >= 0x20 && c <= 0x7e) ? (char)c : '?';
+        dst[i] = (c >= 0x20 && c <= 0x7e) ? (char)c : '?';
     }
     if (cut) {
-        it->title[n++] = '.';
-        it->title[n++] = '.';
-        it->title[n++] = '.';
+        dst[n++] = '.';
+        dst[n++] = '.';
+        dst[n++] = '.';
     }
-    it->title[n] = '\0';
+    dst[n] = '\0';
+}
+
+static void set_title(ts_menu_item *it, const char *s)
+{
+    clean_cut(it->title, sizeof it->title, s);
 }
 
 static ts_menu_item *add(ts_menu *m, const char *title, ts_menu_action act, const char *arg, int enabled, int in_devices)
 {
     ts_menu_item *it;
-    if (m->nitems >= TS_MENU_MAX_ITEMS) return NULL;   /* cannot happen: 256 peers + at most 10 */
+    if (m->nitems >= TS_MENU_MAX_ITEMS) return NULL;   /* cannot happen: 256 peers + at most 11 */
     it = &m->items[m->nitems++];
     set_title(it, title);
     it->action = act;
@@ -110,6 +115,14 @@ static void set_status(ts_menu *m, const char *line, ts_menu_icon icon)
     add(m, line, TS_ACT_NONE, NULL, 0, 0);
 }
 
+/* A NONE line whose title may be cut: the whole text goes in arg too (cleaned
+ * the same way), for the tooltip. */
+static void add_text(ts_menu *m, const char *text)
+{
+    ts_menu_item *it = add(m, text, TS_ACT_NONE, NULL, 0, 0);
+    if (it) clean_cut(it->arg, sizeof it->arg, text);
+}
+
 /* ---- the build ---- */
 
 void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r)
@@ -129,7 +142,8 @@ void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r)
         set_status(m, "Needs an administrator account", TS_ICON_ERROR);
     } else if (res == TS_REQ_OK && r != NULL && !r->ok && r->error[0]) {
         snprintf(tmp, sizeof tmp, "tsppcd error: %s", r->error);
-        set_status(m, tmp, TS_ICON_ERROR);
+        m->icon = TS_ICON_ERROR;
+        add_text(m, tmp);
     } else if (res != TS_REQ_OK || r == NULL || !r->ok) {
         set_status(m, "tsppcd is not responding", TS_ICON_ERROR);
     } else {
@@ -144,15 +158,18 @@ void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r)
         else if (is(r->state, "NEED_LOGIN")) set_status(m, "Login needed", TS_ICON_ATTENTION);
         else if (is(r->state, "AWAIT_APPROVAL")) set_status(m, "Waiting for approval in the admin console", TS_ICON_ATTENTION);
         else if (is(r->state, "FAILED")) set_status(m, "Stopped: see tsppc status", TS_ICON_ERROR);
-        else if (is(r->state, "CONNECTING") || (is(r->state, "BACKOFF") && wanted_up)) set_status(m, "Connecting...", TS_ICON_BUSY);
+        /* wanted down: a key fetch still running (CONNECTING/BACKOFF) is not shown */
+        else if (!wanted_up && (is(r->state, "CONNECTING") || is(r->state, "BACKOFF")))
+            set_status(m, login_no ? "Not logged in" : "Disconnected", TS_ICON_OFF);
+        else if (is(r->state, "CONNECTING") || is(r->state, "BACKOFF")) set_status(m, "Connecting...", TS_ICON_BUSY);
         else if (is(r->state, "IDLE") && login_no) set_status(m, "Not logged in", TS_ICON_OFF);
         else if (is(r->state, "IDLE") && login_yes && !wanted_up) set_status(m, "Disconnected", TS_ICON_OFF);
         else if (wanted_up) set_status(m, "Connecting...", TS_ICON_BUSY);
         else set_status(m, "Disconnected", TS_ICON_OFF);
 
-        if (r->problem[0]) add(m, r->problem, TS_ACT_NONE, NULL, 0, 0);
+        if (r->problem[0]) add_text(m, r->problem);
 
-        if (r->have_ipv4 && wanted_up) {  /* after Disconnect the daemon still reports the last map */
+        if (r->have_ipv4 && wanted_up) {  /* the map is stale while wanted is down (the daemon leaves it out too) */
             fmt_ip(ip, sizeof ip, r->ipv4);
             short_name(r->self, &sn, &snn);
             snprintf(tmp, sizeof tmp, " (%s)", ip);
@@ -160,8 +177,15 @@ void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r)
         }
 
         /* one of Connect or Disconnect, never both, and neither while leaving */
-        if (!leaving && wanted_up) add(m, "Disconnect", TS_ACT_DOWN, NULL, 1, 0);
-        else if (!leaving) add(m, "Connect", TS_ACT_UP, NULL, 1, 0);
+        if (!leaving && wanted_up) {
+            add(m, "Disconnect", TS_ACT_DOWN, NULL, 1, 0);
+            /* Stuck until the next up: key expired or removed (NEED_LOGIN with
+             * no url), or FAILED. */
+            if (is(r->state, "FAILED")) add(m, "Try Again", TS_ACT_UP, NULL, 1, 0);
+            else if (is(r->state, "NEED_LOGIN") && !r->url[0]) add(m, "Log In Again...", TS_ACT_UP, NULL, 1, 0);
+        } else if (!leaving) {
+            add(m, "Connect", TS_ACT_UP, NULL, 1, 0);
+        }
         if (r->url[0]) add(m, "Log In...", TS_ACT_LOGIN, r->url, 1, 0);
 
         if (wanted_up && r->npeers > 0 && r->peers) {
@@ -189,4 +213,13 @@ void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r)
         if (login_yes && !leaving) add(m, "Log Out...", TS_ACT_LOGOUT, NULL, 1, 0);
     }
     add(m, "Quit tsppc", TS_ACT_QUIT, NULL, 1, 0);
+}
+
+int ts_menu_moving(ts_req_result res, const ts_reply *r)
+{
+    if (res != TS_REQ_OK || r == NULL || !r->ok) return 0;
+    if (is(r->login, "leaving")) return 1;
+    if (!is(r->wanted, "up")) return 0;
+    return is(r->state, "CONNECTING") || is(r->state, "BACKOFF") || is(r->state, "NEED_LOGIN") ||
+           is(r->state, "AWAIT_APPROVAL");
 }

@@ -14,7 +14,10 @@ typedef enum { TS_ACT_NONE, TS_ACT_COPY, TS_ACT_UP, TS_ACT_DOWN, TS_ACT_LOGIN, T
 
 #define TS_MENU_TITLE_MAX 64     /* bytes, NUL included; longer titles end in "..." */
 
-/* title holds only 0x20-0x7e. arg is the ip for COPY and the url for LOGIN, else "".
+/* title holds only 0x20-0x7e. arg is the ip for COPY and the url for LOGIN.
+ * For the problem line and a "tsppcd error: ..." status line (action NONE,
+ * whose title may be cut), arg holds the whole text, cleaned like a title, for
+ * a tooltip. Otherwise arg is "".
  * in_devices is 1 for the items of the Devices submenu (the peers and the
  * "More devices not shown" line); the "Devices (<n> online)" parent item
  * itself has in_devices 0 and the submenu items follow it. */
@@ -41,9 +44,19 @@ typedef struct {
  * combination the tables do not name shows "Connecting..." (icon BUSY) when
  * wanted is up, else "Disconnected" (icon OFF); login "leaving" shows
  * "Logging out..." (BUSY) with no Connect, Disconnect or Log Out items.
+ * When wanted is not up, CONNECTING and BACKOFF (a control key fetch, which
+ * runs whatever is wanted) show "Not logged in" for login "no", else
+ * "Disconnected" (icon OFF).
  * Disconnect shows when wanted is up, else Connect (never both, neither while
- * leaving). When wanted is not up the "This Mac" item and the Devices submenu
- * are hidden, because the daemon still reports its last map after Disconnect. */
+ * leaving). With Disconnect, state FAILED adds "Try Again" and NEED_LOGIN with
+ * no url (key expired or removed) adds "Log In Again..." (both TS_ACT_UP): the
+ * session waits for an up there. When wanted is not up the "This Mac" item and
+ * the Devices submenu are hidden (the daemon leaves its map out too). */
 void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r);
+
+/* 1 when the state is moving and the app should keep polling quickly: login
+ * "leaving", or wanted up with CONNECTING, BACKOFF, NEED_LOGIN or
+ * AWAIT_APPROVAL. 0 otherwise, including any res other than TS_REQ_OK. */
+int ts_menu_moving(ts_req_result res, const ts_reply *r);
 
 #endif

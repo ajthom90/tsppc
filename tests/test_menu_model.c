@@ -101,7 +101,10 @@ static void test_total(void)
     state_case("unknown state up", "WEIRD", "yes", "up", "Connecting...", TS_ICON_BUSY);
     state_case("unknown state down", "WEIRD", "yes", "down", "Disconnected", TS_ICON_OFF);
     state_case("empty everything", "", "", "", "Disconnected", TS_ICON_OFF);
-    state_case("connecting wanted down", "CONNECTING", "yes", "down", "Connecting...", TS_ICON_BUSY);
+    state_case("connecting wanted down", "CONNECTING", "yes", "down", "Disconnected", TS_ICON_OFF);
+    state_case("connecting wanted down, no login", "CONNECTING", "no", "down", "Not logged in", TS_ICON_OFF);
+    state_case("backoff wanted down, no login", "BACKOFF", "no", "down", "Not logged in", TS_ICON_OFF);
+    state_case("backoff wanted unknown", "BACKOFF", "yes", "", "Disconnected", TS_ICON_OFF);
     state_case("leaving idle", "IDLE", "leaving", "down", "Logging out...", TS_ICON_BUSY);
     state_case("leaving running", "RUNNING", "leaving", "up", "Logging out...", TS_ICON_BUSY);
     reset("RUNNING", "leaving", "up");
@@ -128,7 +131,8 @@ static void test_items_table(void)
     t_true("yes+down: Connect", find("Connect") >= 0 && g_m.items[find("Connect")].action == TS_ACT_UP && find("Disconnect") < 0);
     reset("NEED_LOGIN", "no", "up");
     build();
-    t_true("NEED_LOGIN no+up: Disconnect only", find("Connect") < 0 && find("Disconnect") >= 0 && find("Log Out...") < 0);
+    t_true("NEED_LOGIN no+up, no url: Disconnect and Log In Again...", find("Connect") < 0 && find("Disconnect") >= 0 &&
+           find("Log In Again...") >= 0 && find("Log Out...") < 0);
     reset("IDLE", "no", "down");
     build();
     t_true("login no wanted down: Connect only", find("Connect") >= 0 && find("Disconnect") < 0 && find("Log Out...") < 0);
@@ -187,6 +191,104 @@ static void test_down_hides(void)
     snprintf(g_r.wanted, sizeof g_r.wanted, "up");
     build();
     t_true("up: This Mac and devices shown", find("This Mac: laptop (100.64.0.1)") >= 0 && find("Devices (1 online)") >= 0);
+}
+
+/* Stuck states that wait for an up get an item that sends one. */
+static void test_retry(void)
+{
+    int d, i;
+    reset("NEED_LOGIN", "yes", "up");
+    snprintf(g_r.problem, sizeof g_r.problem, "node key expired, run `tsppc up`");
+    build();
+    d = find("Disconnect");
+    i = find("Log In Again...");
+    t_true("expired: Log In Again... after Disconnect", d >= 0 && i == d + 1 && g_m.items[i].action == TS_ACT_UP &&
+           g_m.items[i].enabled && g_m.items[i].arg[0] == '\0');
+    t_true("expired: no Connect, no Log In..., one up item", find("Connect") < 0 && find("Log In...") < 0 &&
+           find_act(TS_ACT_UP) == i && find("Try Again") < 0);
+
+    reset("FAILED", "yes", "up");
+    build();
+    d = find("Disconnect");
+    i = find("Try Again");
+    t_true("failed: Try Again after Disconnect", d >= 0 && i == d + 1 && g_m.items[i].action == TS_ACT_UP && g_m.items[i].enabled);
+    t_true("failed: no Log In Again...", find("Log In Again...") < 0 && find("Connect") < 0);
+
+    reset("NEED_LOGIN", "no", "up");
+    snprintf(g_r.url, sizeof g_r.url, "https://login.example.test/a/abc123");
+    build();
+    t_true("url: Log In... and no extra up item", find("Log In...") >= 0 && find_act(TS_ACT_UP) < 0 &&
+           find("Log In Again...") < 0 && find("Try Again") < 0 && find("Disconnect") >= 0);
+
+    reset("FAILED", "yes", "down");
+    build();
+    t_true("failed, wanted down: Connect only", find("Connect") >= 0 && find("Try Again") < 0 && find("Disconnect") < 0);
+    reset("NEED_LOGIN", "leaving", "up");
+    build();
+    t_true("leaving: no up item", find_act(TS_ACT_UP) < 0);
+    reset("RUNNING", "yes", "up");
+    build();
+    t_true("running: no up item", find_act(TS_ACT_UP) < 0);
+}
+
+/* The problem line and an error status line carry their whole text for a tooltip. */
+static void test_tooltips(void)
+{
+    char longp[300];
+    size_t i;
+    for (i = 0; i < sizeof longp - 1; i++) longp[i] = (char)('a' + i % 26);
+    longp[sizeof longp - 1] = '\0';
+    longp[5] = '\t';
+    reset("BACKOFF", "yes", "up");
+    snprintf(g_r.problem, sizeof g_r.problem, "%s", longp);
+    build();
+    longp[5] = '?';
+    t_true("problem: title cut", strlen(g_m.items[1].title) == TS_MENU_TITLE_MAX - 1 &&
+           strcmp(g_m.items[1].title + TS_MENU_TITLE_MAX - 4, "...") == 0 && g_m.items[1].action == TS_ACT_NONE);
+    t_true("problem: whole cleaned text in arg", strcmp(g_m.items[1].arg, longp) == 0);
+    t_true("plain status line: no tooltip", g_m.items[0].arg[0] == '\0');
+
+    reset("BACKOFF", "yes", "up");
+    snprintf(g_r.problem, sizeof g_r.problem, "short");
+    build();
+    t_true("short problem: tooltip too", strcmp(g_m.items[1].title, "short") == 0 && strcmp(g_m.items[1].arg, "short") == 0);
+
+    reset("RUNNING", "yes", "up");
+    g_r.ok = 0;
+    snprintf(g_r.error, sizeof g_r.error, "%s", longp);
+    build();
+    t_true("error status: title cut, whole text in arg", strlen(g_m.items[0].title) == TS_MENU_TITLE_MAX - 1 &&
+           strncmp(g_m.items[0].arg, "tsppcd error: ", 14) == 0 && strcmp(g_m.items[0].arg + 14, longp) == 0);
+
+    memset(g_r.error, 'e', sizeof g_r.error - 1);
+    g_r.error[sizeof g_r.error - 1] = '\0';
+    build();
+    t_true("error status: over-long text cut in arg too", strlen(g_m.items[0].arg) == sizeof g_m.items[0].arg - 1 &&
+           strcmp(g_m.items[0].arg + sizeof g_m.items[0].arg - 4, "...") == 0);
+}
+
+static void moving_case(const char *name, const char *state, const char *login, const char *wanted, int want)
+{
+    reset(state, login, wanted);
+    t_true(name, ts_menu_moving(TS_REQ_OK, &g_r) == want);
+}
+
+static void test_moving(void)
+{
+    moving_case("moving: connecting up", "CONNECTING", "yes", "up", 1);
+    moving_case("moving: backoff up", "BACKOFF", "yes", "up", 1);
+    moving_case("moving: need login up", "NEED_LOGIN", "no", "up", 1);
+    moving_case("moving: await approval up", "AWAIT_APPROVAL", "yes", "up", 1);
+    moving_case("moving: leaving", "IDLE", "leaving", "down", 1);
+    moving_case("still: running", "RUNNING", "yes", "up", 0);
+    moving_case("still: connecting down", "CONNECTING", "yes", "down", 0);
+    moving_case("still: backoff down", "BACKOFF", "no", "down", 0);
+    moving_case("still: idle down", "IDLE", "yes", "down", 0);
+    moving_case("still: failed up", "FAILED", "yes", "up", 0);
+    reset("CONNECTING", "yes", "up");
+    t_true("still: not ok", ts_menu_moving(TS_REQ_TIMEOUT, &g_r) == 0 && ts_menu_moving(TS_REQ_OK, NULL) == 0);
+    g_r.ok = 0;
+    t_true("still: error reply", ts_menu_moving(TS_REQ_OK, &g_r) == 0);
 }
 
 static void test_devices(void)
@@ -324,6 +426,9 @@ void test_menu_model(void)
     test_total();
     test_items_table();
     test_down_hides();
+    test_retry();
+    test_tooltips();
+    test_moving();
     test_devices();
     test_names();
     test_capacity();

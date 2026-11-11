@@ -21,10 +21,7 @@
     ts_reply *reply;
     ts_reply_peer *peers;          /* TS_MAX_PEERS */
     char *buf;                     /* TS_IPC_RESP_MAX: this reply */
-    char *prevBuf;                 /* TS_IPC_RESP_MAX: the last poll's reply */
-    size_t prevLen;
-    ts_req_result prevRes;
-    int sameCount;                 /* identical poll replies in a row */
+    int sameCount;                 /* identical menus in a row */
 }
 
 - (void)menuAction:(id)sender;

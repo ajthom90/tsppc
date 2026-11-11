@@ -35,8 +35,9 @@ typedef struct {
  * malformed lines are skipped; values are cleaned with ts_ipc_clean. For a key
  * that occurs more than once, the first occurrence wins (peer lines add). A
  * peer line needs a valid a.b.c.d or "-", "online" or "offline", and a space
- * after the status (the name after it may be empty), or it is skipped. Returns 0, or -1 if the reply holds no
- * "ok" and no "error" line. */
+ * after the status (the name after it may be empty), or it is skipped. With
+ * peers NULL no peer is stored: each valid peer line sets truncated instead.
+ * Returns 0, or -1 if the reply holds no "ok" and no "error" line. */
 int ts_reply_parse(ts_reply *r, ts_reply_peer *peers, const char *buf, size_t len);
 
 typedef enum { TS_REQ_OK = 0, TS_REQ_NO_DAEMON, TS_REQ_DENIED, TS_REQ_TIMEOUT, TS_REQ_FAILED } ts_req_result;

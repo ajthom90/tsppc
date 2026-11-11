@@ -366,7 +366,9 @@ static int log_has_key(const char *logpath, const uint8_t *const *keys, int n)
 #define SELFNAME "self.example.test"
 #define HA "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 #define MAP_JSON "{\"Node\":{\"ID\":1,\"Name\":\"" SELFNAME ".\",\"Key\":\"nodekey:" HA "\"," \
-    "\"Addresses\":[\"100.64.0.1/32\"],\"MachineAuthorized\":true},\"Peers\":[]}"
+    "\"Addresses\":[\"100.64.0.1/32\"],\"MachineAuthorized\":true},\"Peers\":[{\"ID\":2,\"Name\":\"peer.example.test.\"," \
+    "\"Key\":\"nodekey:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\"," \
+    "\"Addresses\":[\"100.64.0.2/32\"],\"Online\":true,\"MachineAuthorized\":true}]}"
 
 static void fk_handler(fake *f, fk_req *r)
 {
@@ -503,6 +505,8 @@ static void test_daemon_down(void)
     t_true("down: running, wanted up", strstr(out, "\nwanted up\n") != NULL);
     t_true("down: status has the self name", strstr(out, "\nself " SELFNAME ".\n") != NULL);
     t_true("down: no url while running", strstr(out, "\nurl ") == NULL);
+    t_true("down: running shows ip and peer", strstr(out, "\nip 100.64.0.1\n") != NULL &&
+           strstr(out, "\npeer 100.64.0.2 online peer.example.test.\n") != NULL);
 
     rc = run_cli("down", out, sizeof out);
     t_true("down: the command says so and exits 0", rc == 0 && strstr(out, "Disconnected. Run tsppc up to connect again.") != NULL);
@@ -511,6 +515,11 @@ static void test_daemon_down(void)
     rc = run_cli("status", out, sizeof out);
     t_true("down: tsppc status says disconnected", rc == 0 && strstr(out, "Disconnected (tsppc up to connect)") != NULL);
     t_true("down: saved as down", load_state(statedir, &after) == 0 && after.have_login && after.down);
+    t_true("down: no stale self, ip or peer", !strstr(out, "\nself ") && !strstr(out, "\nip ") && !strstr(out, "\npeer "));
+    rc = run_cli("status", out, sizeof out);
+    t_true("down: tsppc status shows no address or peers", rc == 0 && !strstr(out, "Tailnet IP") && !strstr(out, "Peers:"));
+    rc = run_cli("ip", out, sizeof out);
+    t_true("down: tsppc ip has no address", rc == 1 && strstr(out, "no tailnet IP") != NULL && !strstr(out, "100.64.0.1"));
 
     kill(pid, SIGTERM);
     t_true("down: daemon exits", wait_exit(pid, 60000) == 0);
@@ -557,6 +566,60 @@ static void test_daemon_down(void)
     ts_wipe(&after, sizeof after);
     unsetenv("TSPPC_SOCKET");
     remove_test_files(statedir, sock, logpath, countpath);
+}
+
+/* tsppc against a fake daemon that answers every request with reply. */
+static int cli_against(const char *sock, const char *reply, const char *arg, char *out, size_t cap)
+{
+    struct sockaddr_un a;
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0), rc, st;
+    pid_t srv;
+    if (lfd < 0) return -1;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", sock);
+    unlink(sock);
+    if (bind(lfd, (struct sockaddr *)&a, sizeof a) != 0 || listen(lfd, 4) != 0) {
+        close(lfd);
+        return -1;
+    }
+    srv = fork();
+    if (srv == 0) {
+        for (;;) {
+            char line[128];
+            int c = accept(lfd, NULL, NULL);
+            if (c < 0) _exit(0);
+            if (read(c, line, sizeof line) < 0) {}
+            if (write(c, reply, strlen(reply)) < 0) {}
+            close(c);
+        }
+    }
+    close(lfd);
+    rc = run_cli(arg, out, cap);
+    kill(srv, SIGKILL);
+    waitpid(srv, &st, 0);
+    unlink(sock);
+    return rc;
+}
+
+static void test_cli_replies(void)
+{
+    char sock[128], out[1024];
+    int rc;
+    if (access(TS_BIN_DIR "/tsppc", X_OK) != 0) {
+        printf("SKIP: CLI reply tests (no " TS_BIN_DIR "/tsppc here)\n");
+        return;
+    }
+    snprintf(sock, sizeof sock, "/tmp/tsppc-c.%d", (int)getpid());
+    setenv("TSPPC_SOCKET", sock, 1);
+    rc = cli_against(sock, "error \n", "status", out, sizeof out);
+    t_true("cli: an empty error says the reply was unexpected", rc == 1 &&
+           strcmp(out, "tsppc: unexpected reply from tsppcd\n") == 0);
+    rc = cli_against(sock, "error\n", "down", out, sizeof out);
+    t_true("cli: an error key alone, the same", rc == 1 && strcmp(out, "tsppc: unexpected reply from tsppcd\n") == 0);
+    rc = cli_against(sock, "error busy now\n", "ip", out, sizeof out);
+    t_true("cli: an error with text prints it", rc == 1 && strcmp(out, "tsppc: busy now\n") == 0);
+    unsetenv("TSPPC_SOCKET");
 }
 
 static void test_daemon(void)
@@ -609,6 +672,36 @@ static void test_daemon(void)
     t_true("daemon: ip without an address fails", rc == 1 && strstr(out, "no tailnet IP"));
     rc = run_cli("bogus", out, sizeof out);
     t_true("daemon: CLI rejects an unknown command", rc == 2);
+
+    /* down and up before the session (no control key): each is saved at once,
+     * so a restart before the key is in keeps it. */
+    rc = run_cli("down", out, sizeof out);
+    t_true("daemon: down before the key exits 0", rc == 0 && strstr(out, "Disconnected.") != NULL);
+    t_true("daemon: down before the key is saved", load_state(statedir, &mid) == 0 && mid.have_login && mid.down);
+    raw_request(sock, "status\n", 7, out, sizeof out);
+    t_true("daemon: down before the key: wanted down", strstr(out, "\nwanted down\n") != NULL);
+    if (geteuid() != 0) {
+        chmod(statedir, 0500);
+        raw_request(sock, "up\n", 3, out, sizeof out);
+        chmod(statedir, 0700);
+        t_true("daemon: up before the key, failed save: an error line",
+               strncmp(out, "error ", 6) == 0 && strstr(out, "up failed") && !strstr(out, "\nstate "));
+        t_true("daemon: failed up saved nothing", load_state(statedir, &mid) == 0 && mid.have_login && mid.down);
+        raw_request(sock, "status\n", 7, out, sizeof out);
+        t_true("daemon: failed up left it down", strstr(out, "\nwanted down\n") != NULL);
+    } else {
+        printf("SKIP: failed-save up before the key (root)\n");
+    }
+    raw_request(sock, "up\n", 3, out, sizeof out);
+    t_true("daemon: up before the key accepted, wanted up", strncmp(out, "ok\n", 3) == 0 && strstr(out, "\nwanted up\n"));
+    t_true("daemon: up before the key cleared the saved down", load_state(statedir, &mid) == 0 && mid.have_login &&
+           !mid.down && memcmp(mid.node_priv, saved.node_priv, 32) == 0);
+    kill(pid, SIGTERM);
+    t_true("daemon: exits for the restart after up", wait_exit(pid, 60000) == 0);
+    pid = start_daemon(statedir, sock, logpath, NULL);
+    t_true("daemon: restarts after up", wait_socket(sock, pid, 120000) == 0);
+    t_true("daemon: restart after up before the key: wanted up",
+           wait_status(sock, "\nlogin yes\n", out, sizeof out, 60000) && strstr(out, "\nwanted up\n") != NULL);
 
     /* Idle clients fill every slot; they must not block the loop, and the
      * next client is turned away rather than queued. */
@@ -740,6 +833,7 @@ void test_ipc(void)
     test_clean();
     test_split();
     test_listen();
+    test_cli_replies();
     test_daemon();
     test_daemon_down();
 }

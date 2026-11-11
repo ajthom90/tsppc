@@ -817,6 +817,35 @@ static void test_sess_up_save_fails(void)
     end();
 }
 
+/* A failed up save does not hide the state's own problem: BACKOFF's reason
+ * shows first, and the save text again once the state has none. */
+static void test_sess_problem_order(void)
+{
+    char st[512];
+    begin_running();
+    ts_sess_down(S);
+    fk_pump(&F);
+    F.save_fail = 1;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("problem order: running with the up save text",
+           ts_sess_get_state(S) == TS_SESS_RUNNING && has(ts_sess_problem(S), "restart will stay disconnected"));
+    fk_goaway(&F, fk_last(&F, "/machine/map")->sid, 0);
+    fk_pump(&F);
+    t_true("problem order: BACKOFF shows its reason, not the save text", ts_sess_get_state(S) == TS_SESS_BACKOFF &&
+           ts_sess_problem(S)[0] != 0 && !has(ts_sess_problem(S), "could not be saved"));
+    ts_sess_status(S, st, sizeof st);
+    t_true("problem order: status still has the save text", has(st, "restart will stay disconnected"));
+    {
+        int64_t t = F.now;
+        while (ts_sess_get_state(S) != TS_SESS_RUNNING && F.now - t < 5000) fk_advance(&F, 10, 10);
+    }
+    t_true("problem order: RUNNING again shows the save text", ts_sess_get_state(S) == TS_SESS_RUNNING &&
+           has(ts_sess_problem(S), "restart will stay disconnected"));
+    F.save_fail = 0;
+    end();
+}
+
 /* Logout from down: down is cleared with the login, starting with the intent
  * save, and every saved image is a valid state file. */
 static void test_sess_logout_clears_down(void)
@@ -1720,6 +1749,7 @@ void test_session(void)
     test_sess_up_after_down();
     test_sess_down_save_fails();
     test_sess_up_save_fails();
+    test_sess_problem_order();
     test_sess_logout_clears_down();
     test_sess_down_edges();
     test_followup_expired_loop();

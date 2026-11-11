@@ -1338,11 +1338,9 @@ const char *ts_sess_login_url(const ts_sess *s)
     return s->auth_url;
 }
 
-const char *ts_sess_problem(const ts_sess *s)
+/* The state's own problem; "" when it has none. */
+static const char *state_problem(const ts_sess *s)
 {
-    if (s->logout_failed) return LOGOUT_SAVE_TEXT;
-    if (s->down_failed) return DOWN_SAVE_TEXT;
-    if (s->up_save_failed) return UP_SAVE_TEXT;
     switch (s->state) {
     case TS_SESS_BACKOFF:
     case TS_SESS_FAILED:
@@ -1358,6 +1356,19 @@ const char *ts_sess_problem(const ts_sess *s)
     default:
         return s->login_save_failed ? LOGIN_SAVE_TEXT : "";
     }
+}
+
+/* The state's problem first (an expired key or a failure says what to do);
+ * a failed logout, down or up save shows when the state has none. The status
+ * line holds both. */
+const char *ts_sess_problem(const ts_sess *s)
+{
+    const char *p = state_problem(s);
+    if (p[0]) return p;
+    if (s->logout_failed) return LOGOUT_SAVE_TEXT;
+    if (s->down_failed) return DOWN_SAVE_TEXT;
+    if (s->up_save_failed) return UP_SAVE_TEXT;
+    return "";
 }
 
 int ts_sess_want_read(const ts_sess *s)

@@ -94,7 +94,8 @@ static int request(ts_ipc_cmd cmd)
 static int check_ok(void)
 {
     if (R.ok) return 0;
-    fprintf(stderr, "tsppc: %s\n", R.error);
+    if (R.error[0]) fprintf(stderr, "tsppc: %s\n", R.error);
+    else fprintf(stderr, "tsppc: unexpected reply from tsppcd\n");   /* an "error" line with no text */
     return -1;
 }
 

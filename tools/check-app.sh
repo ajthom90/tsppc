@@ -1,6 +1,8 @@
 #!/bin/sh
 # Check the built menu bar app: no "Tailscale" anywhere in the binary or its
-# Info.plist, a PowerPC binary, only the system libraries it needs, and no
+# Info.plist, no test hooks (no TSPPC_ string, no getenv: it is built from the
+# release socket code, as tools/check-release.sh checks for tsppc), a PowerPC
+# binary, only the system libraries it needs, and no
 # name-lookup or network API among its undefined symbols (resolver calls
 # included). Its one connection
 # is the daemon's Unix socket, so socket, connect, read, write, select, close
@@ -27,6 +29,9 @@ trap 'rm -f "$tmp"' EXIT
 for f in "$BIN" "$PLIST"; do
     if LC_ALL=C grep -a -i -q tailscale "$f"; then bad "$f contains \"Tailscale\""; fi
 done
+
+# No test hooks: an environment override would let any user redirect the app.
+if LC_ALL=C grep -a -q TSPPC_ "$BIN"; then bad "$BIN contains a TSPPC_ string (a test hook)"; fi
 
 # The architecture: a thin ppc binary.
 lipo -info "$BIN" >"$tmp" 2>&1 || die "lipo failed on $BIN"
@@ -57,7 +62,7 @@ nm -u "$BIN" >"$tmp" 2>/dev/null || die "nm -u failed on $BIN"
 for s in socket connect; do
     grep -q "^_$s\$" "$tmp" || die "no _$s among the undefined symbols of $BIN (wrong file?)"
 done
-hits=$(grep -E '^_(getaddrinfo|gethostbyname[0-9_a-z]*|gethostbyaddr|getnameinfo|getipnodebyname|getipnodebyaddr|res_[0-9_a-z]*|sendto|recvfrom|bind|listen|accept)(\$.*)?$|NSURL|CFNetwork|CFSocket|CFStream' "$tmp")
+hits=$(grep -E '^_(getenv|getaddrinfo|gethostbyname[0-9_a-z]*|gethostbyaddr|getnameinfo|getipnodebyname|getipnodebyaddr|res_[0-9_a-z]*|sendto|recvfrom|bind|listen|accept)(\$.*)?$|NSURL|CFNetwork|CFSocket|CFStream' "$tmp")
 for s in $hits; do bad "$BIN uses $s"; done
 
 if [ "$fail" != 0 ]; then exit 1; fi
