@@ -30,7 +30,7 @@ static void set_title(ts_menu_item *it, const char *s)
 static ts_menu_item *add(ts_menu *m, const char *title, ts_menu_action act, const char *arg, int enabled, int in_devices)
 {
     ts_menu_item *it;
-    if (m->nitems >= TS_MENU_MAX_ITEMS) return NULL;   /* cannot happen: 256 peers + at most 11 */
+    if (m->nitems >= TS_MENU_MAX_ITEMS) return NULL;   /* cannot happen: 256 peers + at most 10 */
     it = &m->items[m->nitems++];
     set_title(it, title);
     it->action = act;
@@ -44,6 +44,22 @@ static ts_menu_item *add(ts_menu *m, const char *title, ts_menu_action act, cons
     it->enabled = enabled;
     it->in_devices = in_devices;
     return it;
+}
+
+/* prefix + name + suffix as one item. When it would not fit, only the name is
+ * cut (ending in "..."), so the suffix (the ip) stays visible. */
+static ts_menu_item *add_named(ts_menu *m, const char *prefix, const char *name, size_t nlen, const char *suffix,
+                               ts_menu_action act, const char *arg, int enabled, int in_devices)
+{
+    char tmp[TS_MENU_TITLE_MAX + 8 + TS_NODE_NAME_MAX];
+    size_t fixed = strlen(prefix) + strlen(suffix), room = TS_MENU_TITLE_MAX - 1;
+    int cut = 0;
+    if (fixed + nlen > room) {
+        nlen = (room > fixed + 3) ? room - fixed - 3 : 0;
+        cut = 1;
+    }
+    snprintf(tmp, sizeof tmp, "%s%.*s%s%s", prefix, (int)nlen, name, cut ? "..." : "", suffix);
+    return add(m, tmp, act, arg, enabled, in_devices);
 }
 
 static void fmt_ip(char *out, size_t cap, unsigned long ip)
@@ -82,7 +98,7 @@ static int short_cmp(const char *a, const char *b)
 /* Order: online first, then short name. Ties are not ordered (stable sort keeps reply order). */
 static int peer_before(const ts_reply_peer *a, const ts_reply_peer *b)
 {
-    if (a->online != b->online) return a->online ? 1 : 0;
+    if (!a->online != !b->online) return a->online ? 1 : 0;
     return short_cmp(a->name, b->name) < 0;
 }
 
@@ -111,6 +127,9 @@ void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r)
         set_status(m, "tsppcd is not running", TS_ICON_ERROR);
     } else if (res == TS_REQ_DENIED) {
         set_status(m, "Needs an administrator account", TS_ICON_ERROR);
+    } else if (res == TS_REQ_OK && r != NULL && !r->ok && r->error[0]) {
+        snprintf(tmp, sizeof tmp, "tsppcd error: %s", r->error);
+        set_status(m, tmp, TS_ICON_ERROR);
     } else if (res != TS_REQ_OK || r == NULL || !r->ok) {
         set_status(m, "tsppcd is not responding", TS_ICON_ERROR);
     } else {
@@ -136,8 +155,8 @@ void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r)
         if (r->have_ipv4) {
             fmt_ip(ip, sizeof ip, r->ipv4);
             short_name(r->self, &sn, &snn);
-            snprintf(tmp, sizeof tmp, "This Mac: %.*s (%s)", (int)snn, sn, ip);
-            add(m, tmp, TS_ACT_COPY, ip, 1, 0);
+            snprintf(tmp, sizeof tmp, " (%s)", ip);
+            add_named(m, "This Mac: ", sn, snn, tmp, TS_ACT_COPY, ip, 1, 0);
         }
 
         if (!leaving && ((login_yes && !wanted_up) || login_no)) add(m, "Connect", TS_ACT_UP, NULL, 1, 0);
@@ -160,8 +179,8 @@ void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r)
                 const ts_reply_peer *p = &r->peers[order[i]];
                 short_name(p->name, &sn, &snn);
                 if (p->have_ipv4) fmt_ip(ip, sizeof ip, p->ipv4);
-                snprintf(tmp, sizeof tmp, "%.*s  %s%s", (int)snn, sn, p->have_ipv4 ? ip : "no address", p->online ? "" : " (offline)");
-                add(m, tmp, p->have_ipv4 ? TS_ACT_COPY : TS_ACT_NONE, p->have_ipv4 ? ip : NULL, p->have_ipv4, 1);
+                snprintf(tmp, sizeof tmp, "  %s%s", p->have_ipv4 ? ip : "no address", p->online ? "" : " (offline)");
+                add_named(m, "", sn, snn, tmp, p->have_ipv4 ? TS_ACT_COPY : TS_ACT_NONE, p->have_ipv4 ? ip : NULL, p->have_ipv4, 1);
             }
             if (r->truncated) add(m, "More devices not shown", TS_ACT_NONE, NULL, 0, 1);
         }

@@ -75,6 +75,10 @@ static void test_status_table(void)
     t_true("failed", g_m.nitems == 2 && strcmp(g_m.items[0].title, "tsppcd is not responding") == 0 && g_m.icon == TS_ICON_ERROR);
     reset("RUNNING", "yes", "up");
     g_r.ok = 0;
+    snprintf(g_r.error, sizeof g_r.error, "bad command");
+    ts_menu_build(&g_m, TS_REQ_OK, &g_r);
+    t_true("error reply shows the error", g_m.nitems == 2 && strcmp(g_m.items[0].title, "tsppcd error: bad command") == 0 && g_m.icon == TS_ICON_ERROR);
+    g_r.error[0] = '\0';
     ts_menu_build(&g_m, TS_REQ_OK, &g_r);
     t_true("ok result without ok reply", g_m.nitems == 2 && strcmp(g_m.items[0].title, "tsppcd is not responding") == 0);
     ts_menu_build(&g_m, TS_REQ_OK, NULL);
@@ -223,7 +227,9 @@ static void test_names(void)
     g_r.ipv4 = 0x64400001u;
     build();
     n = strlen(g_m.items[1].title);
-    t_true("long self fits and ends in dots", n == TS_MENU_TITLE_MAX - 1 && strcmp(g_m.items[1].title + n - 3, "...") == 0);
+    t_true("long self: name cut with dots, ip kept", n == TS_MENU_TITLE_MAX - 1 && strncmp(g_m.items[1].title, "This Mac: xxx", 13) == 0 &&
+                                                         strcmp(g_m.items[1].title + n - 19, "... (100.64.0.1)") != 0 && strcmp(g_m.items[1].title + n - 16, "... (100.64.0.1)") == 0);
+    t_true("long self still copies the ip", g_m.items[1].action == TS_ACT_COPY && strcmp(g_m.items[1].arg, "100.64.0.1") == 0);
 
     reset("RUNNING", "yes", "up");
     memset(big, 'y', 300);
@@ -235,7 +241,7 @@ static void test_names(void)
     t_true("long problem cut with dots", n == TS_MENU_TITLE_MAX - 1 && strcmp(g_m.items[1].title + n - 3, "...") == 0);
     p = find("Devices (2 online)");
     n = strlen(g_m.items[p + 2].title);
-    t_true("long device name cut with dots", n == TS_MENU_TITLE_MAX - 1 && strcmp(g_m.items[p + 2].title + n - 3, "...") == 0);
+    t_true("long device name: cut with dots, ip kept", n == TS_MENU_TITLE_MAX - 1 && strcmp(g_m.items[p + 2].title + n - 15, "...  100.64.0.2") == 0);
     {
         size_t i, j;
         int ok = 1;
@@ -246,6 +252,20 @@ static void test_names(void)
     }
     /* stray bytes become '?' */
     t_true("stray bytes replaced", strcmp(g_m.items[p + 1].title, "q?????z  100.64.0.3") == 0);
+
+    /* a realistic 45-byte name keeps its ip, and "(offline)" when offline */
+    reset("RUNNING", "yes", "up");
+    memset(big, 'k', 45);
+    big[45] = '\0';
+    add_peer(big, 1, 1, 0x64400005u);
+    add_peer(big, 0, 1, 0x64400006u);
+    build();
+    p = find("Devices (1 online)");
+    n = strlen(g_m.items[p + 1].title);
+    t_true("45-byte online name: whole name and ip kept", n == 45 + 2 + 10 && strcmp(g_m.items[p + 1].title + n - 12, "  100.64.0.5") == 0);
+    n = strlen(g_m.items[p + 2].title);
+    t_true("45-byte offline name: ip and (offline) kept", n <= TS_MENU_TITLE_MAX - 1 && strstr(g_m.items[p + 2].title, "...  100.64.0.6 (offline)") != NULL &&
+                                                              strcmp(g_m.items[p + 2].title + n - 10, " (offline)") == 0);
 
     reset("RUNNING", "yes", "up");
     add_peer("ab?cd.example.test.", 1, 1, 0x64400004u);
