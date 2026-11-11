@@ -49,5 +49,22 @@ Both are fixed in `baba749`, with host tests. That build passed `vm-test.sh leop
 - Disconnected: `Disconnected`, `Connect`, `Log Out...`, `Quit tsppc`, with no peers.
 - Connected again: the full menu, `Devices (14 online)`.
 
+## After the final review
+
+The final review's fixes are in commit `b0664b8`. That build passed `vm-test.sh leopard` (1744 checks, check-release, check-ct and check-app). These were installed on both VMs:
+
+| File | SHA-1 |
+|---|---|
+| `tsppcd` | `b2d4bb68117abc30bd12d1907815907d7bc08e17` |
+| `tsppc` | `cd4903133bdd8f2ad013b34fa11dfb586f5ecb60` |
+| `tsppc.app/Contents/MacOS/tsppc` | `645576bc552c19c5952f69667d67f0ad894de91c` |
+
+Results:
+- Both daemons came back `RUNNING` within 2 s, as the same nodes, with no login.
+- **A state change while the menu is open (Tiger).** The menu was open when `tsppc down` ran from SSH. The open menu kept its items, and the icon changed to the hollow ring at once. Closed and reopened, it showed `Disconnected`, `Connect`, `Log Out...` and `Quit tsppc`. After `tsppc up` it was back to `RUNNING`.
+- **Not seen live, covered by host tests.** These states need an expired key, a control failure or a long problem text:
+  - the new `Log In Again...` and `Try Again` items;
+  - the tooltip with the full problem text.
+
 - **Connect and Disconnect at once.** In `Login needed` after a Connect, the menu showed both items. That is the plan's table read literally: "login no" gives Connect, and "wanted up" gives Disconnect. Connect now appears only when the node is not meant to be up.
 - **Stale peers while down.** Right after Disconnect, the menu still listed `This Mac` and `Devices` from the last map until the daemon restarted. They are now hidden while the node is meant to be down.
