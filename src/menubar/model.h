@@ -40,7 +40,10 @@ typedef struct {
  * without "ok") shows only a status line and Quit. A state/login/wanted
  * combination the tables do not name shows "Connecting..." (icon BUSY) when
  * wanted is up, else "Disconnected" (icon OFF); login "leaving" shows
- * "Logging out..." (BUSY) with no Connect, Disconnect or Log Out items. */
+ * "Logging out..." (BUSY) with no Connect, Disconnect or Log Out items.
+ * Disconnect shows when wanted is up, else Connect (never both, neither while
+ * leaving). When wanted is not up the "This Mac" item and the Devices submenu
+ * are hidden, because the daemon still reports its last map after Disconnect. */
 void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r);
 
 #endif

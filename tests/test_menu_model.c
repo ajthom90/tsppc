@@ -128,7 +128,7 @@ static void test_items_table(void)
     t_true("yes+down: Connect", find("Connect") >= 0 && g_m.items[find("Connect")].action == TS_ACT_UP && find("Disconnect") < 0);
     reset("NEED_LOGIN", "no", "up");
     build();
-    t_true("login no: Connect, and Disconnect while wanted up", find("Connect") >= 0 && find("Disconnect") >= 0 && find("Log Out...") < 0);
+    t_true("NEED_LOGIN no+up: Disconnect only", find("Connect") < 0 && find("Disconnect") >= 0 && find("Log Out...") < 0);
     reset("IDLE", "no", "down");
     build();
     t_true("login no wanted down: Connect only", find("Connect") >= 0 && find("Disconnect") < 0 && find("Log Out...") < 0);
@@ -164,6 +164,29 @@ static void test_items_table(void)
     g_r.ipv4 = (100u << 24) | (64u << 16) | 5u;
     build();
     t_true("empty self", find("This Mac: (no name) (100.64.0.5)") >= 0);
+}
+
+static void test_down_hides(void)
+{
+    reset("IDLE", "yes", "down");
+    build();
+    t_true("yes+down: Connect only", find("Connect") >= 0 && find("Disconnect") < 0);
+    reset("IDLE", "yes", "down");
+    g_r.have_ipv4 = 1;
+    g_r.ipv4 = 0x64400001u;
+    snprintf(g_r.self, sizeof g_r.self, "laptop.example.test.");
+    add_peer("a.example.test.", 1, 1, 0x64400002u);
+    g_r.truncated = 1;
+    build();
+    t_true("down: no This Mac", find("This Mac: laptop (100.64.0.1)") < 0 && find_act(TS_ACT_COPY) < 0);
+    t_true("down: no devices submenu", find("Devices (1 online)") < 0 && find("More devices not shown") < 0 && g_m.ndevices_online == 0);
+    t_true("down: only status, Connect, Log Out, Quit", g_m.nitems == 4);
+    g_r.wanted[0] = '\0';
+    build();
+    t_true("wanted unknown: Connect, no stale items", find("Connect") >= 0 && find("Disconnect") < 0 && find_act(TS_ACT_COPY) < 0);
+    snprintf(g_r.wanted, sizeof g_r.wanted, "up");
+    build();
+    t_true("up: This Mac and devices shown", find("This Mac: laptop (100.64.0.1)") >= 0 && find("Devices (1 online)") >= 0);
 }
 
 static void test_devices(void)
@@ -300,6 +323,7 @@ void test_menu_model(void)
     test_status_table();
     test_total();
     test_items_table();
+    test_down_hides();
     test_devices();
     test_names();
     test_capacity();

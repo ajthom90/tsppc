@@ -152,18 +152,19 @@ void ts_menu_build(ts_menu *m, ts_req_result res, const ts_reply *r)
 
         if (r->problem[0]) add(m, r->problem, TS_ACT_NONE, NULL, 0, 0);
 
-        if (r->have_ipv4) {
+        if (r->have_ipv4 && wanted_up) {  /* after Disconnect the daemon still reports the last map */
             fmt_ip(ip, sizeof ip, r->ipv4);
             short_name(r->self, &sn, &snn);
             snprintf(tmp, sizeof tmp, " (%s)", ip);
             add_named(m, "This Mac: ", sn, snn, tmp, TS_ACT_COPY, ip, 1, 0);
         }
 
-        if (!leaving && ((login_yes && !wanted_up) || login_no)) add(m, "Connect", TS_ACT_UP, NULL, 1, 0);
+        /* one of Connect or Disconnect, never both, and neither while leaving */
         if (!leaving && wanted_up) add(m, "Disconnect", TS_ACT_DOWN, NULL, 1, 0);
+        else if (!leaving) add(m, "Connect", TS_ACT_UP, NULL, 1, 0);
         if (r->url[0]) add(m, "Log In...", TS_ACT_LOGIN, r->url, 1, 0);
 
-        if (r->npeers > 0 && r->peers) {
+        if (wanted_up && r->npeers > 0 && r->peers) {
             unsigned short order[TS_MAX_PEERS];
             size_t n = r->npeers, i, j;
             if (n > TS_MAX_PEERS) n = TS_MAX_PEERS;
