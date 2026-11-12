@@ -150,3 +150,14 @@ check.
   carries `ControlTime`, and an expired peer can be kept that much longer.
   Decision: accepted. Control's `Expired` flag still removes the peer, and the
   error only ever keeps a peer longer, never drops a valid one early.
+
+## Peer names (milestone 5)
+
+- Names only: tsppc writes a block of peer names into `/etc/hosts`. There is no 100.100.100.100 resolver, no split DNS and no search domain, so other tailnet DNS records (for example services) do not resolve.
+- Names are in the file only while the tunnel is up. `tsppc down`, logging out, stopping the daemon or the tailnet's `disable-hosts-file-updates` setting removes them.
+- Short names (`<name>` as well as `<name>.<suffix>`) are written only for nodes in this Mac's own tailnet. Machines shared in from another tailnet get their full name only.
+- A short name is left out when two nodes would share it, when it is `localhost`, `broadcasthost`, `wpad`, `isatap` or starts with `ip6-`, or when the owner's own lines in `/etc/hosts` already use it. The full name is still written.
+- A hosts file that is a symbolic link, is not a regular file, is larger than 1 MiB, or has a tsppc begin marker with no end marker is never written; `tsppc status` says why.
+- A block deleted by hand comes back at the next network map change, not on a timer.
+- An edit the owner makes in the moment between tsppc reading the file and replacing it is lost. The window is very short and only exists while a map change is being written.
+- The resolver cache flush (`dscacheutil` on 10.5, `lookupd` on 10.4) runs in the daemon's loop and can hold it for up to 10 s if the command hangs.
