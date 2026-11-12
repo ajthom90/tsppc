@@ -101,8 +101,54 @@ static void test_symlink(void)
     rmdir(dir);
 }
 
+/* <path>.1 is a non-empty directory: the rename never works. The log must
+ * still stay within the cap. */
+static void test_rotation_fails(void)
+{
+    char dir[64] = "/tmp/tsppc-log-XXXXXX", path[128], old[136], inner[160], err[200], line[LINE + 1];
+    int saved = dup(STDERR_FILENO), i, total = (3 * TS_LOG_MAX / 2) / LINE, fd;
+    struct stat sb;
+    off_t big = 0;
+
+    if (!mkdtemp(dir) || saved < 0) {
+        t_true("logfile: failed rotation (setup)", 0);
+        return;
+    }
+    snprintf(path, sizeof path, "%s/log", dir);
+    snprintf(old, sizeof old, "%s.1", path);
+    snprintf(inner, sizeof inner, "%s/x", old);
+    mkdir(old, 0700);
+    fd = open(inner, O_WRONLY | O_CREAT, 0600);
+    if (fd >= 0) close(fd);
+    t_true("logfile: failed rotation: open", ts_logfile_open(path, err, sizeof err) == 0);
+    for (i = 0; i < total; i++) {
+        int n = snprintf(line, sizeof line, "L%d ", i);
+        memset(line + n, 'x', LINE - 1 - n);
+        line[LINE - 1] = '\n';
+        (void)!write(STDERR_FILENO, line, LINE);
+        ts_logfile_check();
+        if (fstat(STDERR_FILENO, &sb) == 0 && sb.st_size > big) big = sb.st_size;
+    }
+    dup2(saved, STDERR_FILENO);
+    close(saved);
+    t_true("logfile: failed rotation: the file never exceeds the cap plus a line", big > 0 && big <= TS_LOG_MAX + LINE);
+    {
+        FILE *f = fopen(path, "r");
+        char buf[256];
+        int seen = 0;
+        while (f && fgets(buf, sizeof buf, f)) if (strstr(buf, "log reset because rotation failed")) seen = 1;
+        if (f) fclose(f);
+        t_true("logfile: failed rotation: the reset is logged", seen);
+    }
+    unlink(inner);
+    rmdir(old);
+    unlink(path);
+    rmdir(dir);
+}
+
 void test_logfile(void)
 {
+    test_rotation_fails();
     test_rotates();
     test_symlink();
 }

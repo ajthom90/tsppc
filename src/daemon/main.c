@@ -1212,11 +1212,19 @@ static int run_cleanup(void)
 {
     char buf[TS_IPC_RESP_MAX];
     size_t len = 0;
+    ts_req_result rc;
 
     mach_timebase_info(&tb);
     t_start = now_ms();
     /* Only "nothing there" (no socket, or a stale one) means no daemon. */
-    if (ts_ipc_request(ts_ipc_socket_path(), TS_IPC_STATUS, 3000, buf, sizeof buf, &len) != TS_REQ_NO_DAEMON) {
+    errno = 0;
+    rc = ts_ipc_request(ts_ipc_socket_path(), TS_IPC_STATUS, 3000, buf, sizeof buf, &len);
+    if (rc == TS_REQ_DENIED || rc == TS_REQ_FAILED) {
+        fprintf(stderr, "tsppcd: cannot check for a running tsppcd: %s; not cleaning up\n",
+                errno ? strerror(errno) : "failed");
+        return 1;
+    }
+    if (rc != TS_REQ_NO_DAEMON) {
         fprintf(stderr, "tsppcd is running; stop it first\n");
         return 1;
     }
