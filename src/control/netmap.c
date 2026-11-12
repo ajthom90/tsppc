@@ -221,13 +221,15 @@ static int bool_field(const ts_json_tok *v, int *out, ctx *c, const char *what)
     return 0;
 }
 
+#define CAP_NO_HOSTS "disable-hosts-file-updates"   /* tailcfg NodeAttrDisableHostsFileUpdates */
+
 /* A Node object (the first token already read). Whole replacement: *n is
  * zeroed first. */
 static int parse_node(ts_json *r, const ts_json_tok *first, ts_node *n, ctx *c)
 {
     ts_json_tok k, v;
     char key[32];
-    int legacy = 0;
+    int legacy = 0, cap_map = 0, cap_list = 0;
     memset(n, 0, sizeof *n);
     if (first->type != TS_JSON_OBJ_START) return bad(c, "node is not an object");
     for (;;) {
@@ -287,10 +289,39 @@ static int parse_node(ts_json *r, const ts_json_tok *first, ts_node *n, ctx *c)
         } else if (is_key(key, "KeyExpiry")) {
             if (v.type == TS_JSON_NUL) { n->key_expiry = 0; continue; }
             if (parse_time(&v, &n->key_expiry)) return bad(c, "malformed node KeyExpiry");
+        } else if (is_key(key, "CapMap")) {
+            /* Presence of the key is what counts, whatever its value. */
+            cap_map = 0;
+            if (v.type == TS_JSON_NUL) continue;
+            if (v.type != TS_JSON_OBJ_START) return bad(c, "node CapMap is not an object");
+            for (;;) {
+                char ck[64];   /* longer keys read as "" and match nothing */
+                ts_json_tok cv;
+                ts_json_next(r, &k);
+                if (k.type == TS_JSON_OBJ_END) break;
+                if (k.type != TS_JSON_KEY) return bad(c, "invalid JSON");
+                key_name(ck, sizeof ck, &k);
+                if (value(r, &cv, c)) return -1;
+                if (ts_json_skip(r, &cv)) return bad(c, "invalid JSON");
+                if (is_key(ck, CAP_NO_HOSTS)) cap_map = 1;
+            }
+        } else if (is_key(key, "Capabilities")) {
+            cap_list = 0;
+            if (v.type == TS_JSON_NUL) continue;
+            if (v.type != TS_JSON_ARR_START) return bad(c, "node Capabilities is not an array");
+            for (;;) {
+                char cs[64];
+                ts_json_next(r, &v);
+                if (v.type == TS_JSON_ARR_END) break;
+                if (v.type != TS_JSON_STRING) return bad(c, "node Capabilities is not an array of strings");
+                if (ts_json_string(cs, sizeof cs, &v) < 0) cs[0] = 0;
+                if (is_key(cs, CAP_NO_HOSTS)) cap_list = 1;
+            }
         } else if (ts_json_skip(r, &v)) {
             return bad(c, "invalid JSON");
         }
     }
+    n->no_hosts_file = cap_map || cap_list;
     if (n->home_derp == 0 && legacy > 0) n->home_derp = legacy;
     return 0;
 }

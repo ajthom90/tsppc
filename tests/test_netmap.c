@@ -1018,8 +1018,73 @@ static void test_control_time(void)
     ts_netmap_free(&m);
 }
 
+#define NH "disable-hosts-file-updates"
+#define SELF_WITH(extra) \
+    "{\"Node\":{\"ID\":1,\"Name\":\"self.example.test.\",\"Key\":\"nodekey:" HA "\"," extra "}}"
+
+static void test_no_hosts_file(void)
+{
+    ts_netmap m;
+    const ts_node *p;
+
+    ts_netmap_init(&m);
+    t_true("no_hosts: plain self is 0", apply(&m, FULL_MAP) == 0 && m.self.no_hosts_file == 0);
+    t_true("no_hosts: CapMap key with []",
+           apply(&m, SELF_WITH("\"CapMap\":{\"" NH "\":[]}")) == 0 && m.self.no_hosts_file == 1);
+    t_true("no_hosts: later Node without it clears",
+           apply(&m, SELF_WITH("\"IsJailed\":false")) == 0 && m.self.no_hosts_file == 0);
+    t_true("no_hosts: CapMap key with null",
+           apply(&m, SELF_WITH("\"CapMap\":{\"" NH "\":null}")) == 0 && m.self.no_hosts_file == 1);
+    t_true("no_hosts: CapMap key with values",
+           apply(&m, SELF_WITH("\"CapMap\":{\"x\":null,\"" NH "\":[{\"a\":1}]}")) == 0
+               && m.self.no_hosts_file == 1);
+    t_true("no_hosts: legacy Capabilities",
+           apply(&m, SELF_WITH("\"Capabilities\":[\"x\",\"" NH "\"]")) == 0 && m.self.no_hosts_file == 1);
+    t_true("no_hosts: other CapMap keys do not set it",
+           apply(&m, SELF_WITH("\"CapMap\":{\"" NH "x\":[],\"x" NH "\":[],\"other\":[]}")) == 0
+               && m.self.no_hosts_file == 0);
+    t_true("no_hosts: other Capabilities strings do not set it",
+           apply(&m, SELF_WITH("\"Capabilities\":[\"" NH "x\",\"Disable-Hosts-File-Updates\"]")) == 0
+               && m.self.no_hosts_file == 0);
+    t_true("no_hosts: null CapMap and Capabilities are absent",
+           apply(&m, SELF_WITH("\"CapMap\":null,\"Capabilities\":null")) == 0 && m.self.no_hosts_file == 0);
+    t_true("no_hosts: empty CapMap",
+           apply(&m, SELF_WITH("\"CapMap\":{}")) == 0 && m.self.no_hosts_file == 0);
+    t_true("no_hosts: duplicate CapMap, last wins",
+           apply(&m, SELF_WITH("\"CapMap\":{\"" NH "\":[]},\"CapMap\":{}")) == 0
+               && m.self.no_hosts_file == 0);
+    t_true("no_hosts: either source suffices",
+           apply(&m, SELF_WITH("\"CapMap\":{},\"Capabilities\":[\"" NH "\"]")) == 0
+               && m.self.no_hosts_file == 1);
+    t_true("no_hosts: set again",
+           apply(&m, SELF_WITH("\"CapMap\":{\"" NH "\":[]}")) == 0 && m.self.no_hosts_file == 1);
+
+    t_unchanged("CapMap array", &m, SELF_WITH("\"CapMap\":[]"));
+    t_unchanged("CapMap string", &m, SELF_WITH("\"CapMap\":\"x\""));
+    t_unchanged("Capabilities number", &m, SELF_WITH("\"Capabilities\":[1]"));
+    t_unchanged("Capabilities object", &m, SELF_WITH("\"Capabilities\":{}"));
+    t_unchanged("Capabilities with null entry", &m, SELF_WITH("\"Capabilities\":[null]"));
+    t_true("no_hosts: still set after rejections", m.self.no_hosts_file == 1);
+
+    t_true("no_hosts: peer in PeersChanged",
+           apply(&m, "{\"PeersChanged\":[{\"ID\":10,\"Name\":\"alpha.example.test.\",\"CapMap\":{\"" NH "\":[]}},"
+                     "{\"ID\":11,\"Name\":\"beta.example.test.\",\"Capabilities\":[\"" NH "\"]},"
+                     "{\"ID\":12,\"Name\":\"gamma.example.test.\",\"CapMap\":{\"other\":[]}}]}") == 0);
+    p = ts_netmap_peer(&m, 10);
+    t_true("no_hosts: peer 10 (CapMap)", p && p->no_hosts_file == 1);
+    p = ts_netmap_peer(&m, 11);
+    t_true("no_hosts: peer 11 (Capabilities)", p && p->no_hosts_file == 1);
+    p = ts_netmap_peer(&m, 12);
+    t_true("no_hosts: peer 12 (other key)", p && p->no_hosts_file == 0);
+    t_true("no_hosts: peer upsert without it clears",
+           apply(&m, "{\"PeersChanged\":[{\"ID\":10,\"Name\":\"alpha.example.test.\"}]}") == 0
+               && ts_netmap_peer(&m, 10)->no_hosts_file == 0);
+    ts_netmap_free(&m);
+}
+
 void test_netmap(void)
 {
+    test_no_hosts_file();
     test_full_map();
     test_authorization();
     test_deltas();

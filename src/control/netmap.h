@@ -71,6 +71,11 @@
  * - Every other field (DNSConfig, UserProfiles, SSHPolicy, ControlDialPlan,
  *   PopBrowserURL, ...) is skipped, of any type.
  *
+ * Node fields read: ID, Name, Key, DiscoKey, Addresses, HomeDERP (or legacy
+ * DERP), Online, MachineAuthorized, Expired, IsJailed, IsWireGuardOnly,
+ * KeyExpiry, and CapMap (an object) and Capabilities (an array of strings),
+ * which only feed no_hosts_file. Other fields are skipped.
+ *
  * Whole-node replacement means a Node, Peers or PeersChanged entry that omits
  * a field sets it to zero (for example "Online" absent means offline).
  * null is treated as absent for every field. A known field of the wrong JSON
@@ -131,7 +136,13 @@ typedef struct {
     int expired;                /* Expired (control's explicit flag) */
     int jailed;                 /* IsJailed */
     int wireguard_only;         /* IsWireGuardOnly */
-    /* Laid out without padding, so nodes compare with memcmp. */
+    /* 1 when CapMap has the key "disable-hosts-file-updates" (any value, null
+     * and [] included, as upstream's HasCap checks presence) or the legacy
+     * Capabilities array holds that exact string. The daemon reads it from self. */
+    int no_hosts_file;
+    int reserved;               /* always 0: keeps the size a multiple of 8 */
+    /* Laid out without padding, so nodes compare with memcmp: the int64_t
+     * members come first and the count of ints is even. */
 } ts_node;
 
 typedef struct {
