@@ -81,7 +81,9 @@ One daemon, `tsppcd`, runs as root from launchd. It is single-threaded around a 
 
 The `tsppc` CLI talks to the daemon over a Unix socket in `/var/run`, limited to root and the `admin` group. The names avoid installing programs called `tailscale` and `tailscaled` in a public release. **[Call]**
 
-Commands for the first version: `up`, `down`, `status`, `ip`, `logout`. `up` prints the login URL, then reports when the node is waiting for device approval. `status` shows self, each peer's name and IP, whether the path is direct or relayed, and any current problem, such as a wrong clock or an expired key.
+Commands for the first version: `up`, `down`, `status`, `ip`, `logout`, `ping`. `up` prints the login URL, then reports when the node is waiting for device approval. `status` shows self, each peer's name and IP, whether the path is direct or relayed, and any current problem, such as a wrong clock or an expired key.
+
+`tsppc ping <name|IP>` (added 2026-11-12, **[Owner]**; details **[Call]**) works like `tailscale ping`: disco pings to the peer, one line per pong, `pong from <name> (<ip>) via DERP(<region>) in <n>ms` or `via <ip:port>` once direct. Up to 10 pings by default (`-c`), stopping at the first direct pong, then `direct connection not established` if there was none; a timeout per ping (default 5 s); non-zero exit when nothing answered. The relay-only version (disco ping and pong over DERP, NaCl box with the disco keys) is built right after milestone 5; milestone 8 adds direct pongs.
 
 ### Portable core with a thin platform layer **[Call]**
 
@@ -228,7 +230,7 @@ If the driver can't be made to work on Tiger, the project continues as a Leopard
 5. **Services.** *Passes when:* SSH works in both directions over the tunnel, and a real AFP or SMB mount works from a client that still speaks those protocols. See "Known limits". The far end may use legacy SSH options, or a test `sshd` configured to allow them. The second Leopard VM can serve as the file-sharing client. Bundling a newer SSH client is out of scope. **[Call]**
 6. **Tiger.** *Passes when:* milestones 4 and 5 pass on the Tiger VM.
 7. **Daemon and install.** launchd, CLI, install and uninstall, and the conditions table above. *Passes when:* a reboot brings the node back with no login, uninstall leaves no routes or hosts entries, and each row of the table has been exercised on both Leopard and Tiger.
-8. **Direct connections.** *Passes when:* `status` shows a direct path between the Mac and a peer on a network that allows it. The current VM's NAT may not allow it, so this needs bridged networking or real hardware.
+8. **Direct connections.** *Passes when:* `status` and `tsppc ping` show a direct path between the Mac and a peer on a network that allows it. The current VM's NAT may not allow it, so this needs bridged networking or real hardware.
 9. **Real hardware.** Run the above on the owner's G4 eMac, and record throughput and CPU use. *Passes when:* interactive SSH feels normal and throughput numbers are written down. There is no numeric throughput target until there's a measurement. The eMac is not available for the foreseeable future, so nothing waits on this milestone: the first release does not need it, and says it has only been tested under emulation. It runs whenever the eMac comes back out. **[Owner]**
 10. **Public release.** The checklist in "Open source release". *Passes when:* someone following only the published instructions can install the client on a clean Leopard VM and join a tailnet.
 
