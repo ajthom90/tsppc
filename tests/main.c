@@ -19,6 +19,9 @@ void test_menu_model(void);
 void test_filter(void);
 void test_wg(void);
 void test_wg_device(void);
+void test_derp_handshake(void);
+void test_derp_frames(void);
+void test_derp_send(void);
 
 int main(void)
 {
@@ -41,5 +44,8 @@ int main(void)
     test_filter();
     test_wg();
     test_wg_device();
+    test_derp_handshake();
+    test_derp_frames();
+    test_derp_send();
     return t_summary();
 }

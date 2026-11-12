@@ -29,6 +29,10 @@ size_t ts_upgrade_request(char *out, size_t cap, const char *host,
  * Upgrade header counts, as with Go's Header.Get. */
 int ts_upgrade_response(const char *buf, size_t len, size_t *consumed);
 
+/* The same for any protocol: a 101 whose first Upgrade header is proto
+ * (case-insensitive), e.g. "DERP" for the relay. */
+int ts_http_upgrade_response(const char *buf, size_t len, const char *proto, size_t *consumed);
+
 /* Look for the early payload at the start of the decrypted server stream:
  * "\xff\xff\xffTS", BE32 length, then that many bytes of JSON. The JSON is
  * syntax-checked (one value, whitespace around it allowed) and otherwise

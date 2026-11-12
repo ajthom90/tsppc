@@ -4,7 +4,9 @@
 # TS_FUZZ_ITERS to change the 200000 iterations per target), ppc-test
 # (PowerPC, build only here; run the binary on a PowerPC Mac; also builds the
 # tun_check driver check tool, which tools/driver.sh runs, and the
-# keyfetch_check live TLS check), keyfetch-check (host build of keyfetch_check),
+# keyfetch_check live TLS check and the derp_check live relay check; test
+# builds derp_check too), keyfetch-check (host build of keyfetch_check),
+# derp-check (host build of derp_check),
 # release (host tsppcd and tsppc without test hooks), ppc (the same for
 # PowerPC, with the ppc-test compiler and flags), menubar (the PowerPC menu bar
 # app, build/ppc/tsppc.app, from macos/menubar and the release socket, reply
@@ -28,13 +30,13 @@ ALLTESTS := $(wildcard tests/*.c)
 BSRCS   := $(shell find $(BEARSSL)/src -name '*.c' | sort)
 
 ifeq ($(TARGET),)
-.PHONY: test asan ct-test ppc-test fuzz keyfetch-check release ppc menubar clean
+.PHONY: test asan ct-test ppc-test fuzz keyfetch-check derp-check release ppc menubar clean
 # The release build that goes with each test target.
 rel_test := release
 rel_asan := release
 rel_ppc-test := ppc
 test asan ppc-test:
-	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all build/$@/tsppcd build/$@/tsppc $(if $(filter ppc-test,$@),build/ppc-test/tun_check build/ppc-test/keyfetch_check)
+	@$(MAKE) --no-print-directory TARGET=$@ build/$@/test_all build/$@/tsppcd build/$@/tsppc $(if $(filter ppc-test,$@),build/ppc-test/tun_check build/ppc-test/keyfetch_check) $(if $(filter test ppc-test,$@),build/$@/derp_check)
 	@$(MAKE) --no-print-directory TARGET=$(rel_$@) build/$(rel_$@)/tsppcd build/$(rel_$@)/tsppc
 	@sh tools/check-release.sh build/$(rel_$@)/tsppcd build/$@/tsppcd
 	@sh tools/check-release.sh --cli build/$(rel_$@)/tsppc build/$@/tsppc
@@ -56,6 +58,9 @@ menubar:
 
 keyfetch-check:
 	@$(MAKE) --no-print-directory TARGET=test build/test/keyfetch_check
+
+derp-check:
+	@$(MAKE) --no-print-directory TARGET=test build/test/derp_check
 
 fuzz:
 	@$(MAKE) --no-print-directory TARGET=fuzz build/fuzz/fuzz_all
@@ -180,6 +185,7 @@ $(OBJDIR)/tun_check: $(CHECKOBJS)
 	$(CC) $(ARCH) -o $@ $(CHECKOBJS)
 
 KFOBJS := $(OBJDIR)/tools/keyfetch_check.o $(LIBOBJS)
+DCOBJS := $(OBJDIR)/tools/derp_check.o $(LIBOBJS)
 
 $(OBJDIR)/tsppcd: $(OBJDIR)/src/daemon/main.o $(LIBOBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(OBJDIR)/src/daemon/main.o $(LIBOBJS) $(VOBJS)
@@ -190,6 +196,9 @@ $(OBJDIR)/tsppc: $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/daemon/ipc.o $(OBJDIR)/s
 
 $(OBJDIR)/keyfetch_check: $(KFOBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(KFOBJS) $(VOBJS)
+
+$(OBJDIR)/derp_check: $(DCOBJS) $(VOBJS)
+	$(CC) $(ARCH) $(SAN) -o $@ $(DCOBJS) $(VOBJS)
 
 # The menu bar app (TARGET=ppc only): its Objective-C files and the release
 # objects of the socket, reply and menu model code, so the socket path is the
@@ -228,5 +237,5 @@ $(VOBJDIR)/%.o: %.c $(VFLAGSTAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(VFLAGS) -c -o $@ $<
 
--include $(OBJS:.o=.d) $(MOBJS:.o=.d) $(CHECKOBJS:.o=.d) $(OBJDIR)/tools/keyfetch_check.d $(patsubst %.c,$(OBJDIR)/%.d,$(MAINS))
+-include $(OBJS:.o=.d) $(MOBJS:.o=.d) $(CHECKOBJS:.o=.d) $(OBJDIR)/tools/keyfetch_check.d $(OBJDIR)/tools/derp_check.d $(patsubst %.c,$(OBJDIR)/%.d,$(MAINS))
 endif

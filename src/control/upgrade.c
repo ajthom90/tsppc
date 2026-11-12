@@ -87,6 +87,12 @@ static int status_code(const char *buf, size_t end)
 
 int ts_upgrade_response(const char *buf, size_t len, size_t *consumed)
 {
+    return ts_http_upgrade_response(buf, len, UPGRADE_VALUE, consumed);
+}
+
+int ts_http_upgrade_response(const char *buf, size_t len, const char *proto, size_t *consumed)
+{
+    size_t plen = strlen(proto);
     size_t scan = len < TS_UPGRADE_HEADER_MAX ? len : TS_UPGRADE_HEADER_MAX;
     size_t eol, at;
     int upgrade_ok = 0, upgrade_seen = 0;
@@ -111,8 +117,7 @@ int ts_upgrade_response(const char *buf, size_t len, size_t *consumed)
             upgrade_seen = 1;
             for (vs = colon + 1; vs < eol && is_ows(buf[vs]); vs++) {}
             for (ve = eol; ve > vs && is_ows(buf[ve - 1]); ve--) {}
-            upgrade_ok = ve - vs == sizeof UPGRADE_VALUE - 1 &&
-                         ieq(buf + vs, UPGRADE_VALUE, ve - vs);
+            upgrade_ok = ve - vs == plen && ieq(buf + vs, proto, plen);
         }
         at = eol + 2;
     }
