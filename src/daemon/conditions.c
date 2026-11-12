@@ -65,28 +65,26 @@ static uint64_t fnv32(uint64_t h, uint32_t v)
 uint64_t ts_net_fingerprint(const ts_ifaddr *a, size_t n, uint32_t gw, const char *gw_if)
 {
     ts_ifaddr kept[TS_NET_MAX_ADDRS];
-    ts_ifaddr *all;
-    size_t i, m = 0, k;
+    size_t i, j, k = 0;
     uint64_t h = 0xcbf29ce484222325ULL;
 
-    /* Sort everything that counts, then cut: which entries are dropped must
-     * not depend on the input order. */
-    all = n ? (ts_ifaddr *)malloc(n * sizeof(*all)) : NULL;
-    if (all == NULL && n)
-        return 0;
+    /* Keep the TS_NET_MAX_ADDRS smallest by (name, addr, mask), sorted, by
+     * insertion: which entries are dropped does not depend on input order. */
     for (i = 0; i < n; i++) {
+        ts_ifaddr e;
         if (ignored(&a[i]))
             continue;
-        all[m] = a[i];
-        all[m].name[sizeof(all[m].name) - 1] = 0;
-        m++;
+        e = a[i];
+        e.name[sizeof(e.name) - 1] = 0;
+        if (k == TS_NET_MAX_ADDRS && cmp(&e, &kept[k - 1]) >= 0)
+            continue;
+        j = k < TS_NET_MAX_ADDRS ? k++ : k - 1;
+        while (j > 0 && cmp(&e, &kept[j - 1]) < 0) {
+            kept[j] = kept[j - 1];
+            j--;
+        }
+        kept[j] = e;
     }
-    if (m)
-        qsort(all, m, sizeof(*all), cmp);
-    k = m < TS_NET_MAX_ADDRS ? m : TS_NET_MAX_ADDRS;
-    for (i = 0; i < k; i++)
-        kept[i] = all[i];
-    free(all);
 
     for (i = 0; i < k; i++) {
         h = fnv(h, kept[i].name, strlen(kept[i].name) + 1);

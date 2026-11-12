@@ -29,8 +29,10 @@ static void copy_name(char out[16], const char *src, size_t n)
     out[n] = 0;
 }
 
-/* The default route, by RTM_GET. Any failure leaves *gw = 0, gw_if = "". */
-static void default_route(uint32_t *gw, char gw_if[16])
+/* The default route, by RTM_GET. 0 when the kernel answered (ESRCH, no
+ * default route, gives *gw = 0 and gw_if = ""); -1 when it could not be
+ * asked or did not answer (socket error, timeout, only foreign messages). */
+static int default_route(uint32_t *gw, char gw_if[16])
 {
     struct {
         struct rt_msghdr h;
@@ -38,7 +40,12 @@ static void default_route(uint32_t *gw, char gw_if[16])
         struct sockaddr_in mask;
         struct sockaddr_dl ifp;
     } req;
-    char buf[RT_BUF];
+    union {
+        struct rt_msghdr h;
+        char c[RT_BUF];
+    } bu;
+    char *buf = bu.c;
+    int ok = -1;
     struct timeval tv;
     pid_t pid = getpid();
     int s, tries;
@@ -47,7 +54,7 @@ static void default_route(uint32_t *gw, char gw_if[16])
     gw_if[0] = 0;
     s = socket(PF_ROUTE, SOCK_RAW, 0);
     if (s < 0)
-        return;
+        return -1;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -67,11 +74,12 @@ static void default_route(uint32_t *gw, char gw_if[16])
     req.ifp.sdl_len = sizeof(req.ifp);
     req.ifp.sdl_family = AF_LINK;
     if (write(s, &req, sizeof(req)) != (ssize_t)sizeof(req)) {
+        int no_route = errno == ESRCH;
         close(s);
-        return;
+        return no_route ? 0 : -1;
     }
     for (tries = 0; tries < 32; tries++) {
-        ssize_t r = read(s, buf, sizeof(buf));
+        ssize_t r = read(s, buf, RT_BUF);
         struct rt_msghdr *rh;
         char *p, *end;
         int bit;
@@ -85,8 +93,12 @@ static void default_route(uint32_t *gw, char gw_if[16])
         rh = (struct rt_msghdr *)buf;
         if (rh->rtm_type != RTM_GET || rh->rtm_seq != 1 || rh->rtm_pid != pid)
             continue;
-        if (rh->rtm_errno != 0)
+        if (rh->rtm_errno != 0) {
+            if (rh->rtm_errno == ESRCH)
+                ok = 0;
             break;
+        }
+        ok = 0;
         end = buf + ((size_t)rh->rtm_msglen < (size_t)r ? (size_t)rh->rtm_msglen : (size_t)r);
         p = buf + sizeof(struct rt_msghdr);
         for (bit = 0; bit < RTAX_MAX && p < end; bit++) {
@@ -120,6 +132,7 @@ static void default_route(uint32_t *gw, char gw_if[16])
         break;
     }
     close(s);
+    return ok;
 }
 
 int ts_net_snapshot(ts_ifaddr *out, size_t cap, size_t *n, uint32_t *gw, char gw_if[16])
@@ -149,6 +162,5 @@ int ts_net_snapshot(ts_ifaddr *out, size_t cap, size_t *n, uint32_t *gw, char gw
     }
     freeifaddrs(list);
     *n = m;
-    default_route(gw, gw_if);
-    return 0;
+    return default_route(gw, gw_if);
 }

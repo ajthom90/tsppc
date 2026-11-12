@@ -32,6 +32,7 @@ int64_t ts_wake_check(ts_wake *w, int64_t wall_ms, int64_t mono_ms);
  * plus the default gateway and its interface. Independent of entry order. */
 uint64_t ts_net_fingerprint(const ts_ifaddr *a, size_t n, uint32_t gw, const char *gw_if);
 
+/* Use only through the API: last is stored encoded, never set it by hand. */
 typedef struct {
     int64_t last;               /* 0: none yet; else the time of the last rebind + 1 */
     int pending;
@@ -41,7 +42,7 @@ typedef struct {
 /* Notes that a rebind is wanted. The earliest pending reason is kept. */
 void ts_rebind_request(ts_rebind_gate *g, const char *why, int64_t now_ms);
 
-/* 1 (and why filled, pending cleared, last = now) when a request is pending
+/* 1 (and why filled, pending cleared, last recorded) when a request is pending
  * and either no rebind happened before or TS_REBIND_MIN_GAP_MS has passed. */
 int ts_rebind_due(ts_rebind_gate *g, int64_t now_ms, char why[64]);
 

@@ -31,6 +31,17 @@ static void wake_tests(void)
     memset(&w, 0, sizeof(w));
     ts_wake_check(&w, 10000000, 50);
     t_true("wake: backward jump", ts_wake_check(&w, 10000000 - 3600000, 50 + 1000) == -3601000);
+    memset(&w, 0, sizeof(w));
+    ts_wake_check(&w, 1000, 0);
+    t_true("wake: +15000 is a jump", ts_wake_check(&w, 1000 + 15000, 0) == 15000);
+    t_true("wake: -15000 is a jump", ts_wake_check(&w, 1000, 0) == -15000);
+    memset(&w, 0, sizeof(w));
+    ts_wake_check(&w, 1000, 0);
+    t_true("wake: 14999 is not", ts_wake_check(&w, 1000 + 14999, 0) == 0);
+    t_true("wake: -14999 is not", ts_wake_check(&w, 1000 + 14999 - 14999, 0) == 0);
+    memset(&w, 0, sizeof(w));
+    ts_wake_check(&w, 10000000, 50);
+    ts_wake_check(&w, 10000000 - 3600000, 50 + 1000);
     t_true("wake: re-primed after backward", ts_wake_check(&w, 10000000 - 3600000 + 1000, 50 + 2000) == 0);
 }
 
@@ -84,6 +95,12 @@ static void fp_bounded(void)
     v2 = ts_net_fingerprint(e, 40, 0, "");
     t_true("fingerprint: bounded stable", v1 == v2);
     t_true("fingerprint: bounded order independent", v1 == ts_net_fingerprint(r, 40, 0, ""));
+    /* e[] is sorted by name: e[39] is beyond the 32nd, e[5] within. */
+    e[39].addr ^= 0x100;
+    t_true("fingerprint: beyond 32nd ignored", v1 == ts_net_fingerprint(e, 40, 0, ""));
+    e[39].addr ^= 0x100;
+    e[5].addr ^= 0x100;
+    t_true("fingerprint: within 32 counts", v1 != ts_net_fingerprint(e, 40, 0, ""));
 }
 
 static void gate_tests(void)
@@ -126,6 +143,7 @@ static void snapshot_test(void)
     int bad = 0;
     int rc = ts_net_snapshot(e, 16, &n, &gw, gif);
     t_true("snapshot runs", rc == 0 && n <= 16);
+    t_true("snapshot: gw implies gw_if", gw == 0 || gif[0] != 0);
     for (i = 0; i < n && i < 16; i++)
         if (strncmp(e[i].name, "lo", 2) == 0)
             bad = 1;
