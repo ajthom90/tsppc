@@ -371,6 +371,7 @@ static void slot_events(int i, fd_set *r, fd_set *w)
 #ifdef TS_TEST_HOOKS
 int (*ts_dpio_test_tun_open)(char ifname[16]);
 int (*ts_dpio_test_run)(const char *const *argv);
+unsigned long ts_dpio_test_event_ticks;
 #define TUN_OPEN(n) (ts_dpio_test_tun_open ? ts_dpio_test_tun_open(n) : ts_tun_open(n))
 #define RUN(a) (ts_dpio_test_run ? ts_dpio_test_run(a) : ts_run(a))
 #else
@@ -828,7 +829,15 @@ void ts_dpio_events(fd_set *r, fd_set *w, int64_t now_ms)
     int i;
     G.now = now_ms;
     if (!G.running) return;
-    ts_dp_tick(G.dp, now_ms);   /* what arrives is timed now, not at the last sync (pong latency) */
+    /* With a ping outstanding, tick first: a pong that arrives now is timed
+     * now, not at the last sync, and a due timeout is reported at once.
+     * Otherwise skip it: a tick on every wake costs a G3 too much. */
+    if (ts_dp_ping_deadline(G.dp) >= 0) {
+        ts_dp_tick(G.dp, now_ms);
+#ifdef TS_TEST_HOOKS
+        ts_dpio_test_event_ticks++;
+#endif
+    }
     for (i = 0; i < TS_DP_MAX_CONNS && G.running; i++) slot_events(i, r, w);
     if (G.running) tun_events(r);
     after_block();

@@ -402,6 +402,18 @@ static void test_dpio_ping(void)
     turn(1);
     turn(0);
     t_true("dpio ping: unknown peer", ts_dpio_ping(0x64400003u, 1000, 1, g_clock) == TS_DP_PING_UNKNOWN);
+    /* With no ping outstanding, events do not tick the data plane. */
+    {
+        fd_set r, w;
+        unsigned long t0 = ts_dpio_test_event_ticks;
+        FD_ZERO(&r);
+        FD_ZERO(&w);
+        for (i = 0; i < 5; i++) {
+            g_clock += 10;
+            ts_dpio_events(&r, &w, g_clock);
+        }
+        t_true("dpio ping: no extra tick with no ping outstanding", ts_dpio_test_event_ticks == t0);
+    }
     t_true("dpio ping: sent", ts_dpio_ping(0x64400002u, 300, 77, g_clock) == 0);
     for (i = 0; i < 100 && n_res == 0; i++) {
         fd_set r, w;
@@ -410,6 +422,7 @@ static void test_dpio_ping(void)
         g_clock += 10;
         ts_dpio_events(&r, &w, g_clock);
     }
+    t_true("dpio ping: events tick while a ping is outstanding", ts_dpio_test_event_ticks > 0);
     t_true("dpio ping: timeout through the callback, from events alone",
            n_res == 1 && res_cookie == 77 && res_status == TS_DP_PING_TIMEOUT && res_region == 7 && i >= 29 && i <= 31);
     /* The loop's sleep ends at the earliest ping deadline. */

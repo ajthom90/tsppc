@@ -174,3 +174,4 @@ check.
 - At most 4 pings can wait at once across all `tsppc ping` commands, so `tsppc status` and the menu bar app always find a free connection to the daemon.
 - `--timeout` accepts 100ms to 10s. Names resolve only to tailnet peers (full name, or its first label); there is no fallback to the system resolver.
 - "peer has no home relay" is tsppc's own message; upstream would time out instead.
+- Jailed and WireGuard-only peers are not configured in tsppc's data plane, so `tsppc ping` to them says `no matching peer` although `tsppc status` lists them; upstream would ping them.

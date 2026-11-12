@@ -850,6 +850,9 @@ static void finish_pings(void)
             client_error(c, ping_error_text(TS_DP_PING_DOWN));
         }
         shutdown(c->fd, SHUT_RD);
+        /* Time to write it, even if the loop was held past the ping's
+         * deadline (a blocking command) and the check below runs now. */
+        c->deadline = now_ms() + TS_IPC_CLIENT_TIMEOUT_MS;
     }
 }
 

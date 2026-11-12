@@ -81,7 +81,8 @@ void ts_dpio_sync(ts_sess *sess, int want_up, int map_changed, int64_t now_ms);
  * needs (TS_DPIO_TICK_MS while running, the time to the earliest ping
  * deadline if sooner, 0 with decrypted data waiting). */
 void ts_dpio_fds(fd_set *r, fd_set *w, int *maxfd, int64_t *timeout_ms);
-/* After select. */
+/* After select. While a ping is outstanding it ticks the data plane first
+ * (pong latency, timeouts on time); otherwise the tick waits for sync. */
 void ts_dpio_events(fd_set *r, fd_set *w, int64_t now_ms);
 /* Stop everything (signals, exit) and free. */
 void ts_dpio_shutdown(void);
@@ -124,6 +125,8 @@ void ts_dpio_ping_cancel(uint64_t cookie);
 /* Replace the tun device and the commands (NULL: the real ones). */
 extern int (*ts_dpio_test_tun_open)(char ifname[16]);
 extern int (*ts_dpio_test_run)(const char *const *argv);
+/* Data-plane ticks ts_dpio_events made (only while a ping is outstanding). */
+extern unsigned long ts_dpio_test_event_ticks;
 #endif
 
 #endif
