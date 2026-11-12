@@ -108,7 +108,7 @@ Both daemons were left running with the tunnel up and the kext loaded.
 | `<tiger>` to `<leopard>` | 0 of 400 | (the same session) | |
 | `<host>` to `<leopard>` | 0 of 400 | at about 120 s, 240 s and 360 s | `rx 401 tx 405` on `<leopard>` |
 
-`<leopard>` initiated the session with `<tiger>`, so tsppc rekeyed as initiator there and `<tiger>` as responder; the host's client initiated its session, so `<leopard>` was the responder to the official client's rekeys. A session that is never rekeyed is refused after 180 s, so traffic without loss past 6 minutes needs the rekeys. `en0` on `<leopard>` saw no ICMP for `<tiger>` during the run. An SSH session from `<host>` to `<leopard>`'s tailnet address stayed open for 7.5 minutes, printing `date` every 30 s (read-only commands).
+`<leopard>` initiated the session with `<tiger>`, so tsppc rekeyed as initiator there and `<tiger>` as responder; the host's client initiated its session, so `<leopard>` was the responder to the official client's rekeys. A session that is never rekeyed is refused after 180 s, so traffic without loss past 6 minutes needs the rekeys. `en0` on `<leopard>` saw no ICMP for `<tiger>` during the run. An SSH session from `<host>` to `<leopard>`'s tailnet address stayed open for 7 minutes, printing `date` every 30 s (read-only commands).
 
 **Filter denial (B4).** The policy allows TCP, UDP and ICMP only. As root on `<tiger>`, a throwaway Python script (not in the repository) sent 10 raw IPv4 packets of protocol 253 to `<leopard>`'s tailnet address; then 3 ICMP pings as a positive control. One `tcpdump -i tun0 'icmp or ip proto 253'` ran on `<leopard>`, and `tcpdump -i tun0 'ip proto 253'` on `<tiger>`.
 
