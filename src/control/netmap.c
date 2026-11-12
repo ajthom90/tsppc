@@ -1172,12 +1172,12 @@ static void filters_drop(ts_netmap *m)
 /* ---- apply ---------------------------------------------------------------- */
 
 enum { F_KEEPALIVE, F_NODE, F_PEERS, F_REMOVED, F_CHANGED, F_ONLINE, F_PATCH,
-       F_DEBUG, F_TKA, F_PING, F_DERPMAP, F_PFILTER, F_PFILTERS, F_COUNT };
+       F_DEBUG, F_TKA, F_PING, F_DERPMAP, F_PFILTER, F_PFILTERS, F_CTIME, F_COUNT };
 
 static const char *const field_names[F_COUNT] = {
     "KeepAlive", "Node", "Peers", "PeersRemoved", "PeersChanged", "OnlineChange",
     "PeersChangedPatch", "Debug", "TKAInfo", "PingRequest", "DERPMap", "PacketFilter",
-    "PacketFilters"
+    "PacketFilters", "ControlTime"
 };
 
 static void set_error(ts_netmap *m, const char *msg)
@@ -1195,8 +1195,9 @@ static int apply_inner(ts_netmap *m, const char *json, size_t len, fstage *fs, c
     slot f[F_COUNT];
     char key[32];
     int i, keepalive = 0, tka_present = 0, tka_disabled = 0;
-    int have_exit = 0, exit_code = 0, got_ping = 0;
+    int have_exit = 0, exit_code = 0, got_ping = 0, have_ctime = 0;
     uint32_t sleep_ms = 0;
+    int64_t ctime = 0;
     ts_node self;
     int have_node = 0;
     ts_ping_req ping;
@@ -1233,6 +1234,14 @@ static int apply_inner(ts_netmap *m, const char *json, size_t len, fstage *fs, c
     if (f[F_PING].have) {
         ts_json r = f[F_PING].r;
         if (parse_ping(&r, &ping, &got_ping, c)) return -1;
+    }
+    if (f[F_CTIME].have) {   /* the zero time counts as absent, as upstream */
+        ts_json r = f[F_CTIME].r;
+        if (value(&r, &t, c)) return -1;
+        if (t.type != TS_JSON_NUL) {
+            if (parse_time(&t, &ctime)) return bad(c, "malformed ControlTime");
+            have_ctime = ctime != 0;
+        }
     }
     if (f[F_NODE].have) {
         ts_json r = f[F_NODE].r;
@@ -1291,6 +1300,10 @@ static int apply_inner(ts_netmap *m, const char *json, size_t len, fstage *fs, c
 
     /* Commit. */
     if (got_ping) m->ping = ping;
+    if (have_ctime) {
+        m->control_time = ctime;
+        m->control_time_gen++;
+    }
     if (keepalive) {
         m->have_exit = 0;
         m->exit_code = 0;
@@ -1422,6 +1435,8 @@ void ts_netmap_reset(ts_netmap *m)
     m->nfilters = keep.nfilters;
     m->have_filter = keep.have_filter;
     m->filter_gen = keep.filter_gen;
+    m->control_time = keep.control_time;
+    m->control_time_gen = keep.control_time_gen;
     m->derp_fresh = m->filter_fresh = 1;
 }
 

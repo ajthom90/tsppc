@@ -10,7 +10,12 @@
  * Semantics follow upstream's controlclient (tailcfg.MapResponse, map.go):
  *
  * - "KeepAlive": true. Nothing in the map changes; Debug and TKAInfo are not
- *   acted on. Only PingRequest is taken from such a message.
+ *   acted on. Only PingRequest and ControlTime are taken from such a message.
+ * - "ControlTime" (control's clock, RFC 3339): every accepted message that
+ *   carries one, KeepAlive included (as upstream), sets control_time and bumps
+ *   control_time_gen, even for the same value, so the caller can note when it
+ *   arrived. Absent, null or the zero time leaves both; a malformed value
+ *   rejects the message. Both are kept by ts_netmap_reset.
  * - "Node" replaces self as a whole. Absent (or null) means self is unchanged.
  *   The first non-KeepAlive message after ts_netmap_init/ts_netmap_reset must
  *   carry Node ("initial MapResponse lacked Node"), as upstream requires.
@@ -187,6 +192,11 @@ typedef struct {
     size_t nfilters;
     int have_filter;            /* a PacketFilter(s) has been applied */
     uint32_t filter_gen;        /* bumps on every change of the filters or have_filter */
+    /* The last ControlTime, in Unix seconds as key_expiry (the fraction
+     * dropped; 1970-01-01T00:00:00Z is -1), and a counter of the messages
+     * that carried one (0: none yet). */
+    int64_t control_time;
+    uint32_t control_time_gen;
     char last_error[128];
     int last_limit;             /* the last rejection was a limit (TS_MAX_PEERS, or a filter
                                  * name, count or size limit), which control will hit again on

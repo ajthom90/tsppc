@@ -48,6 +48,8 @@ typedef struct {
     size_t nregions, nscores, nfilters, fblob_len;
     uint32_t derp_gen, filter_gen;
     int have_filter, derp_fresh, filter_fresh;
+    int64_t control_time;
+    uint32_t control_time_gen;
     ts_derp_region regions[TS_DERP_MAX_REGIONS];
     ts_derp_score scores[TS_DERP_SCORES_MAX];
     char fblob[TS_FILTER_JSON_MAX + 4096];   /* each filter: name, NUL, length, text */
@@ -76,6 +78,8 @@ static snap *take(const ts_netmap *m)
     s->have_filter = m->have_filter;
     s->derp_fresh = m->derp_fresh;
     s->filter_fresh = m->filter_fresh;
+    s->control_time = m->control_time;
+    s->control_time_gen = m->control_time_gen;
     s->nfilters = m->nfilters;
     for (i = 0; i < m->nfilters; i++) {
         size_t nl = strlen(m->filter_name[i]) + 1, len = m->filter_len[i];
@@ -976,6 +980,44 @@ static void test_netmap_filters(void)
     ts_netmap_free(&m);
 }
 
+/* MapResponse.ControlTime: taken from every accepted message that has one,
+ * KeepAlive included; absent, null and the zero time leave it; kept across
+ * reset; a malformed one rejects the message. */
+static void test_control_time(void)
+{
+    ts_netmap m;
+    t_true("ctime: init", ts_netmap_init(&m) == 0);
+    t_true("ctime: none at first", m.control_time == 0 && m.control_time_gen == 0);
+    t_true("ctime: map without it", apply(&m, FULL_MAP) == 0 && m.control_time_gen == 0);
+    t_true("ctime: in a map",
+           apply(&m, "{\"PeersRemoved\":[],\"ControlTime\":\"2026-11-12T10:20:30.123456Z\"}") == 0 &&
+               m.control_time == (int64_t)1794478830 && m.control_time_gen == 1);
+    t_true("ctime: in a KeepAlive",
+           apply(&m, "{\"KeepAlive\":true,\"ControlTime\":\"2026-11-12T11:20:31+01:00\"}") == 0 &&
+               m.control_time == (int64_t)1794478831 && m.control_time_gen == 2);
+    t_true("ctime: the same value again still counts",
+           apply(&m, "{\"KeepAlive\":true,\"ControlTime\":\"2026-11-12T11:20:31+01:00\"}") == 0 &&
+               m.control_time == (int64_t)1794478831 && m.control_time_gen == 3);
+    t_true("ctime: absent leaves it", apply(&m, "{\"KeepAlive\":true}") == 0 && m.control_time_gen == 3);
+    t_true("ctime: null leaves it", apply(&m, "{\"ControlTime\":null}") == 0 && m.control_time_gen == 3);
+    t_true("ctime: the zero time leaves it",
+           apply(&m, "{\"ControlTime\":\"0001-01-01T00:00:00Z\"}") == 0 && m.control_time_gen == 3 &&
+               m.control_time == (int64_t)1794478831);
+    t_true("ctime: the epoch is -1",
+           apply(&m, "{\"ControlTime\":\"1970-01-01T00:00:00Z\"}") == 0 && m.control_time == -1 &&
+               m.control_time_gen == 4);
+    t_unchanged("ctime malformed", &m, "{\"ControlTime\":\"2026-11-12 10:20:30Z\"}");
+    t_unchanged("ctime not a string", &m, "{\"ControlTime\":1794478830}");
+    t_unchanged("ctime with a bad delta", &m,
+                "{\"ControlTime\":\"2026-11-12T10:20:30Z\",\"PeersRemoved\":[\"x\"]}");
+    t_unchanged("ctime in a bad KeepAlive", &m,
+                "{\"KeepAlive\":true,\"ControlTime\":\"2026-11-12T10:20:30Z\",\"PingRequest\":7}");
+    t_true("ctime: rejections changed nothing", m.control_time == -1 && m.control_time_gen == 4);
+    ts_netmap_reset(&m);
+    t_true("ctime: kept across reset", m.control_time == -1 && m.control_time_gen == 4);
+    ts_netmap_free(&m);
+}
+
 void test_netmap(void)
 {
     test_full_map();
@@ -987,4 +1029,5 @@ void test_netmap(void)
     test_netmap_derpmap();
     test_netmap_filters();
     test_stream();
+    test_control_time();
 }

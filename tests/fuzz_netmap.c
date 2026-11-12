@@ -16,7 +16,7 @@
  *   the DERP regions, score table, filters, gens and session flags included;
  * - an accepted message is idempotent: applying it again succeeds and changes
  *   nothing, so derp_gen and filter_gen do not bump (every MapResponse field
- *   we apply is idempotent);
+ *   we apply is idempotent; only control_time_gen counts a ControlTime again);
  * - regions are sorted by ID with nnodes <= TS_DERP_MAX_NODES and usable
  *   nodes only; filters are sorted by name, NUL-terminated JSON arrays within
  *   TS_FILTER_JSON_MAX together;
@@ -37,6 +37,8 @@ typedef struct {
     size_t nregions, nscores, nfilters, flen;
     uint32_t derp_gen, filter_gen;
     int have_filter, derp_fresh, filter_fresh;
+    int64_t ctime;
+    uint32_t ctime_gen;
     ts_derp_region regions[TS_DERP_MAX_REGIONS];
     ts_derp_score scores[TS_DERP_SCORES_MAX];
     /* not compared directly: the filters, serialized (name, NUL, length, text) */
@@ -87,6 +89,8 @@ static void take(snap *s, const ts_netmap *m)
     s->have_filter = m->have_filter;
     s->derp_fresh = m->derp_fresh;
     s->filter_fresh = m->filter_fresh;
+    s->ctime = m->control_time;
+    s->ctime_gen = m->control_time_gen;
     s->nfilters = m->nfilters;
     for (i = 0; i < m->nfilters; i++) {
         size_t len = m->filter_len[i];
@@ -122,6 +126,8 @@ static void restore(ts_netmap *m, const snap *s)
     m->have_filter = s->have_filter;
     m->derp_fresh = s->derp_fresh;
     m->filter_fresh = s->filter_fresh;
+    m->control_time = s->ctime;
+    m->control_time_gen = s->ctime_gen;
     /* The netmap owns its filter strings (malloc); replace them with copies. */
     {
         size_t i, o = 0;
@@ -292,6 +298,9 @@ static void target(const uint8_t *data, size_t len)
         TS_FUZZ_ASSERT(ts_netmap_apply(&M, json, len) == 0);
         invariants(&M);
         take(S2, &M);
+        /* A message with a ControlTime counts it again (same value). */
+        TS_FUZZ_ASSERT(S2->ctime_gen == S1->ctime_gen || S2->ctime_gen == S1->ctime_gen + 1);
+        S2->ctime_gen = S1->ctime_gen;
         TS_FUZZ_ASSERT(same(S1, S2));
     }
     stream_check(data, len);
@@ -329,7 +338,8 @@ static const char *const SEEDS[] = {
     "\"3\":{\"RegionCode\":\"r3\",\"Nodes\":[{\"HostName\":\"d3.example.test\",\"IPv4\":\"192.0.2.9\","
     "\"CertName\":\"c3.example.test\",\"DERPPort\":8443}]},\"4\":null}},"
     "\"PacketFilter\":[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":22,\"Last\":22}}]}],"
-    "\"PacketFilters\":{\"b\":[],\"a\":[{\"SrcIPs\":[\"100.64.0.0/10\"]}]},\"KeepAlive\":false}",
+    "\"PacketFilters\":{\"b\":[],\"a\":[{\"SrcIPs\":[\"100.64.0.0/10\"]}]},\"KeepAlive\":false,"
+    "\"ControlTime\":\"2026-11-12T10:20:30.123456789Z\"}",
     "{\"PeersRemoved\":[10],\"OnlineChange\":{\"11\":true},\"PeerSeenChange\":{\"11\":true},"
     "\"PeersChanged\":[{\"ID\":12,\"Key\":\"nodekey:" HB "\"}],"
     "\"PeersChangedPatch\":[{\"NodeID\":11,\"DERPRegion\":4,\"Online\":false,\"Key\":\"nodekey:" HA "\","
@@ -340,7 +350,9 @@ static const char *const SEEDS[] = {
     "\"3000000000\":{},\"2\":null,\"5\":{}},\"HomeParams\":{\"RegionScore\":null}},"
     "\"PacketFilters\":{\"*\":null,\"x\":[],\"a\":null,\"x\":null,\"y\":[[1]]}}",
     "{\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"1\":-1,\"9\":1e3}}},\"PacketFilter\":[],\"PacketFilters\":{\"b\":null}}",
-    "{\"KeepAlive\":true,\"PingRequest\":{\"URL\":\"https://ping.example.test/y\",\"Types\":\"c2n\"}}",
+    "{\"KeepAlive\":true,\"PingRequest\":{\"URL\":\"https://ping.example.test/y\",\"Types\":\"c2n\"},\"ControlTime\":\"2026-11-12T11:20:30-01:00\"}",
+    "{\"ControlTime\":\"0001-01-01T00:00:00Z\",\"PeersRemoved\":[]}",
+    "{\"ControlTime\":null,\"KeepAlive\":true}",
     "{\"Peers\":[],\"OnlineChange\":{\"100\":false,\"-5\":true},\"Debug\":{\"Exit\":null,\"SleepSeconds\":1e400}}",
     "\x0f\x00\x00\x00{\"KeepAlive\":1}\x00\x00\x00\x00\x02\x00\x00\x00{}\xff\xff\xff\x7f",
 };
