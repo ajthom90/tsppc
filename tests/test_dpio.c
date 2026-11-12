@@ -11,6 +11,7 @@
 #include <sys/select.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -629,6 +630,157 @@ static void test_dpio_rebind(void)
     t_true("rebind: after shutdown, nothing logged", logbuf[0] == 0);
 }
 
+/* ---- Loading the kext when no tun device exists ------------------------- */
+
+static int kext_loaded;           /* kextload has run and worked */
+static int kext_fail;             /* kextload exits non-zero */
+static int kext_calls;
+static char kext_argv1[256];
+static char kext_dir[64];
+
+static int kext_tun_open(char ifname[16])
+{
+    if (!kext_loaded) {
+        n_open++;
+        errno = ENOENT;
+        return -1;
+    }
+    return fake_tun_open(ifname);
+}
+
+static int kext_run(const char *const *argv)
+{
+    if (strcmp(argv[0], "/sbin/kextload") == 0) {
+        kext_calls++;
+        g_clock += 2000;   /* it blocks */
+        snprintf(kext_argv1, sizeof kext_argv1, "%s", argv[1] ? argv[1] : "(null)");
+        if (argv[1] && argv[2]) kext_argv1[0] = 0;   /* exactly two elements */
+        if (kext_fail) return 1;
+        kext_loaded = 1;
+        return 0;
+    }
+    return fake_run(argv);
+}
+
+/* A kext directory (mode given) and a session; the test user counts as root. */
+static int kext_begin(mode_t mode, int use_kext_hooks)
+{
+    snprintf(kext_dir, sizeof kext_dir, "/tmp/tsppc-kext.XXXXXX");
+    if (!mkdtemp(kext_dir)) return -1;
+    chmod(kext_dir, mode);
+    setenv("TSPPC_KEXT_PATH", kext_dir, 1);
+    ts_dpio_test_kext_owner = (long)getuid();
+    kext_loaded = kext_fail = kext_calls = 0;
+    kext_argv1[0] = 0;
+    if (begin() != 0) return -1;
+    if (use_kext_hooks) {
+        ts_dpio_test_tun_open = kext_tun_open;
+        ts_dpio_test_run = kext_run;
+    }
+    return 0;
+}
+
+static void kext_end(void)
+{
+    end();
+    unsetenv("TSPPC_KEXT_PATH");
+    ts_dpio_test_kext_owner = -1;
+    rmdir(kext_dir);
+}
+
+static void test_dpio_kextload(void)
+{
+    ts_dpio_view v;
+    if (kext_begin(0755, 1) != 0) {
+        t_true("dpio: kextload when no driver: setup", 0);
+        kext_end();
+        return;
+    }
+    turn(1);
+    ts_dpio_get_view(&v);
+    t_true("dpio: kextload when no driver: run once", kext_calls == 1);
+    t_true("dpio: kextload when no driver: argv is kextload and the path", strcmp(kext_argv1, kext_dir) == 0);
+    t_true("dpio: kextload when no driver: the tunnel is up", v.tun_open && v.problem[0] == 0);
+    t_true("dpio: kextload when no driver: logged", has(logbuf, "loaded the tunnel driver"));
+    kext_end();
+}
+
+static void test_dpio_no_kextload_when_device(void)
+{
+    ts_dpio_view v;
+    if (kext_begin(0755, 0) != 0) {
+        t_true("dpio: no kextload when a device opens: setup", 0);
+        kext_end();
+        return;
+    }
+    kext_loaded = 1;
+    ts_dpio_test_tun_open = kext_tun_open;
+    ts_dpio_test_run = kext_run;
+    turn(1);
+    ts_dpio_get_view(&v);
+    t_true("dpio: no kextload when a device opens: up", v.tun_open);
+    t_true("dpio: no kextload when a device opens: never called", kext_calls == 0 && !has(logbuf, "tunnel driver"));
+    kext_end();
+}
+
+static void test_dpio_no_kextload_unsafe(void)
+{
+    ts_dpio_view v;
+    if (kext_begin(0777, 1) != 0) {
+        t_true("dpio: no kextload for an unsafe kext: setup", 0);
+        kext_end();
+        return;
+    }
+    turn(1);
+    ts_dpio_get_view(&v);
+    t_true("dpio: no kextload for an unsafe kext: not called", kext_calls == 0);
+    t_true("dpio: no kextload for an unsafe kext: status", !v.tun_open && has(v.problem, "tunnel driver not loaded"));
+    kext_end();
+}
+
+static void test_dpio_kextload_wrong_owner(void)
+{
+    if (kext_begin(0755, 1) != 0) {
+        t_true("dpio: no kextload for a non-root kext: setup", 0);
+        kext_end();
+        return;
+    }
+    ts_dpio_test_kext_owner = (long)getuid() + 1;   /* the directory is not owned by "root" */
+    turn(1);
+    t_true("dpio: no kextload for a non-root kext: not called", kext_calls == 0);
+    kext_end();
+}
+
+static void test_dpio_kextload_rate(void)
+{
+    ts_dpio_view v;
+    int64_t t0;
+    if (kext_begin(0755, 1) != 0) {
+        t_true("dpio: kextload rate limited: setup", 0);
+        kext_end();
+        return;
+    }
+    kext_fail = 1;
+    turn(1);
+    t0 = g_clock;
+    t_true("dpio: kextload rate limited: first try", kext_calls == 1);
+    ts_dpio_get_view(&v);
+    t_true("dpio: kextload rate limited: failure logged", has(logbuf, "could not load the tunnel driver (") &&
+                                                          has(v.problem, "tunnel driver not loaded"));
+    while (g_clock < t0 + TS_DPIO_TUN_RETRY_MS - 2000) {
+        g_clock += 1000;
+        turn(0);
+    }
+    t_true("dpio: kextload rate limited: not again within the interval", kext_calls == 1);
+    g_clock = t0 + TS_DPIO_TUN_RETRY_MS + 3000;
+    turn(0);
+    t_true("dpio: kextload rate limited: again after the interval", kext_calls == 2);
+    g_clock += 1000;
+    turn(0);
+    t_true("dpio: kextload rate limited: not on the next turn", kext_calls == 2);
+    kext_end();
+}
+
 void test_dpio(void)
 {
     test_dpio_probe_clock();
@@ -637,4 +789,9 @@ void test_dpio(void)
     test_dpio_home_gone();
     test_dpio_ping();
     test_dpio_rebind();
+    test_dpio_kextload();
+    test_dpio_no_kextload_when_device();
+    test_dpio_no_kextload_unsafe();
+    test_dpio_kextload_wrong_owner();
+    test_dpio_kextload_rate();
 }

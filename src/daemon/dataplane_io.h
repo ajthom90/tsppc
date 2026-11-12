@@ -57,6 +57,7 @@
 #define TS_DPIO_REPROBE_MS (30 * 60 * 1000)
 #define TS_DPIO_HOME_FAILS 3
 #define TS_DPIO_TUN_RETRY_MS 30000
+#define TS_KEXT_PATH "/Library/Extensions/tsppc-tun.kext"
 #define TS_DPIO_TICK_MS 250            /* the data plane's tick, the loop's longest sleep while it runs */
 #define TS_DPIO_TUN_BUF 2048
 #define TS_DPIO_TUN_READS 64           /* packets read from tun per loop turn */
@@ -139,6 +140,8 @@ extern int (*ts_dpio_test_tun_open)(char ifname[16]);
 extern int (*ts_dpio_test_run)(const char *const *argv);
 /* Data-plane ticks ts_dpio_events made (only while a ping is outstanding). */
 extern unsigned long ts_dpio_test_event_ticks;
+/* -1: the kext directory must be owned by root; otherwise the uid to accept. */
+extern long ts_dpio_test_kext_owner;
 /* 1 if a home probe round is wanted or running. */
 int ts_dpio_test_probe_wanted(void);
 #endif

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -70,6 +71,9 @@ static struct {
     int tun_err;               /* errno of the last failed open, 0 if none */
     char tun_problem[128];
     int64_t tun_retry_at;
+    char kext_path[256];
+    int kext_tried;            /* kextload was attempted, at kext_at */
+    int64_t kext_at;
     unsigned long tun_dropped;
 
     rslot s[TS_DP_MAX_CONNS];
@@ -373,6 +377,7 @@ static void slot_events(int i, fd_set *r, fd_set *w)
 int (*ts_dpio_test_tun_open)(char ifname[16]);
 int (*ts_dpio_test_run)(const char *const *argv);
 unsigned long ts_dpio_test_event_ticks;
+long ts_dpio_test_kext_owner = -1;
 #define TUN_OPEN(n) (ts_dpio_test_tun_open ? ts_dpio_test_tun_open(n) : ts_tun_open(n))
 #define RUN(a) (ts_dpio_test_run ? ts_dpio_test_run(a) : ts_run(a))
 #else
@@ -435,6 +440,46 @@ static void tun_problem(const char *p)
     snprintf(G.tun_problem, sizeof G.tun_problem, "%s", p);
 }
 
+static void after_block(void);
+
+/* Is the kext a real directory that only root can change? The daemon runs as
+ * root and loads it, so a kext anyone else could write must never be loaded. */
+static int kext_safe(void)
+{
+    struct stat st;
+    long owner = 0;
+#ifdef TS_TEST_HOOKS
+    if (ts_dpio_test_kext_owner >= 0) owner = ts_dpio_test_kext_owner;
+#endif
+    if (lstat(G.kext_path, &st) != 0 || !S_ISDIR(st.st_mode)) return 0;
+    return (long)st.st_uid == owner && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+/* No tun device opened and every failure was ENOENT: the driver is not
+ * loaded. Load our own kext, at most once per TS_DPIO_TUN_RETRY_MS. Returns 1
+ * if it loaded, so that the units are tried once more. Never unloads. */
+static int kext_load(void)
+{
+    const char *argv[3];
+    int rc;
+    if (G.kext_tried && G.now - G.kext_at < TS_DPIO_TUN_RETRY_MS) return 0;
+    if (!kext_safe()) return 0;
+    G.kext_tried = 1;
+    G.kext_at = G.now;
+    argv[0] = "/sbin/kextload";
+    argv[1] = G.kext_path;
+    argv[2] = NULL;
+    rc = run_quiet(argv);   /* blocks */
+    after_block();
+    G.kext_at = G.now;
+    if (rc != 0) {
+        G.log("could not load the tunnel driver (%s)", G.kext_path);
+        return 0;
+    }
+    G.log("loaded the tunnel driver");
+    return 1;
+}
+
 /* Open the tun device and give it our address and the tailnet route. */
 static void tun_open(void)
 {
@@ -444,6 +489,16 @@ static void tun_open(void)
     if (G.no_tun || G.tun_fd >= 0) return;
     G.tun_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
     fd = TUN_OPEN(G.ifname);
+    if (fd < 0 && errno == ENOENT) {
+        int was = G.kext_tried;
+        int64_t was_at = G.kext_at;
+        int e = errno;
+        int loaded = kext_load();
+        errno = e;   /* the problem text below still says "not loaded" */
+        if (G.kext_tried != was || G.kext_at != was_at)   /* kextload ran, and blocked */
+            G.tun_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
+        if (loaded) fd = TUN_OPEN(G.ifname);
+    }
     if (fd < 0) {
         G.tun_err = errno;
         if (errno == ENOENT) tun_problem("tunnel driver not loaded");
@@ -861,8 +916,11 @@ int ts_dpio_init(ts_dpio_log_fn logf, ts_dpio_clock_fn clock)
         G.no_tun = e && strcmp(e, "1") == 0;
         e = getenv("TSPPC_DERP_PLAIN");
         G.plain = e && strcmp(e, "1") == 0;
+        e = getenv("TSPPC_KEXT_PATH");
+        if (e && strlen(e) < sizeof G.kext_path) snprintf(G.kext_path, sizeof G.kext_path, "%s", e);
     }
 #endif
+    if (!G.kext_path[0]) snprintf(G.kext_path, sizeof G.kext_path, "%s", TS_KEXT_PATH);
     G.pr = (ts_derp_region *)calloc(TS_DERP_MAX_REGIONS, sizeof *G.pr);
     G.dp = ts_dp_new(&DP_IO, NULL);
     if (!G.pr || !G.dp) {

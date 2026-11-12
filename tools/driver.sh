@@ -3,10 +3,10 @@
 # Usage: tools/driver.sh build
 #        sudo tools/driver.sh load|unload|cycle
 #
-# load and cycle take tun.kext, and cycle takes tun_check, from:
+# load and cycle take tsppc-tun.kext, and cycle takes tun_check, from:
 #   1. $TSPPC_KEXT and $TSPPC_TUN_CHECK (sudo clears the environment, so pass
 #      them as: sudo env TSPPC_KEXT=... tools/driver.sh cycle);
-#   2. otherwise build/driver/tun.kext and build/ppc-test/tun_check in this tree.
+#   2. otherwise build/driver/tsppc-tun.kext and build/ppc-test/tun_check in this tree.
 # This script runs as root, so it never takes them from the current directory,
 # and it refuses a symlink.
 # Only build needs a compiler.
@@ -16,7 +16,12 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VERSION=20090913
 VENDOR_SRC=$ROOT/vendor/tuntaposx-$VERSION/tuntap/src
 OUT=$ROOT/build/driver
-BUNDLE_ID=foo.tun
+# tsppc's own bundle ID and bundle name, so it never meets another tuntaposx
+# install (tun.kext, foo.tun). The kmod name is not compiled in: kextload
+# gives the module the bundle identifier, so the Info.plist is the one place.
+BUNDLE_ID=com.github.ajthom90.tsppc.tun
+KEXT_NAME=tsppc-tun.kext
+CF_NAME=tsppc-tun
 STAGING_TEMPLATE=/tmp/tsppc.XXXXXX
 # Records the private staging directory. /var/db is writable only by root;
 # /var/run is not, as group daemon can write there.
@@ -108,15 +113,24 @@ cmd_build() {
     rm -rf "$OUT" || die "cannot clear $OUT"
     mkdir -p "$OUT" || die "cannot create $OUT"
     cp -R "$VENDOR_SRC" "$OUT/src" || die "cannot copy driver source"
-    ( cd "$OUT/src/tun" && make TUNTAP_VERSION="$VERSION" -f Makefile all ) || die "build failed"
-    [ -f "$OUT/tun.kext/Contents/MacOS/tun" ] || die "build produced no $OUT/tun.kext"
-    echo "built $OUT/tun.kext"
+    # Upstream's Makefile takes the identifier and the bundle directory name as
+    # variables; the vendored source is not edited. It leaves CFBundleName as
+    # the executable's name ("tun"), so that one value is set afterwards.
+    ( cd "$OUT/src/tun" && make TUNTAP_VERSION="$VERSION" BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+        BUNDLE_NAME="$KEXT_NAME" -f Makefile all ) || die "build failed"
+    [ -f "$OUT/$KEXT_NAME/Contents/MacOS/tun" ] || die "build produced no $OUT/$KEXT_NAME"
+    plist=$OUT/$KEXT_NAME/Contents/Info.plist
+    sed -e "/<key>CFBundleName<\/key>/{n;s|<string>.*</string>|<string>$CF_NAME</string>|;}" \
+        "$plist" >"$plist.new" && mv "$plist.new" "$plist" || die "cannot set CFBundleName"
+    grep -A1 CFBundleIdentifier "$plist" | grep -q "<string>$BUNDLE_ID</string>" || die "bundle identifier not set in $plist"
+    grep -A1 CFBundleName "$plist" | grep -q "<string>$CF_NAME</string>" || die "bundle name not set in $plist"
+    echo "built $OUT/$KEXT_NAME"
 }
 
 cmd_load() {
     need_root load
     [ -e "$DEV" ] && die "$DEV is already present; run unload first"
-    kext=$(locate -d TSPPC_KEXT "${TSPPC_KEXT:-}" "$OUT/tun.kext") || exit 1
+    kext=$(locate -d TSPPC_KEXT "${TSPPC_KEXT:-}" "$OUT/$KEXT_NAME") || exit 1
     clear_staging
     # Root loads this copy, so it lives in a new private directory rather than
     # at a fixed /tmp path that another user could plant or swap.
@@ -125,7 +139,7 @@ cmd_load() {
         rm -rf "$staging"
         die "cannot write $RECORD"
     fi
-    staged=$staging/tun.kext
+    staged=$staging/$KEXT_NAME
     if ! { chmod 700 "$staging" &&
            cp -R "$kext" "$staged" &&
            chown -R root:wheel "$staged" &&
