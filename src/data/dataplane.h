@@ -49,7 +49,11 @@
  * WireGuard. It is accepted only if the frame's source is a configured peer
  * (as above) whose netmap DiscoKey is set and equals the packet's sender disco
  * key (stricter than upstream, which takes any known disco key), and the box
- * opens; anything else is dropped and counted (disco_bad), with no X25519.
+ * opens; anything else is dropped and counted (disco_bad). A packet that
+ * fails the source and key checks costs no X25519. One that passes them
+ * (from a real peer, under its disco key) but whose box does not open still
+ * costs the one X25519 that computes that peer's box key, if it is not
+ * cached yet, taken from the budget below.
  * The box key for a peer is computed once (one X25519, taken from the
  * WireGuard device's handshake budget, TS_WG_HS_PER_SEC; over budget the
  * packet is dropped and counted) and cached until the peer's disco key
@@ -135,8 +139,8 @@ int ts_dp_start(ts_dp *dp, const uint8_t node_priv[32], const uint8_t disco_priv
  * ends every outstanding ping with TS_DP_PING_STOPPED. */
 void ts_dp_stop(ts_dp *dp);
 int ts_dp_running(const ts_dp *dp);
-/* Copy what the data plane needs from the map: peers (node key, ipv4, home_derp,
- * wireguard_only, jailed, expired, online), and the DERP map and filters when
+/* Copy what the data plane needs from the map: peers (node key, disco key,
+ * ipv4, home_derp, wireguard_only, jailed, expired, online), and the DERP map and filters when
  * their gens changed. Never keeps a pointer into m. */
 void ts_dp_set_netmap(ts_dp *dp, const ts_netmap *m);
 void ts_dp_set_home(ts_dp *dp, int region);
@@ -157,6 +161,14 @@ void ts_dp_tick(ts_dp *dp, int64_t now_ms);
  * the DH budget: this is asked for locally, and costs one X25519 per peer
  * disco key. */
 int ts_dp_ping(ts_dp *dp, uint32_t peer_ip, uint32_t timeout_ms, uint64_t cookie, int64_t now_ms);
+/* Forget the outstanding ping with cookie: it is never reported and its
+ * place is free at once (a pong for it is then ignored). 0, or -1 if no
+ * outstanding ping has that cookie. */
+int ts_dp_ping_cancel(ts_dp *dp, uint64_t cookie);
+/* The earliest deadline of an outstanding ping (the clock of ts_dp_tick),
+ * or -1 if there is none: the caller wakes then, so a timeout is reported
+ * on time rather than at its next regular tick. */
+int64_t ts_dp_ping_deadline(const ts_dp *dp);
 /* Pick a home region from probe latencies (ms, -1 unknown), per Appendix B, B4. */
 int ts_dp_pick_home(const ts_derp_region *r, size_t n, const int *lat_ms, int current,
                     uint32_t rand32);

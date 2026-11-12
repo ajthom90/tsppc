@@ -1927,6 +1927,19 @@ void test_dp_disco_ping(void)
     advance(1100);
     t_true("busy: timed out", N[0].nres == 4 + TS_DP_MAX_PINGS);
 
+    /* The earliest deadline, and cancelling. */
+    t_true("deadline: none", ts_dp_ping_deadline(N[0].dp) == -1);
+    t_true("deadline: two pings", ts_dp_ping(N[0].dp, N[1].ip, 900, 300, g_now) == 0 &&
+                                      ts_dp_ping(N[0].dp, N[1].ip, 700, 301, g_now) == 0);
+    t_true("deadline: the earliest", ts_dp_ping_deadline(N[0].dp) == g_now + 700);
+    t_true("cancel: a known cookie", ts_dp_ping_cancel(N[0].dp, 301) == 0);
+    t_true("cancel: an unknown one, or twice", ts_dp_ping_cancel(N[0].dp, 301) == -1 &&
+                                                   ts_dp_ping_cancel(N[0].dp, 999) == -1);
+    t_true("deadline: the cancelled one is gone", ts_dp_ping_deadline(N[0].dp) == g_now + 900);
+    advance(1000);
+    t_true("cancel: never reported, the other times out",
+           N[0].nres == 5 + TS_DP_MAX_PINGS && res_is(&N[0], 4 + TS_DP_MAX_PINGS, 300, TS_DP_PING_TIMEOUT, 1));
+
     /* Errors. */
     t_true("err: unknown peer", ts_dp_ping(N[0].dp, IP_OF(77), 1000, 1, g_now) == TS_DP_PING_UNKNOWN);
     {
@@ -1951,7 +1964,7 @@ void test_dp_disco_ping(void)
         t_true("err: no randomness", ts_dp_ping(N[0].dp, N[2].ip, 1000, 1, g_now) == TS_DP_PING_FAILED);
         N[0].rand_fail = 0;
     }
-    t_true("err: no results from refused pings", N[0].nres == 4 + TS_DP_MAX_PINGS);
+    t_true("err: no results from refused pings", N[0].nres == 5 + TS_DP_MAX_PINGS);
 
     /* Home region 2: dialed for the ping; no answer there yet, so a timeout
      * names region 2; then B joins region 2 and answers there. */
@@ -1967,12 +1980,12 @@ void test_dp_disco_ping(void)
         t_true("home: region 2 dialed", N[0].ndial == nd + 1 && N[0].last_dial_region == 2 &&
                                             conn_of(&N[0], 2)->nsend == 1);
         advance(600);
-        t_true("home: timeout names region 2", res_is(&N[0], 4 + TS_DP_MAX_PINGS, 300, TS_DP_PING_TIMEOUT, 2));
+        t_true("home: timeout names region 2", res_is(&N[0], 5 + TS_DP_MAX_PINGS, 300, TS_DP_PING_TIMEOUT, 2));
         ts_dp_set_home(N[1].dp, 2);
         pump();
         t_true("home: sent again", ts_dp_ping(N[0].dp, N[1].ip, 500, 301, g_now) == 0);
         pump();
-        t_true("home: pong via region 2", res_is(&N[0], 5 + TS_DP_MAX_PINGS, 301, TS_DP_PONG, 2) &&
+        t_true("home: pong via region 2", res_is(&N[0], 6 + TS_DP_MAX_PINGS, 301, TS_DP_PONG, 2) &&
                                               conn_of(&N[1], 2)->nsend == 1);
     }
 
@@ -1980,7 +1993,7 @@ void test_dp_disco_ping(void)
     N[1].active = 0;
     t_true("stop: sent", ts_dp_ping(N[0].dp, N[1].ip, 5000, 400, g_now) == 0);
     ts_dp_stop(N[0].dp);
-    t_true("stop: ended", res_is(&N[0], 6 + TS_DP_MAX_PINGS, 400, TS_DP_PING_STOPPED, 2));
+    t_true("stop: ended", res_is(&N[0], 7 + TS_DP_MAX_PINGS, 400, TS_DP_PING_STOPPED, 2));
     t_true("stop: refused while stopped", ts_dp_ping(N[0].dp, N[1].ip, 1000, 1, g_now) == TS_DP_PING_DOWN);
     N[1].active = 1;
 

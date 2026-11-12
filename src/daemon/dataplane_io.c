@@ -775,6 +775,14 @@ void ts_dpio_fds(fd_set *r, fd_set *w, int *maxfd, int64_t *timeout_ms)
     int i, k;
     if (!G.running) return;
     if (*timeout_ms > TS_DPIO_TICK_MS) *timeout_ms = TS_DPIO_TICK_MS;
+    {
+        int64_t d = ts_dp_ping_deadline(G.dp), left;
+        if (d >= 0) {
+            left = d - G.clock();
+            if (left < 0) left = 0;
+            if (*timeout_ms > left) *timeout_ms = left;
+        }
+    }
     for (i = 0; i < TS_DP_MAX_CONNS; i++) {
         rslot *s = &G.s[i];
         int rd = 0, wr = 0;
@@ -899,8 +907,13 @@ void ts_dpio_set_ping_cb(ts_dpio_ping_fn fn, void *user)
 
 int ts_dpio_ping(uint32_t peer_ip, uint32_t timeout_ms, uint64_t cookie, int64_t now_ms)
 {
-    if (!G.running || !G.dp) return TS_DP_PING_DOWN;
+    if (!G.running || !G.dp || G.stopping) return TS_DP_PING_DOWN;
     return ts_dp_ping(G.dp, peer_ip, timeout_ms, cookie, now_ms);
+}
+
+void ts_dpio_ping_cancel(uint64_t cookie)
+{
+    if (G.running && G.dp && !G.stopping) (void)ts_dp_ping_cancel(G.dp, cookie);
 }
 
 int ts_dpio_peer_status(uint32_t ipv4, ts_wg_stats *st, int *region)

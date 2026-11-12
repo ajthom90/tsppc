@@ -19,30 +19,9 @@
 
 /* ---- Parsing ---------------------------------------------------------- */
 
-/* a.b.c.d with each part 1 to 3 digits, at most 255, no leading zero (so
- * "01" is not read as octal by anyone), nothing else. */
 static int parse_ipv4(const char *s, size_t n, uint32_t *out)
 {
-    uint32_t a = 0, part = 0;
-    size_t i, digits = 0;
-    int dots = 0;
-    for (i = 0; i < n; i++) {
-        if (s[i] >= '0' && s[i] <= '9') {
-            if (digits == 1 && part == 0) return -1;
-            part = part * 10 + (uint32_t)(s[i] - '0');
-            if (++digits > 3 || part > 255) return -1;
-        } else if (s[i] == '.') {
-            if (digits == 0 || ++dots > 3) return -1;
-            a = a << 8 | part;
-            part = 0;
-            digits = 0;
-        } else {
-            return -1;
-        }
-    }
-    if (dots != 3 || digits == 0) return -1;
-    *out = a << 8 | part;
-    return 0;
+    return ts_ipc_parse_ipv4(s, n, out);
 }
 
 static void copy_clean(char *dst, size_t cap, const char *v, size_t n)
@@ -78,6 +57,48 @@ static void add_peer(ts_reply *r, const char *v, size_t n)
         return;
     }
     r->peers[r->npeers++] = p;
+}
+
+/* Decimal with no leading zero, at most max. 0 or -1. */
+static int parse_dec(const char *s, size_t n, uint32_t max, uint32_t *out)
+{
+    uint32_t v = 0;
+    size_t i;
+    if (n == 0 || n > 10 || (n > 1 && s[0] == '0')) return -1;
+    for (i = 0; i < n; i++) {
+        uint32_t d;
+        if (s[i] < '0' || s[i] > '9') return -1;
+        d = (uint32_t)(s[i] - '0');
+        if (v > (max - d) / 10) return -1;
+        v = v * 10 + d;
+    }
+    *out = v;
+    return 0;
+}
+
+/* "timeout" or "pong <latency_us> <region> <code>". 0 with r's ping fields
+ * set, or -1. */
+static int parse_ping(ts_reply *r, const char *v, size_t n)
+{
+    const char *sp1, *sp2;
+    uint32_t lat, region;
+    if (n == 7 && memcmp(v, "timeout", 7) == 0) {
+        r->ping = TS_REPLY_PING_TIMEOUT;
+        return 0;
+    }
+    if (n < 5 || memcmp(v, "pong ", 5) != 0) return -1;
+    v += 5;
+    n -= 5;
+    if (!(sp1 = memchr(v, ' ', n))) return -1;
+    if (!(sp2 = memchr(sp1 + 1, ' ', n - (size_t)(sp1 + 1 - v)))) return -1;
+    if (parse_dec(v, (size_t)(sp1 - v), 0xffffffffu, &lat) != 0) return -1;
+    if (parse_dec(sp1 + 1, (size_t)(sp2 - sp1 - 1), 0x7fffffffu, &region) != 0 || region == 0) return -1;
+    if (sp2 + 1 == v + n) return -1;
+    r->ping = TS_REPLY_PONG;
+    r->ping_latency_us = lat;
+    r->ping_region = (int)region;
+    copy_clean(r->ping_code, sizeof r->ping_code, sp2 + 1, (size_t)(v + n - (sp2 + 1)));
+    return 0;
 }
 
 int ts_reply_parse(ts_reply *r, ts_reply_peer *peers, const char *buf, size_t len)
@@ -128,6 +149,8 @@ int ts_reply_parse(ts_reply *r, ts_reply_peer *peers, const char *buf, size_t le
             }
         } else if (k == 9 && memcmp(l, "truncated", 9) == 0) {
             r->truncated = 1;
+        } else if (k == 4 && memcmp(l, "ping", 4) == 0) {
+            if (r->ping == TS_REPLY_PING_NONE) (void)parse_ping(r, l + v, n - v);
         } else if (k == 4 && memcmp(l, "peer", 4) == 0) {
             size_t cl = ts_ipc_clean(val, sizeof val, l + v, n - v, 0);
             add_peer(r, val, cl);
@@ -182,8 +205,13 @@ static ts_req_result connect_result(int e)
 
 ts_req_result ts_ipc_request(const char *path, ts_ipc_cmd cmd, int timeout_ms, char *buf, size_t cap, size_t *len)
 {
+    return ts_ipc_request_line(path, ts_ipc_cmd_line(cmd), timeout_ms, buf, cap, len);
+}
+
+ts_req_result ts_ipc_request_line(const char *path, const char *line, int timeout_ms, char *buf, size_t cap,
+                                  size_t *len)
+{
     struct sockaddr_un a;
-    const char *line = ts_ipc_cmd_line(cmd);
     size_t off = 0, n = strlen(line);
     int64_t deadline = mono_ms() + (timeout_ms > 0 ? timeout_ms : 0);
     ts_req_result res = TS_REQ_FAILED;

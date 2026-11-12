@@ -16,6 +16,7 @@ void test_netmap(void);
 void test_session(void);
 void test_ipc(void);
 void test_ipc_reply(void);
+void test_ping_cli(void);
 void test_menu_model(void);
 void test_filter(void);
 void test_hosts(void);
@@ -60,6 +61,7 @@ int main(void)
     test_session();
     test_ipc();
     test_ipc_reply();
+    test_ping_cli();
     test_menu_model();
     test_filter();
     test_hosts();

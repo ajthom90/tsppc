@@ -5,6 +5,11 @@
  *   tsppc ip       the tailnet IPv4 address
  *   tsppc down     disconnect, stay logged in (tsppc up connects again)
  *   tsppc logout   expire this node's key at control and forget the login
+ *   tsppc ping [-c N] [--timeout DUR] [--until-direct=BOOL] <name|IP>
+ *                  disco pings over the peer's home relay, as upstream's
+ *                  `tailscale ping` (src/cli/ping.h): its lines on stdout,
+ *                  its errors ("no reply", "direct connection not
+ *                  established", the daemon's) bare on stderr
  *
  * Exit status: 0 done, 1 failed or tsppcd not reachable, 2 usage.
  * Everything the daemon sends is cleaned of control bytes before it is shown. */
@@ -18,6 +23,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "src/cli/ping.h"
 #include "src/daemon/ipc.h"
 #include "src/daemon/ipc_reply.h"
 
@@ -25,6 +31,8 @@
 #define UP_TIMEOUT_S 900        /* up gives up waiting after this (tsppcd keeps going) */
 #define LOGOUT_TIMEOUT_S 90
 #define POLL_MS 1000
+#define PING_SLACK_MS 3000      /* a ping request waits its timeout plus this (tsppcd answers first) */
+#define PING_PAUSE_MS 1000      /* after each pong, as upstream */
 
 /* ts_reply and its peers are large: kept off the stack. */
 static char *rbuf;
@@ -43,7 +51,8 @@ static long mono_s(void)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: tsppc <up|down|status|ip|logout>\n");
+    fprintf(stderr, "usage: tsppc <up|down|status|ip|logout>\n"
+                    "       tsppc ping [-c N] [--timeout DUR] [--until-direct=BOOL] <name|IP>\n");
 }
 
 static void sleep_ms(int ms)
@@ -54,17 +63,18 @@ static void sleep_ms(int ms)
     (void)select(0, NULL, NULL, NULL, &tv);
 }
 
-/* Send one request and parse the reply into R. 0, or -1 (message printed). */
-static int request(ts_ipc_cmd cmd)
+/* Send one request line and parse the reply into R. 0, or -1 (message
+ * printed). */
+static int request_line(const char *line, int timeout_ms)
 {
     const char *path = ts_ipc_socket_path();
     size_t len = 0;
     char safe[256];
-    rlen = 0;
     ts_req_result rc;
+    rlen = 0;
 
     errno = 0;
-    rc = ts_ipc_request(path, cmd, REPLY_TIMEOUT_MS, rbuf, TS_IPC_RESP_MAX, &len);
+    rc = ts_ipc_request_line(path, line, timeout_ms, rbuf, TS_IPC_RESP_MAX, &len);
 
     switch (rc) {
     case TS_REQ_OK:
@@ -91,6 +101,11 @@ static int request(ts_ipc_cmd cmd)
         return -1;
     }
     return 0;
+}
+
+static int request(ts_ipc_cmd cmd)
+{
+    return request_line(ts_ipc_cmd_line(cmd), REPLY_TIMEOUT_MS);
 }
 
 /* The request went through and the daemon said ok; else say why not. */
@@ -290,10 +305,90 @@ static int cmd_logout(void)
     }
 }
 
+/* Upstream's runPing loop (cmd/tailscale/cli/ping.go), relay paths only:
+ * no pong is ever direct, so --until-direct ends with "direct connection not
+ * established" after the last pong. */
+static int cmd_ping(int argc, char **argv)
+{
+    ts_ping_opts o;
+    char err[160], msg[TS_IPC_VALUE_MAX + 64], ips[16], label[TS_NODE_NAME_MAX + 1], line[TS_IPC_LINE_MAX + 1];
+    uint32_t ip;
+    long n = 0;
+    int any_pong = 0, rc;
+
+    if (ts_ping_parse_args(argc, argv, &o, err, sizeof err) != 0) {
+        fprintf(stderr, "tsppc ping: %s\n", err);
+        return 2;
+    }
+    if (request(TS_IPC_STATUS) != 0 || check_ok() != 0) return 1;
+    if (ts_ping_not_running(&R, msg, sizeof msg)) {
+        printf("%s\n", msg);
+        return 1;
+    }
+    rc = ts_ping_resolve(&R, o.target, &ip, msg, sizeof msg);
+    if (rc == TS_PING_NOT_FOUND) {
+        fprintf(stderr, "%s\n", msg);
+        return 1;
+    }
+    fmt_ip(ips, sizeof ips, ip);
+    if (rc == TS_PING_SELF) {
+        printf("%s is local Tailscale IP\n", ips);
+        return 0;
+    }
+    ts_ping_peer_label(&R, ip, label, sizeof label);   /* R is replaced by the ping replies */
+    if (ts_ipc_ping_line(line, sizeof line, ip, o.timeout_ms) < 0) return 2;
+    for (;;) {
+        n++;
+        if (request_line(line, (int)o.timeout_ms + PING_SLACK_MS) != 0) return 1;
+        if (!R.ok) {
+            if (R.error[0]) fprintf(stderr, "%s\n", R.error);
+            else fprintf(stderr, "tsppc: unexpected reply from tsppcd\n");
+            return 1;
+        }
+        if (R.ping == TS_REPLY_PING_TIMEOUT) {
+            printf("ping \"%s\" timed out\n", ips);
+            fflush(stdout);
+            if (n == o.count) {
+                if (!any_pong) {
+                    fprintf(stderr, "no reply\n");
+                    return 1;
+                }
+                return 0;
+            }
+            continue;
+        }
+        if (R.ping != TS_REPLY_PONG) {
+            fprintf(stderr, "tsppc: unexpected reply from tsppcd\n");
+            return 1;
+        }
+        any_pong = 1;
+        ts_ping_pong_line(msg, sizeof msg, label, ip, R.ping_code, R.ping_latency_us);
+        printf("%s\n", msg);
+        fflush(stdout);
+        sleep_ms(PING_PAUSE_MS);
+        if (n == o.count) {
+            if (o.until_direct) {
+                fprintf(stderr, "direct connection not established\n");
+                return 1;
+            }
+            return 0;
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
     mach_timebase_info(&tb);
+    if (argc >= 2 && strcmp(argv[1], "ping") == 0) {
+        rbuf = (char *)malloc(TS_IPC_RESP_MAX);
+        peers = (ts_reply_peer *)malloc(TS_MAX_PEERS * sizeof *peers);
+        if (!rbuf || !peers) {
+            fprintf(stderr, "tsppc: out of memory\n");
+            return 1;
+        }
+        return cmd_ping(argc - 2, argv + 2);
+    }
     if (argc != 2) {
         usage();
         return 2;

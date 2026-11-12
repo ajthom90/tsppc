@@ -29,7 +29,16 @@ typedef struct {
     uint32_t ipv4; int have_ipv4;
     ts_reply_peer *peers; size_t npeers;   /* peers: caller array of TS_MAX_PEERS */
     int truncated;                   /* "truncated" seen, or more than TS_MAX_PEERS peers */
+    /* The first valid "ping" line (a ping request's reply). */
+    int ping;                        /* TS_REPLY_PING_NONE, TS_REPLY_PONG or TS_REPLY_PING_TIMEOUT */
+    uint32_t ping_latency_us;        /* pong only */
+    int ping_region;                 /* pong only: the region the ping was sent to, 1..INT32_MAX */
+    char ping_code[32];              /* pong only: its code, cleaned, "-" if the daemon knows none */
 } ts_reply;
+
+#define TS_REPLY_PING_NONE 0
+#define TS_REPLY_PONG 1
+#define TS_REPLY_PING_TIMEOUT 2
 
 /* Parse a whole reply (bytes up to the daemon's close). Unknown keys and
  * malformed lines are skipped; values are cleaned with ts_ipc_clean. For a key
@@ -37,6 +46,9 @@ typedef struct {
  * peer line needs a valid a.b.c.d or "-", "online" or "offline", and a space
  * after the status (the name after it may be empty), or it is skipped. With
  * peers NULL no peer is stored: each valid peer line sets truncated instead.
+ * A ping line is "ping timeout" or "ping pong <latency_us> <region> <code>"
+ * (decimal, no leading zeros, latency at most 2^32-1, region 1 to 2^31-1,
+ * a non-empty code); anything else is skipped.
  * Returns 0, or -1 if the reply holds no "ok" and no "error" line. */
 int ts_reply_parse(ts_reply *r, ts_reply_peer *peers, const char *buf, size_t len);
 
@@ -54,5 +66,10 @@ typedef enum { TS_REQ_OK = 0, TS_REQ_NO_DAEMON, TS_REQ_DENIED, TS_REQ_TIMEOUT, T
  * refuses the connection). Not thread-safe (the clock's timebase is set up on
  * first use): call it from one thread, such as the app's main thread. */
 ts_req_result ts_ipc_request(const char *path, ts_ipc_cmd cmd, int timeout_ms, char *buf, size_t cap, size_t *len);
+
+/* The same with a request line of the caller's (newline included), such as
+ * one from ts_ipc_ping_line. */
+ts_req_result ts_ipc_request_line(const char *path, const char *line, int timeout_ms, char *buf, size_t cap,
+                                  size_t *len);
 
 #endif

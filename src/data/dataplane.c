@@ -1075,6 +1075,27 @@ int ts_dp_ping(ts_dp *dp, uint32_t peer_ip, uint32_t timeout_ms, uint64_t cookie
     return 0;
 }
 
+int ts_dp_ping_cancel(ts_dp *dp, uint64_t cookie)
+{
+    int i;
+    for (i = 0; i < TS_DP_MAX_PINGS; i++) {
+        if (dp->pings[i].used && dp->pings[i].cookie == cookie) {
+            ts_wipe(&dp->pings[i], sizeof dp->pings[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int64_t ts_dp_ping_deadline(const ts_dp *dp)
+{
+    int64_t d = -1;
+    int i;
+    for (i = 0; i < TS_DP_MAX_PINGS; i++)
+        if (dp->pings[i].used && (d < 0 || dp->pings[i].deadline < d)) d = dp->pings[i].deadline;
+    return d;
+}
+
 #ifdef TS_TEST_HOOKS
 int ts_dp_test_has_disco_priv(const ts_dp *dp)
 {
