@@ -10,6 +10,7 @@
 #include "../src/crypto/nacl.h"
 #include "../src/crypto/x25519.h"
 #include "../src/data/dataplane.h"
+#include "../src/disco/disco.h"
 #include "../src/filter/packet.h"
 
 /* Data planes joined by an in-test fake relay built from the DERP frame layout
@@ -20,11 +21,14 @@
  * "rN.derp.test". Everything the data planes send is queued; pump() delivers
  * it from the top level, so no callback re-enters a data plane. Maps are
  * built as MapResponse JSON and applied with ts_netmap_apply. Keys are made
- * up. */
+ * up. Each node's DiscoKey in a map is its disco public key (none if zero);
+ * a made-up peer that is not one of N gets one derived from its node key
+ * (fake_disco). */
 
 #define NODES 3
 #define BUFCAP (128 * 1024)
 #define LOGMAX 16
+#define RESMAX 64
 
 typedef struct {
     int dialed, up;
@@ -34,6 +38,8 @@ typedef struct {
     unsigned long nsend;            /* SendPacket frames from this client */
     int full;                       /* conn_send says there is no room */
     uint8_t first_dst[32], last_dst[32];
+    uint8_t last_pkt[256];          /* body of the last SendPacket (if it fit) */
+    size_t last_pkt_n;
     size_t c2s_n, s2c_n;
     uint8_t c2s[BUFCAP];
     uint8_t s2c[BUFCAP];
@@ -43,10 +49,10 @@ typedef struct {
     int active;
     ts_dp *dp;
     ts_netmap m;
-    uint8_t priv[32], pub[32], disco[32];
+    uint8_t priv[32], pub[32], disco_priv[32], disco[32];
     uint32_t ip;
     tconn c[TS_DP_MAX_CONNS];
-    int auto_up, dial_fail, fail_region, rand_mode;
+    int auto_up, dial_fail, fail_region, rand_mode, rand_fail;
     uint64_t rng;
     int ndial, nclose, last_dial_region, max_active;
     int closed_region[32];
@@ -58,6 +64,10 @@ typedef struct {
     size_t deliv_n[LOGMAX];
     int check_tun;                  /* assert tun packets are from a peer to us */
     int bad_tun;
+    int nres;                       /* ping results */
+    uint64_t res_cookie[RESMAX];
+    int res_status[RESMAX], res_region[RESMAX];
+    uint32_t res_lat[RESMAX];
 } tnode;
 
 static tnode N[NODES];
@@ -156,6 +166,7 @@ static int cb_random(void *user, uint8_t *out, size_t len)
 {
     tnode *n = (tnode *)user;
     size_t i;
+    if (n->rand_fail) return -1;
     for (i = 0; i < len; i++) {
         if (n->rand_mode == 1) out[i] = 0;
         else if (n->rand_mode == 2) out[i] = 0xff;
@@ -174,7 +185,20 @@ static int64_t cb_wall(void *user, uint32_t *nsec)
     return 1800000000 + g_now / 1000;
 }
 
-static const ts_dp_io IO = { cb_dial, cb_conn_send, cb_conn_close, cb_tun_write, cb_random, cb_wall };
+static void cb_ping_result(void *user, uint64_t cookie, int status, uint32_t latency_us, int region_id)
+{
+    tnode *n = (tnode *)user;
+    if (n->nres < RESMAX) {
+        n->res_cookie[n->nres] = cookie;
+        n->res_status[n->nres] = status;
+        n->res_lat[n->nres] = latency_us;
+        n->res_region[n->nres] = region_id;
+    }
+    n->nres++;
+}
+
+static const ts_dp_io IO = { cb_dial, cb_conn_send, cb_conn_close, cb_tun_write, cb_random, cb_wall,
+                             cb_ping_result };
 
 static void on_deliver(void *user, const uint8_t *ip, size_t len)
 {
@@ -263,6 +287,10 @@ static void relay_conn(tconn *c)
             if (c->have_key && len >= 32) {
                 if (c->nsend == 0) memcpy(c->first_dst, body, 32);
                 memcpy(c->last_dst, body, 32);
+                if (len - 32 <= sizeof c->last_pkt) {
+                    memcpy(c->last_pkt, body + 32, len - 32);
+                    c->last_pkt_n = len - 32;
+                }
                 c->nsend++;
                 route(c, body, body + 32, len - 32);
             }
@@ -341,6 +369,28 @@ static void mk_key(uint8_t priv[32], uint8_t pub[32], int seed)
     ts_x25519_public(pub, priv);
 }
 
+/* The disco key of a made-up peer: derived from its node key. */
+static void fake_disco(uint8_t priv[32], uint8_t pub[32], const uint8_t node_pub[32])
+{
+    int i;
+    for (i = 0; i < 32; i++) priv[i] = (uint8_t)(node_pub[i] ^ 0xa5);
+    ts_x25519_public(pub, priv);
+}
+
+/* The DiscoKey a map gives the node with this node key, or NULL for none. */
+static const uint8_t *disco_of(const uint8_t node_pub[32], uint8_t tmp[32])
+{
+    uint8_t priv[32], acc = 0;
+    int i, j;
+    for (j = 0; j < NODES; j++) {
+        if (!N[j].active || memcmp(N[j].pub, node_pub, 32) != 0) continue;
+        for (i = 0; i < 32; i++) acc |= N[j].disco[i];
+        return acc ? N[j].disco : NULL;
+    }
+    fake_disco(priv, tmp, node_pub);
+    return tmp;
+}
+
 static void hex(char *out, const uint8_t *k)
 {
     static const char d[] = "0123456789abcdef";
@@ -388,6 +438,8 @@ static char *map_json(const tnode *self, const pspec *p, size_t np, int nregions
 {
     size_t cap = np * 400 + (size_t)nregions * 200 + (filter ? strlen(filter) : 0) + 1024, n = 0, i;
     char *s = (char *)malloc(cap), kh[65];
+    uint8_t dtmp[32];
+    const uint8_t *dk;
     int r;
     if (!s) abort();
     n = addf(s, cap, n, "{");
@@ -401,8 +453,10 @@ static char *map_json(const tnode *self, const pspec *p, size_t np, int nregions
         for (i = 0; i < np; i++) {
             hex(kh, p[i].key);
             n = addf(s, cap, n, "%s{\"ID\":%d,\"Key\":\"nodekey:%s\"", i ? "," : "", p[i].id, kh);
-            if (!(p[i].flags & P_NODISCO))
+            if (!(p[i].flags & P_NODISCO) && (dk = disco_of(p[i].key, dtmp)) != NULL) {
+                hex(kh, dk);
                 n = addf(s, cap, n, ",\"DiscoKey\":\"discokey:%s\"", kh);
+            }
             if (p[i].ip)
                 n = addf(s, cap, n, ",\"Addresses\":[\"%u.%u.%u.%u/32\"]", (unsigned)(p[i].ip >> 24),
                          (unsigned)(p[i].ip >> 16 & 0xff), (unsigned)(p[i].ip >> 8 & 0xff),
@@ -522,7 +576,7 @@ static size_t tsmp_pkt(uint8_t *b, uint32_t src, uint32_t dst)
 
 static void node_start(tnode *n)
 {
-    t_true("dp start", ts_dp_start(n->dp, n->priv, n->disco, n->ip) == 0);
+    t_true("dp start", ts_dp_start(n->dp, n->priv, n->disco_priv, n->ip) == 0);
     ts_dp_tick(n->dp, g_now);
 }
 
@@ -532,7 +586,7 @@ static void node_init(int i)
     memset(n, 0, sizeof *n);
     n->active = 1;
     mk_key(n->priv, n->pub, i + 1);
-    memset(n->disco, 0xd0 + i, 32);
+    mk_key(n->disco_priv, n->disco, 40 + i);
     n->ip = IP_OF(i + 1);
     n->auto_up = 1;
     n->rng = 0x1234567ull * (uint64_t)(i + 1);
@@ -621,6 +675,89 @@ static const ts_dp_test_counts *CNT(int i)
     return ts_dp_test_counters(N[i].dp);
 }
 
+/* ---- Disco packets --------------------------------------------------------- */
+
+static const uint8_t PONG_SRC[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 3, 3, 40 };
+static const uint8_t NONCE24[24] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                                     13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 };
+
+/* A ping sealed by disco private key priv to disco public key to. */
+static size_t mk_ping(uint8_t *out, const uint8_t priv[32], const uint8_t to[32], const uint8_t txid[12],
+                      const uint8_t node[32])
+{
+    ts_disco_shared sh;
+    uint8_t pub[32];
+    int n;
+    ts_x25519_public(pub, priv);
+    ts_disco_shared_init(&sh, priv, to);
+    n = ts_disco_seal_ping(out, 256, pub, &sh, NONCE24, txid, node);
+    return n < 0 ? 0 : (size_t)n;
+}
+
+static size_t mk_pong(uint8_t *out, const uint8_t priv[32], const uint8_t to[32], const uint8_t txid[12])
+{
+    ts_disco_shared sh;
+    uint8_t pub[32];
+    int n;
+    ts_x25519_public(pub, priv);
+    ts_disco_shared_init(&sh, priv, to);
+    n = ts_disco_seal_pong(out, 256, pub, &sh, NONCE24, txid, PONG_SRC, 1);
+    return n < 0 ? 0 : (size_t)n;
+}
+
+/* Any plaintext, sealed as a disco packet. */
+static size_t mk_raw(uint8_t *out, const uint8_t priv[32], const uint8_t to[32], const uint8_t *pt, size_t n)
+{
+    ts_disco_shared sh;
+    ts_disco_shared_init(&sh, priv, to);
+    memcpy(out, DISCO_MAGIC, 6);
+    ts_x25519_public(out + 6, priv);
+    memcpy(out + 38, NONCE24, 24);
+    ts_secretbox_seal(out + 62, sh.k, NONCE24, pt, n);
+    return 62 + 16 + n;
+}
+
+/* Open a packet sent to the holder of disco private key priv. */
+static int open_as(ts_disco_msg *m, const uint8_t *p, size_t n, const uint8_t priv[32])
+{
+    ts_disco_shared sh;
+    if (n < TS_DISCO_HDR_LEN) return -1;
+    ts_disco_shared_init(&sh, priv, ts_disco_sender(p));
+    return ts_disco_open(m, p, n, &sh);
+}
+
+static ts_dp_status ST(int i)
+{
+    ts_dp_status st;
+    ts_dp_get_status(N[i].dp, &st);
+    return st;
+}
+
+/* SendPackets from node i on every connection. */
+static unsigned long sends(const tnode *n)
+{
+    unsigned long k = 0;
+    int s;
+    for (s = 0; s < TS_DP_MAX_CONNS; s++) k += n->c[s].nsend;
+    return k;
+}
+
+static int map_peers(int i, const pspec *p, size_t np)
+{
+    return apply_json(&N[i], map_json(&N[i], p, np, 3, ALLOW_ALL_ICMP));
+}
+
+static pspec spec_of(int j, int home, int flags)
+{
+    pspec p;
+    p.id = j + 1;
+    p.key = N[j].pub;
+    p.ip = N[j].ip;
+    p.home = home;
+    p.flags = flags;
+    return p;
+}
+
 /* ---- Tests --------------------------------------------------------------- */
 
 void test_dp_ping(void);
@@ -633,6 +770,10 @@ void test_dp_pick_home(void);
 void test_dp_stress(void);
 void test_dp_expiry(void);
 void test_dp_relay_full(void);
+void test_dp_disco_pong(void);
+void test_dp_disco_limits(void);
+void test_dp_disco_ping(void);
+void test_dp_disco_keys(void);
 
 void test_dp_ping(void)
 {
@@ -918,6 +1059,7 @@ void test_dp_disco_and_unknown(void)
     /* With no disco key there is no advert. */
     advance(100);
     memset(N[0].disco, 0, 32);
+    memset(N[0].disco_priv, 0, 32);
     node_start(&N[0]);
     t_true("disco: map 3", map_of(0, 3, ALLOW_ALL_ICMP) == 0);
     ts_dp_set_home(N[0].dp, 1);
@@ -1514,5 +1656,381 @@ void test_dp_relay_full(void)
         t_true("filter count: a UDP packet against an ICMP-only filter is counted",
                st.filtered == s0.filtered + 1);
     }
+    nodes_free();
+}
+
+/* Answering pings: a pong on the region the ping came in on; everything not
+ * from a peer's own disco key is dropped with no pong and no X25519. */
+void test_dp_disco_pong(void)
+{
+    uint8_t pk[256], txid[12], other_priv[32], other[32], bad_priv[32], bad_pub[32];
+    size_t n;
+    tconn *c1, *c2;
+    ts_disco_msg m;
+    ts_dp_status st;
+    unsigned long n1, all, bad, dh;
+    int s1, s2;
+
+    setup(3, ALLOW_ALL_ICMP);
+    memset(txid, 0x21, sizeof txid);
+    n = mk_ping(pk, N[0].disco_priv, N[1].disco, txid, N[0].pub);
+    t_true("pong: ping built", n == TS_DISCO_PING_LEN);
+    s1 = slot_of(&N[1], 1);
+    c1 = conn_of(&N[1], 1);
+    n1 = c1->nsend;
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("pong: one SendPacket to A on the arrival region",
+           c1->nsend == n1 + 1 && memcmp(c1->last_dst, N[0].pub, 32) == 0 && c1->last_pkt_n == TS_DISCO_PONG_LEN);
+    t_true("pong: from B's disco key", memcmp(ts_disco_sender(c1->last_pkt), N[1].disco, 32) == 0);
+    t_true("pong: TxID and Src", open_as(&m, c1->last_pkt, c1->last_pkt_n, N[0].disco_priv) == 0 &&
+                                     m.type == TS_DISCO_PONG && memcmp(m.txid, txid, 12) == 0 &&
+                                     memcmp(m.src_ip16, PONG_SRC, 16) == 0 && m.src_port == 1);
+    st = ST(1);
+    t_true("pong: counted", st.disco_in == 1 && st.pongs_sent == 1 && st.disco_bad == 0 && CNT(1)->disco_dh == 1);
+    t_true("pong: never WireGuard", CNT(1)->wg_in == 0 && CNT(1)->disco == 1);
+    t_true("pong: A took the unmatched pong", ST(0).pongs_in == 1 && N[0].nres == 0);
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("pong: second ping, key cached", ST(1).pongs_sent == 2 && CNT(1)->disco_dh == 1);
+
+    /* A second region: the pong goes back on it, port 2. */
+    ts_dp_set_home(N[1].dp, 2);
+    pump();
+    s2 = slot_of(&N[1], 2);
+    c2 = conn_of(&N[1], 2);
+    t_true("pong: region 2 up", s2 >= 0 && c2->up);
+    n1 = c1->nsend;
+    inject(&N[1], s2, N[0].pub, pk, n);
+    t_true("pong: on region 2 (port 2), not region 1",
+           c2->nsend == 1 && c1->nsend == n1 && c2->last_pkt_n == TS_DISCO_PONG_LEN &&
+               open_as(&m, c2->last_pkt, c2->last_pkt_n, N[0].disco_priv) == 0 && m.src_port == 2 &&
+               memcmp(m.txid, txid, 12) == 0);
+    n1 = c1->nsend;
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("pong: and on region 1, port 1", c1->nsend == n1 + 1 &&
+               open_as(&m, c1->last_pkt, c1->last_pkt_n, N[0].disco_priv) == 0 && m.src_port == 1);
+
+    /* Rejects: no pong, counted, no new X25519. */
+    all = sends(&N[1]);
+    bad = ST(1).disco_bad;
+    dh = CNT(1)->disco_dh;
+    mk_key(bad_priv, bad_pub, 60);
+    n = mk_ping(pk, bad_priv, N[1].disco, txid, N[0].pub);
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("reject: unknown sender disco key", sends(&N[1]) == all && ST(1).disco_bad == bad + 1 &&
+                                                   CNT(1)->disco_dh == dh);
+    n = mk_ping(pk, N[2].disco_priv, N[1].disco, txid, N[0].pub);
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("reject: another peer's disco key from A", sends(&N[1]) == all && ST(1).disco_bad == bad + 2 &&
+                                                          CNT(1)->disco_dh == dh);
+    mk_key(other_priv, other, 61);
+    n = mk_ping(pk, N[0].disco_priv, N[1].disco, txid, N[0].pub);
+    inject(&N[1], s1, other, pk, n);
+    t_true("reject: frame source not a peer", sends(&N[1]) == all && ST(1).disco_bad == bad + 3 &&
+                                                  CNT(1)->disco_dh == dh && CNT(1)->unknown == 0);
+    pk[70] ^= 1;
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("reject: forged box", sends(&N[1]) == all && ST(1).disco_bad == bad + 4 && CNT(1)->disco_dh == dh);
+    pk[70] ^= 1;
+    inject(&N[1], s1, N[0].pub, pk, 61);
+    t_true("reject: too short", sends(&N[1]) == all && ST(1).disco_bad == bad + 5 && CNT(1)->wg_in == 0);
+    {
+        uint8_t pt[20];
+        memset(pt, 0, sizeof pt);
+        pt[0] = 3;   /* CallMeMaybe */
+        n = mk_raw(pk, N[0].disco_priv, N[1].disco, pt, sizeof pt);
+        inject(&N[1], s1, N[0].pub, pk, n);
+        t_true("other type: ignored, counted", sends(&N[1]) == all && ST(1).disco_bad == bad + 5 &&
+                                                   CNT(1)->disco_other == 1);
+    }
+    memset(txid, 0x77, sizeof txid);
+    n = mk_pong(pk, N[0].disco_priv, N[1].disco, txid);
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("unknown pong: no result", N[1].nres == 0 && ST(1).pongs_in == 1 && sends(&N[1]) == all);
+
+    /* A peer with no DiscoKey in the map. */
+    {
+        pspec p[2];
+        p[0] = spec_of(0, 1, P_NODISCO);
+        p[1] = spec_of(2, 1, 0);
+        t_true("nodisco: map", map_peers(1, p, 2) == 0);
+        t_true("nodisco: A's cached key dropped", ts_dp_test_disco_keys(N[1].dp) == 0);
+        n = mk_ping(pk, N[0].disco_priv, N[1].disco, txid, N[0].pub);
+        inject(&N[1], s1, N[0].pub, pk, n);
+        t_true("nodisco: dropped, no X25519", sends(&N[1]) == all && ST(1).disco_bad == bad + 6 &&
+                                                  CNT(1)->disco_dh == dh);
+    }
+    /* No disco key of our own: nothing is answered. */
+    memset(N[1].disco_priv, 0, 32);
+    memset(N[1].disco, 0, 32);
+    node_start(&N[1]);
+    t_true("own: no disco key held", !ts_dp_test_has_disco_priv(N[1].dp));
+    t_true("own: map", map_of(1, 3, ALLOW_ALL_ICMP) == 0);
+    ts_dp_set_home(N[1].dp, 1);
+    pump();
+    s1 = slot_of(&N[1], 1);
+    all = sends(&N[1]);
+    n1 = ST(1).pongs_sent;
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("own: not answered", sends(&N[1]) == all && ST(1).pongs_sent == n1);
+    t_true("pong: no bad callbacks", N[0].bad_tun == 0 && N[1].bad_tun == 0);
+    nodes_free();
+}
+
+#define FAKES 25
+
+/* The DH budget (shared with WireGuard handshakes) and the pong limits. */
+void test_dp_disco_limits(void)
+{
+    uint8_t fpriv[FAKES][32], fpub[FAKES][32], dpriv[32], dpub[32], txid[12], pk[256];
+    pspec p[FAKES + 1];
+    size_t n;
+    int k, j, s1;
+    ts_dp_status st;
+
+    setup(2, ALLOW_ALL_ICMP);
+    p[0] = spec_of(0, 1, 0);
+    for (k = 0; k < FAKES; k++) {
+        mk_key(fpriv[k], fpub[k], 100 + k);
+        p[k + 1].id = 100 + k;
+        p[k + 1].key = fpub[k];
+        p[k + 1].ip = 0x64400100u | (uint32_t)(k + 1);   /* 100.64.1.k+1 */
+        p[k + 1].home = 1;
+        p[k + 1].flags = 0;
+    }
+    t_true("limits: map", map_peers(1, p, FAKES + 1) == 0);
+    s1 = slot_of(&N[1], 1);
+    memset(txid, 0x31, sizeof txid);
+    for (k = 0; k < FAKES; k++) {
+        fake_disco(dpriv, dpub, fpub[k]);
+        n = mk_ping(pk, dpriv, N[1].disco, txid, fpub[k]);
+        inject(&N[1], s1, fpub[k], pk, n);
+    }
+    st = ST(1);
+    t_true("budget: 20 keys in a second", CNT(1)->disco_dh == TS_WG_HS_PER_SEC && st.pongs_sent == 20 &&
+                                              CNT(1)->disco_budget == 5 && st.disco_bad == 5);
+    advance(1000);
+    for (k = 20; k < FAKES; k++) {
+        fake_disco(dpriv, dpub, fpub[k]);
+        n = mk_ping(pk, dpriv, N[1].disco, txid, fpub[k]);
+        inject(&N[1], s1, fpub[k], pk, n);
+    }
+    t_true("budget: the rest a second later", CNT(1)->disco_dh == FAKES && ST(1).pongs_sent == FAKES &&
+                                                  ts_dp_test_disco_keys(N[1].dp) == FAKES);
+
+    /* One peer: 10 a second. */
+    advance(1000);
+    n = mk_ping(pk, N[0].disco_priv, N[1].disco, txid, N[0].pub);
+    for (j = 0; j < 15; j++) inject(&N[1], s1, N[0].pub, pk, n);
+    st = ST(1);
+    t_true("rate: 10 per peer per second", st.pongs_sent == FAKES + 10 && st.pongs_limited == 5);
+    advance(1000);
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("rate: again after a second", ST(1).pongs_sent == FAKES + 11 && ST(1).pongs_limited == 5);
+
+    /* All peers: 50 a second. */
+    advance(1000);
+    for (j = 0; j < 3; j++) {
+        for (k = 0; k < FAKES; k++) {
+            fake_disco(dpriv, dpub, fpub[k]);
+            n = mk_ping(pk, dpriv, N[1].disco, txid, fpub[k]);
+            inject(&N[1], s1, fpub[k], pk, n);
+        }
+    }
+    st = ST(1);
+    t_true("rate: 50 per second in all", st.pongs_sent == FAKES + 11 + 50 && st.pongs_limited == 5 + 25);
+    t_true("rate: no new keys (A's is the one more)", CNT(1)->disco_dh == FAKES + 1);
+    nodes_free();
+}
+
+/* The last ping B received from A on region r, opened: its TxID. */
+static int last_ping_txid(int from, int region, int to, uint8_t txid[12])
+{
+    tconn *c = conn_of(&N[from], region);
+    ts_disco_msg m;
+    if (open_as(&m, c->last_pkt, c->last_pkt_n, N[to].disco_priv) != 0 || m.type != TS_DISCO_PING) return -1;
+    memcpy(txid, m.txid, 12);
+    return 0;
+}
+
+static int res_is(const tnode *n, int i, uint64_t cookie, int status, int region)
+{
+    return n->nres > i && n->res_cookie[i] == cookie && n->res_status[i] == status && n->res_region[i] == region;
+}
+
+/* Our pings: to the home region, results by callback. */
+void test_dp_disco_ping(void)
+{
+    uint8_t pk[256], txid[12], late[256];
+    size_t n, nlate;
+    ts_disco_msg m;
+    tconn *c;
+    int k, s1;
+
+    setup(3, ALLOW_ALL_ICMP);
+    t_true("ping: sent", ts_dp_ping(N[0].dp, N[1].ip, 1000, 42, g_now) == 0);
+    g_now += 30;
+    ts_dp_tick(N[0].dp, g_now);
+    pump();
+    c = conn_of(&N[0], 1);
+    t_true("ping: a ping from A's disco key with A's node key", c->last_pkt_n == TS_DISCO_PING_LEN &&
+               memcmp(c->last_dst, N[1].pub, 32) == 0 && memcmp(ts_disco_sender(c->last_pkt), N[0].disco, 32) == 0 &&
+               open_as(&m, c->last_pkt, c->last_pkt_n, N[1].disco_priv) == 0 && m.type == TS_DISCO_PING &&
+               m.have_node_key && memcmp(m.node_key, N[0].pub, 32) == 0);
+    t_true("ping: pong delivered", N[0].nres == 1 && res_is(&N[0], 0, 42, TS_DP_PONG, 1) && N[0].res_lat[0] == 30000);
+    t_true("ping: counters", ST(0).pings_sent == 1 && ST(0).pongs_in == 1 && ST(1).pongs_sent == 1);
+    /* The same pong again: ignored. */
+    c = conn_of(&N[1], 1);
+    memcpy(pk, c->last_pkt, c->last_pkt_n);
+    n = c->last_pkt_n;
+    s1 = slot_of(&N[0], 1);
+    inject(&N[0], s1, N[1].pub, pk, n);
+    t_true("ping: duplicate ignored", N[0].nres == 1 && ST(0).pongs_in == 2);
+    memset(txid, 0x99, sizeof txid);
+    n = mk_pong(pk, N[1].disco_priv, N[0].disco, txid);
+    inject(&N[0], s1, N[1].pub, pk, n);
+    t_true("ping: unknown TxID ignored", N[0].nres == 1 && ST(0).pongs_in == 3);
+
+    /* B silent: the right TxID from another peer is no answer. */
+    N[1].active = 0;
+    t_true("bind: sent", ts_dp_ping(N[0].dp, N[1].ip, 1000, 43, g_now) == 0);
+    pump();
+    t_true("bind: TxID", last_ping_txid(0, 1, 1, txid) == 0);
+    n = mk_pong(pk, N[2].disco_priv, N[0].disco, txid);
+    inject(&N[0], s1, N[2].pub, pk, n);
+    t_true("bind: C's pong with B's TxID ignored", N[0].nres == 1);
+    n = mk_pong(pk, N[1].disco_priv, N[0].disco, txid);
+    inject(&N[0], s1, N[2].pub, pk, n);
+    t_true("bind: B's pong from C's frame dropped", N[0].nres == 1);
+    inject(&N[0], s1, N[1].pub, pk, n);
+    t_true("bind: B's pong matches", N[0].nres == 2 && res_is(&N[0], 1, 43, TS_DP_PONG, 1));
+
+    /* Timeout, then a late pong. */
+    t_true("timeout: sent", ts_dp_ping(N[0].dp, N[1].ip, 500, 44, g_now) == 0);
+    pump();
+    t_true("timeout: TxID", last_ping_txid(0, 1, 1, txid) == 0);
+    nlate = mk_pong(late, N[1].disco_priv, N[0].disco, txid);
+    advance(400);
+    t_true("timeout: not yet", N[0].nres == 2);
+    advance(150);
+    t_true("timeout: status 1", N[0].nres == 3 && res_is(&N[0], 2, 44, TS_DP_PING_TIMEOUT, 1) && N[0].res_lat[2] == 0);
+    inject(&N[0], s1, N[1].pub, late, nlate);
+    t_true("timeout: late pong ignored", N[0].nres == 3);
+
+    /* At most 16 outstanding. */
+    for (k = 0; k < TS_DP_MAX_PINGS; k++)
+        if (ts_dp_ping(N[0].dp, N[1].ip, 1000, 100 + (uint64_t)k, g_now) != 0) break;
+    t_true("busy: 16 accepted", k == TS_DP_MAX_PINGS);
+    t_true("busy: the 17th refused", ts_dp_ping(N[0].dp, N[1].ip, 1000, 200, g_now) == TS_DP_PING_BUSY);
+    advance(1100);
+    t_true("busy: all timed out", N[0].nres == 3 + TS_DP_MAX_PINGS);
+    t_true("busy: room again", ts_dp_ping(N[0].dp, N[1].ip, 1000, 201, g_now) == 0);
+    advance(1100);
+    t_true("busy: timed out", N[0].nres == 4 + TS_DP_MAX_PINGS);
+
+    /* Errors. */
+    t_true("err: unknown peer", ts_dp_ping(N[0].dp, IP_OF(77), 1000, 1, g_now) == TS_DP_PING_UNKNOWN);
+    {
+        pspec p[2];
+        p[1] = spec_of(2, 1, 0);
+        p[0] = spec_of(1, 1, P_NODISCO);
+        t_true("err: map 1", map_peers(0, p, 2) == 0);
+        t_true("err: no disco key", ts_dp_ping(N[0].dp, N[1].ip, 1000, 1, g_now) == TS_DP_PING_NO_DISCO);
+        p[0] = spec_of(1, 1, P_EXPIRED);
+        t_true("err: map 2", map_peers(0, p, 2) == 0);
+        t_true("err: expired", ts_dp_ping(N[0].dp, N[1].ip, 1000, 1, g_now) == TS_DP_PING_EXPIRED);
+        p[0] = spec_of(1, 1, P_JAILED);
+        t_true("err: map 3", map_peers(0, p, 2) == 0);
+        t_true("err: jailed is unknown", ts_dp_ping(N[0].dp, N[1].ip, 1000, 1, g_now) == TS_DP_PING_UNKNOWN);
+        p[0] = spec_of(1, 0, 0);
+        t_true("err: map 4", map_peers(0, p, 2) == 0);
+        t_true("err: no home", ts_dp_ping(N[0].dp, N[1].ip, 1000, 1, g_now) == TS_DP_PING_NO_HOME);
+        p[0] = spec_of(1, 9, 0);
+        t_true("err: map 5", map_peers(0, p, 2) == 0);
+        t_true("err: home not in the map", ts_dp_ping(N[0].dp, N[1].ip, 1000, 1, g_now) == TS_DP_PING_NO_HOME);
+        N[0].rand_fail = 1;
+        t_true("err: no randomness", ts_dp_ping(N[0].dp, N[2].ip, 1000, 1, g_now) == TS_DP_PING_FAILED);
+        N[0].rand_fail = 0;
+    }
+    t_true("err: no results from refused pings", N[0].nres == 4 + TS_DP_MAX_PINGS);
+
+    /* Home region 2: dialed for the ping; no answer there yet, so a timeout
+     * names region 2; then B joins region 2 and answers there. */
+    N[1].active = 1;
+    {
+        pspec p[2];
+        int nd = N[0].ndial;
+        p[0] = spec_of(1, 2, 0);
+        p[1] = spec_of(2, 1, 0);
+        t_true("home: map", map_peers(0, p, 2) == 0);
+        t_true("home: sent", ts_dp_ping(N[0].dp, N[1].ip, 500, 300, g_now) == 0);
+        pump();
+        t_true("home: region 2 dialed", N[0].ndial == nd + 1 && N[0].last_dial_region == 2 &&
+                                            conn_of(&N[0], 2)->nsend == 1);
+        advance(600);
+        t_true("home: timeout names region 2", res_is(&N[0], 4 + TS_DP_MAX_PINGS, 300, TS_DP_PING_TIMEOUT, 2));
+        ts_dp_set_home(N[1].dp, 2);
+        pump();
+        t_true("home: sent again", ts_dp_ping(N[0].dp, N[1].ip, 500, 301, g_now) == 0);
+        pump();
+        t_true("home: pong via region 2", res_is(&N[0], 5 + TS_DP_MAX_PINGS, 301, TS_DP_PONG, 2) &&
+                                              conn_of(&N[1], 2)->nsend == 1);
+    }
+
+    /* Stop with a ping outstanding: ended with status 2. */
+    N[1].active = 0;
+    t_true("stop: sent", ts_dp_ping(N[0].dp, N[1].ip, 5000, 400, g_now) == 0);
+    ts_dp_stop(N[0].dp);
+    t_true("stop: ended", res_is(&N[0], 6 + TS_DP_MAX_PINGS, 400, TS_DP_PING_STOPPED, 2));
+    t_true("stop: refused while stopped", ts_dp_ping(N[0].dp, N[1].ip, 1000, 1, g_now) == TS_DP_PING_DOWN);
+    N[1].active = 1;
+
+    /* No disco key of our own. */
+    memset(N[0].disco_priv, 0, 32);
+    memset(N[0].disco, 0, 32);
+    node_start(&N[0]);
+    t_true("own: map", map_of(0, 3, ALLOW_ALL_ICMP) == 0);
+    t_true("own: no disco key", ts_dp_ping(N[0].dp, N[1].ip, 1000, 1, g_now) == TS_DP_PING_FAILED);
+    t_true("ping: no bad callbacks", N[0].bad_tun == 0 && N[1].bad_tun == 0 && N[2].bad_tun == 0);
+    nodes_free();
+}
+
+/* Disco keys are wiped on stop, on a peer's key change and on removal. */
+void test_dp_disco_keys(void)
+{
+    uint8_t pk[256], txid[12], old_priv[32];
+    size_t n;
+    int s1;
+
+    setup(2, ALLOW_ALL_ICMP);
+    t_true("keys: private key held", ts_dp_test_has_disco_priv(N[0].dp) && ts_dp_test_has_disco_priv(N[1].dp));
+    t_true("keys: none cached yet", ts_dp_test_disco_keys(N[0].dp) == 0);
+    t_true("keys: ping", ts_dp_ping(N[0].dp, N[1].ip, 1000, 1, g_now) == 0);
+    pump();
+    t_true("keys: one cached each", N[0].nres == 1 && ts_dp_test_disco_keys(N[0].dp) == 1 &&
+                                        ts_dp_test_disco_keys(N[1].dp) == 1);
+
+    /* A's disco key changes in B's map. */
+    memcpy(old_priv, N[0].disco_priv, 32);
+    mk_key(N[0].disco_priv, N[0].disco, 70);
+    t_true("keys: B's map with A's new key", map_of(1, 3, ALLOW_ALL_ICMP) == 0);
+    t_true("keys: B dropped A's key", ts_dp_test_disco_keys(N[1].dp) == 0);
+    s1 = slot_of(&N[1], 1);
+    memset(txid, 0x41, sizeof txid);
+    n = mk_ping(pk, old_priv, N[1].disco, txid, N[0].pub);
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("keys: the old key is refused", ST(1).pongs_sent == 1 && ST(1).disco_bad == 1);
+    n = mk_ping(pk, N[0].disco_priv, N[1].disco, txid, N[0].pub);
+    inject(&N[1], s1, N[0].pub, pk, n);
+    t_true("keys: the new key is answered", ST(1).pongs_sent == 2 && ts_dp_test_disco_keys(N[1].dp) == 1);
+    t_true("keys: the same map keeps it", map_of(1, 3, ALLOW_ALL_ICMP) == 0 && ts_dp_test_disco_keys(N[1].dp) == 1);
+
+    /* A leaves the device (expired). */
+    {
+        pspec p = spec_of(0, 1, P_EXPIRED);
+        t_true("keys: A expired", map_peers(1, &p, 1) == 0 && ts_dp_test_disco_keys(N[1].dp) == 0);
+    }
+
+    ts_dp_stop(N[0].dp);
+    t_true("keys: stop wipes", !ts_dp_test_has_disco_priv(N[0].dp) && ts_dp_test_disco_keys(N[0].dp) == 0);
     nodes_free();
 }

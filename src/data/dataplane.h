@@ -42,7 +42,27 @@
  * use, the least recently written non-home slot is closed first. Until the
  * relay is ready, whole SendPacket requests wait in the slot's queue
  * (TS_DP_QUEUE_PER_CONN; when full, new ones are dropped) and are sent in
- * order once it is. Relay packets starting with the disco magic are dropped.
+ * order once it is.
+ *
+ * Disco over relays (upstream disco and magicsock, relay paths only): a relay
+ * packet of at least 38 bytes starting with the disco magic never reaches
+ * WireGuard. It is accepted only if the frame's source is a configured peer
+ * (as above) whose netmap DiscoKey is set and equals the packet's sender disco
+ * key (stricter than upstream, which takes any known disco key), and the box
+ * opens; anything else is dropped and counted (disco_bad), with no X25519.
+ * The box key for a peer is computed once (one X25519, taken from the
+ * WireGuard device's handshake budget, TS_WG_HS_PER_SEC; over budget the
+ * packet is dropped and counted) and cached until the peer's disco key
+ * changes, the peer leaves the device, or the data plane stops. Then:
+ * - ping: answered with a pong sealed to that peer (Src ::ffff:127.3.3.40,
+ *   port = the region ID it arrived on) on the same relay connection it
+ *   arrived on, at most TS_DP_PONGS_PER_PEER per second per peer and
+ *   TS_DP_PONGS_PER_SEC in all (excess dropped, counted pongs_limited);
+ * - pong: delivered through io->ping_result if its TxID is an outstanding
+ *   ping (ts_dp_ping) to that same peer that has not timed out; the first
+ *   match ends the ping, so later copies are ignored;
+ * - any other type (CallMeMaybe, the relay types): ignored, counted.
+ * Our own pings go to the peer's home region (dialed if needed, as data).
  *
  * Contracts for the caller:
  * - Time is the now_ms of the last ts_dp_tick, as in the WireGuard device.
@@ -70,6 +90,21 @@
 #define TS_DP_REDIAL_MIN_MS 1000
 #define TS_DP_REDIAL_MAX_MS 30000
 #define TS_DP_EXPIRY_CHECK_MS 5000
+#define TS_DP_MAX_PINGS 16                 /* outstanding ts_dp_ping calls */
+#define TS_DP_PONGS_PER_PEER 10            /* pongs per second to one peer */
+#define TS_DP_PONGS_PER_SEC 50             /* pongs per second in all */
+/* ping_result status. */
+#define TS_DP_PONG 0
+#define TS_DP_PING_TIMEOUT 1
+#define TS_DP_PING_STOPPED 2               /* the data plane stopped first */
+/* ts_dp_ping errors. */
+#define TS_DP_PING_UNKNOWN (-1)            /* no peer with that address in the device */
+#define TS_DP_PING_NO_DISCO (-2)           /* the peer has no disco key */
+#define TS_DP_PING_EXPIRED (-3)            /* the peer's node key has expired */
+#define TS_DP_PING_NO_HOME (-4)            /* the peer's home region is 0, not in the map, or has no node */
+#define TS_DP_PING_BUSY (-5)               /* TS_DP_MAX_PINGS outstanding */
+#define TS_DP_PING_DOWN (-6)               /* the data plane is not running */
+#define TS_DP_PING_FAILED (-7)             /* no disco key of our own, a key that cannot be used, no randomness, no slot */
 typedef struct {
     /* Open a stream to node (TCP to node->ipv4:port, then TLS for node->host). Later
      * ts_dp_conn_up / ts_dp_conn_down report on slot. 0 started, -1 failed now. */
@@ -82,13 +117,23 @@ typedef struct {
     void (*tun_write)(void *user, const uint8_t *ip, size_t n);
     int (*random)(void *user, uint8_t *out, size_t n);
     int64_t (*wall)(void *user, uint32_t *nsec);
+    /* The end of a ts_dp_ping (may be NULL): status TS_DP_PONG with the
+     * round trip in microseconds (at the data plane's clock resolution), or
+     * TS_DP_PING_TIMEOUT or TS_DP_PING_STOPPED with latency 0. region_id is
+     * the region the ping was sent to. Called from inside ts_dp_conn_recv,
+     * ts_dp_tick, ts_dp_stop, ts_dp_start and ts_dp_free: must not call back
+     * into the data plane. */
+    void (*ping_result)(void *user, uint64_t cookie, int status, uint32_t latency_us, int region_id);
 } ts_dp_io;
 typedef struct ts_dp ts_dp;
 ts_dp *ts_dp_new(const ts_dp_io *io, void *user);
 void ts_dp_free(ts_dp *dp);
-/* Start with our keys and address (wipes any earlier run). */
-int ts_dp_start(ts_dp *dp, const uint8_t node_priv[32], const uint8_t disco_pub[32], uint32_t self_ip);
-void ts_dp_stop(ts_dp *dp);                       /* closes every connection, wipes sessions */
+/* Start with our keys and address (wipes any earlier run). An all-zero
+ * disco_priv means no disco key: no disco advert, no pongs, no pings. */
+int ts_dp_start(ts_dp *dp, const uint8_t node_priv[32], const uint8_t disco_priv[32], uint32_t self_ip);
+/* Closes every connection, wipes sessions, keys and cached disco keys, and
+ * ends every outstanding ping with TS_DP_PING_STOPPED. */
+void ts_dp_stop(ts_dp *dp);
 int ts_dp_running(const ts_dp *dp);
 /* Copy what the data plane needs from the map: peers (node key, ipv4, home_derp,
  * wireguard_only, jailed, expired, online), and the DERP map and filters when
@@ -104,6 +149,14 @@ void ts_dp_conn_up(ts_dp *dp, int slot);
 void ts_dp_conn_recv(ts_dp *dp, int slot, const uint8_t *p, size_t n);
 void ts_dp_conn_down(ts_dp *dp, int slot, const char *why);
 void ts_dp_tick(ts_dp *dp, int64_t now_ms);
+/* Send a disco ping to the configured peer with tailnet address peer_ip, on
+ * its home region. 0, or a TS_DP_PING_* error. On 0, io->ping_result reports
+ * cookie exactly once: a pong, a timeout timeout_ms after now_ms (seen by
+ * ts_dp_tick), or a stop. now_ms is the current time on the clock of
+ * ts_dp_tick. The peer's box key, if not cached yet, is computed here without
+ * the DH budget: this is asked for locally, and costs one X25519 per peer
+ * disco key. */
+int ts_dp_ping(ts_dp *dp, uint32_t peer_ip, uint32_t timeout_ms, uint64_t cookie, int64_t now_ms);
 /* Pick a home region from probe latencies (ms, -1 unknown), per Appendix B, B4. */
 int ts_dp_pick_home(const ts_derp_region *r, size_t n, const int *lat_ms, int current,
                     uint32_t rand32);
@@ -113,6 +166,11 @@ typedef struct {
     char problem[200];
     unsigned long filtered;      /* packets from peers the filter dropped (since ts_dp_new) */
     unsigned long relay_full;    /* packets dropped: a relay connection's output was full */
+    /* Disco, since ts_dp_new. */
+    unsigned long disco_in;      /* relay packets with the disco magic */
+    unsigned long disco_bad;     /* of those, dropped: not from a peer's disco key, over the DH budget, box or parse failed */
+    unsigned long pongs_sent, pongs_limited, pings_sent;
+    unsigned long pongs_in;      /* authentic pongs received (matched or not) */
 } ts_dp_status;
 void ts_dp_get_status(const ts_dp *dp, ts_dp_status *st);
 int ts_dp_peer_status(const ts_dp *dp, uint32_t ipv4, ts_wg_stats *st, int *region);
@@ -144,12 +202,19 @@ typedef struct {
     unsigned long tsmp;        /* deliver: protocol 99 */
     unsigned long filtered;    /* deliver: the filter said no */
     unsigned long queue_full;  /* SendPacket dropped: slot queue full */
+    unsigned long disco_dh;    /* disco box keys computed (X25519) */
+    unsigned long disco_budget;/* disco packets dropped over the DH budget */
+    unsigned long disco_other; /* disco messages of other types, ignored */
 } ts_dp_test_counts;
 const ts_dp_test_counts *ts_dp_test_counters(const ts_dp *dp);
 /* Called with every packet WireGuard delivers, before any check. */
 extern void (*ts_dp_test_on_deliver)(void *user, const uint8_t *ip, size_t n);
 /* 1 if the device holds key material for that peer key. */
 int ts_dp_test_has_keys(const ts_dp *dp, const uint8_t key[32]);
+/* 1 if the data plane holds a non-zero disco private key. */
+int ts_dp_test_has_disco_priv(const ts_dp *dp);
+/* How many peers have a cached disco box key. */
+int ts_dp_test_disco_keys(const ts_dp *dp);
 #endif
 
 #endif
