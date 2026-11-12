@@ -781,6 +781,38 @@ static void test_dpio_kextload_rate(void)
     kext_end();
 }
 
+static int kext_err;
+static int kext_err_open(char ifname[16])
+{
+    (void)ifname;
+    n_open++;
+    errno = kext_err;
+    return -1;
+}
+
+/* Another tuntaposx is loaded (units busy or not ours to open): never stack. */
+static void test_dpio_no_kextload_foreign(void)
+{
+    static const int errs[2] = {EBUSY, EACCES};
+    static const char *const want[2] = {"every tunnel device is in use", "cannot open the tunnel device"};
+    int i;
+    for (i = 0; i < 2; i++) {
+        ts_dpio_view v;
+        if (kext_begin(0755, 1) != 0) {
+            t_true("dpio: no kextload over a foreign driver: setup", 0);
+            kext_end();
+            continue;
+        }
+        kext_err = errs[i];
+        ts_dpio_test_tun_open = kext_err_open;
+        turn(1);
+        ts_dpio_get_view(&v);
+        t_true("dpio: no kextload over a foreign driver: not called", kext_calls == 0);
+        t_true("dpio: no kextload over a foreign driver: status says why", !v.tun_open && has(v.problem, want[i]));
+        kext_end();
+    }
+}
+
 void test_dpio(void)
 {
     test_dpio_probe_clock();
@@ -794,4 +826,5 @@ void test_dpio(void)
     test_dpio_no_kextload_unsafe();
     test_dpio_kextload_wrong_owner();
     test_dpio_kextload_rate();
+    test_dpio_no_kextload_foreign();
 }

@@ -458,7 +458,7 @@ static int kext_safe(void)
 /* No tun device opened and every failure was ENOENT: the driver is not
  * loaded. Load our own kext, at most once per TS_DPIO_TUN_RETRY_MS. Returns 1
  * if it loaded, so that the units are tried once more. Never unloads. */
-static int kext_load(void)
+static int kext_load(int *ran)
 {
     const char *argv[3];
     int rc;
@@ -466,6 +466,7 @@ static int kext_load(void)
     if (!kext_safe()) return 0;
     G.kext_tried = 1;
     G.kext_at = G.now;
+    *ran = 1;
     argv[0] = "/sbin/kextload";
     argv[1] = G.kext_path;
     argv[2] = NULL;
@@ -490,12 +491,11 @@ static void tun_open(void)
     G.tun_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
     fd = TUN_OPEN(G.ifname);
     if (fd < 0 && errno == ENOENT) {
-        int was = G.kext_tried;
-        int64_t was_at = G.kext_at;
+        int ran = 0;
         int e = errno;
-        int loaded = kext_load();
+        int loaded = kext_load(&ran);
         errno = e;   /* the problem text below still says "not loaded" */
-        if (G.kext_tried != was || G.kext_at != was_at)   /* kextload ran, and blocked */
+        if (ran)   /* kextload ran, and blocked */
             G.tun_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
         if (loaded) fd = TUN_OPEN(G.ifname);
     }
