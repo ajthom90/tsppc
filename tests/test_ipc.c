@@ -19,6 +19,9 @@
 #include "../src/control/session.h"
 #include "../src/daemon/ipc.h"
 #include "../src/core/bytes.h"
+#include "../src/crypto/nacl.h"
+#include "../src/crypto/x25519.h"
+#include "../src/derp/derp.h"
 #include "../src/proto/encoding.h"
 #include "../src/state/store.h"
 
@@ -257,6 +260,10 @@ static pid_t start_daemon(const char *statedir, const char *sock, const char *lo
         setenv("TSPPC_SOCKET", sock, 1);
         snprintf(ctl, sizeof ctl, "localhost:%d", g_ctl_port);
         setenv("TSPPC_CONTROL", ctl, 1);
+        /* Never the real tun, route or ifconfig, even as root on the VM; relays
+         * in these tests are plain TCP. */
+        setenv("TSPPC_NO_TUN", "1", 1);
+        setenv("TSPPC_DERP_PLAIN", "1", 1);
         if (key) setenv("TSPPC_CONTROL_KEY", key, 1);
         else unsetenv("TSPPC_CONTROL_KEY");
         execl(TS_BIN_DIR "/tsppcd", "tsppcd", (char *)NULL);
@@ -568,6 +575,313 @@ static void test_daemon_down(void)
     remove_test_files(statedir, sock, logpath, countpath);
 }
 
+/* ---- The data plane: a fake relay and home selection --------------------- */
+
+#define RELAY_REGION 7
+#define DEAD_REGION 9
+static char g_relay_map[2048];   /* the map, with the fake relay's port */
+static char g_lites_path[128];   /* the fake control appends each lite update's body here */
+
+/* Like fk_handler, but lite map updates (Stream false) are recorded and
+ * answered 200, and the stream gets g_relay_map. */
+static void fk_relay_handler(fake *f, fk_req *r)
+{
+    if (strcmp(r->path, "/machine/register") == 0) {
+        fk_reply(f, r, 200, "{\"MachineAuthorized\":true}");
+    } else if (strcmp(r->path, "/machine/map") == 0 && r->body && strstr(r->body, "\"Stream\":false")) {
+        int fd = open(g_lites_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (fd >= 0) {
+            (void)write(fd, r->body, strlen(r->body));
+            (void)write(fd, "\n", 1);
+            close(fd);
+        }
+        fk_reply(f, r, 200, "");
+    } else if (strcmp(r->path, "/machine/map") == 0) {
+        fk_headers(f, r, 200, NULL, 0, 0);
+        fk_map_msg(f, r, g_relay_map);
+    }
+}
+
+static void note(const char *path, const char *what)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) {
+        (void)write(fd, what, strlen(what));
+        close(fd);
+    }
+}
+
+static int read_all(int fd, uint8_t *p, size_t n)
+{
+    while (n) {
+        ssize_t k = read(fd, p, n);
+        if (k <= 0) return -1;
+        p += k;
+        n -= (size_t)k;
+    }
+    return 0;
+}
+
+static void write_all(int fd, const uint8_t *p, size_t n)
+{
+    while (n) {
+        ssize_t k = write(fd, p, n);
+        if (k <= 0) return;
+        p += k;
+        n -= (size_t)k;
+    }
+}
+
+static void relay_frame(int fd, int type, const uint8_t *body, size_t n)
+{
+    uint8_t h[5];
+    h[0] = (uint8_t)type;
+    ts_put_be32(h + 1, (uint32_t)n);
+    write_all(fd, h, 5);
+    write_all(fd, body, n);
+}
+
+/* One connection to the fake relay (plain TCP, as TSPPC_DERP_PLAIN makes the
+ * daemon talk): the DERP upgrade, ServerKey, ServerInfo after a valid
+ * ClientInfo, then frames until the daemon closes. A connection that closes
+ * before sending anything is a home probe. Events go to evpath: 'u' upgraded,
+ * 'r' ServerInfo sent, 'P'/'p' NotePreferred 1/0, 'e' closed after the
+ * upgrade, 'b' a broken ClientInfo. */
+static void relay_serve(int fd, const char *evpath, const uint8_t s_priv[32], const uint8_t s_pub[32])
+{
+    static const char resp[] = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\n"
+                               "Connection: Upgrade\r\nDerp-Version: 2\r\n\r\n";
+    static uint8_t body[70000];
+    char hdr[2048];
+    size_t hl = 0;
+    uint8_t sk[40], h[5];
+
+    while (hl < sizeof hdr - 1) {
+        ssize_t k = read(fd, hdr + hl, 1);
+        if (k <= 0) return;   /* a probe: connected, closed */
+        hl += (size_t)k;
+        if (hl >= 4 && memcmp(hdr + hl - 4, "\r\n\r\n", 4) == 0) break;
+    }
+    hdr[hl] = 0;
+    if (strncmp(hdr, "GET /derp HTTP/1.1\r\n", 20) != 0) return;
+    write_all(fd, (const uint8_t *)resp, sizeof resp - 1);
+    memcpy(sk, "DERP\xf0\x9f\x94\x91", 8);
+    memcpy(sk + 8, s_pub, 32);
+    relay_frame(fd, TS_DERP_SERVER_KEY, sk, 40);
+    note(evpath, "u");
+    for (;;) {
+        uint32_t len;
+        if (read_all(fd, h, 5) != 0) break;
+        len = ts_get_be32(h + 1);
+        if (len > sizeof body || read_all(fd, body, len) != 0) break;
+        if (h[0] == TS_DERP_CLIENT_INFO) {
+            uint8_t json[256], info[24 + 16 + 64], cpub[32];
+            static const char sj[] = "{\"version\":2}";
+            size_t i;
+            if (len < 72 || len - 72 >= sizeof json ||
+                ts_box_open(json, body + 32, body, s_priv, body + 56, len - 56) != 0) {
+                note(evpath, "b");
+                break;
+            }
+            memcpy(cpub, body, 32);
+            for (i = 0; i < 24; i++) info[i] = (uint8_t)(0x40 + i);
+            ts_box_seal(info + 24, info, cpub, s_priv, (const uint8_t *)sj, sizeof sj - 1);
+            relay_frame(fd, TS_DERP_SERVER_INFO, info, 24 + 16 + sizeof sj - 1);
+            note(evpath, "r");
+        } else if (h[0] == TS_DERP_NOTE_PREFERRED && len == 1) {
+            note(evpath, body[0] ? "P" : "p");
+        }
+    }
+    note(evpath, "e");
+}
+
+static void relay_server(int lfd, const char *evpath)
+{
+    uint8_t s_priv[32], s_pub[32];
+    int i, nul = open("/dev/null", O_RDWR);
+    if (nul >= 0) {
+        dup2(nul, 1);
+        dup2(nul, 2);
+        if (nul > 2) close(nul);
+    }
+    alarm(600);
+    for (i = 0; i < 32; i++) s_priv[i] = (uint8_t)(0x31 + 7 * i);   /* made up */
+    ts_state_clamp_key(s_priv);
+    ts_x25519_public(s_pub, s_priv);
+    for (;;) {
+        int fd = accept(lfd, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        if (getppid() == 1) return;
+        relay_serve(fd, evpath, s_priv, s_pub);
+        close(fd);
+    }
+}
+
+static int listen_local(uint16_t *port)
+{
+    struct sockaddr_in sa;
+    socklen_t sl = sizeof sa;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (fd < 0 || bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(fd, 8) != 0 ||
+        getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    *port = ntohs(sa.sin_port);
+    return fd;
+}
+
+static int file_has(const char *path, const char *want)
+{
+    char buf[16384];
+    FILE *f = fopen(path, "r");
+    size_t n = 0;
+    if (!f) return 0;
+    n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return strstr(buf, want) != NULL;
+}
+
+static int wait_file_has(const char *path, const char *want, int ms)
+{
+    int64_t until = mono_ms() + ms;
+    do {
+        if (file_has(path, want)) return 1;
+        nap_ms(100);
+    } while (mono_ms() < until);
+    return 0;
+}
+
+/* The daemon runs the data plane once RUNNING: probes pick the reachable
+ * region, the relay connection comes up as home, control hears the region in
+ * a lite update, and down stops it all. */
+static void test_daemon_relay(void)
+{
+    static fake f;
+    char statedir[128], sock[128], logpath[128], countpath[128], evpath[128], key[65], out[8192], err[256];
+    ts_state st;
+    pid_t pid, srv, rsrv;
+    int lfd, rfd, rc;
+    uint16_t cport, rport;
+
+    if (access(TS_BIN_DIR "/tsppcd", X_OK) != 0 || access(TS_BIN_DIR "/tsppc", X_OK) != 0) {
+        printf("SKIP: relay tests (no " TS_BIN_DIR "/tsppcd or tsppc here)\n");
+        return;
+    }
+    if (make_tmpdir() != 0) {
+        t_true("relay: temp dir", 0);
+        return;
+    }
+    snprintf(statedir, sizeof statedir, "%s/state", tmpdir);
+    snprintf(sock, sizeof sock, "%s/sock", tmpdir);
+    snprintf(logpath, sizeof logpath, "%s/log", tmpdir);
+    snprintf(countpath, sizeof countpath, "%s/conns", tmpdir);
+    snprintf(evpath, sizeof evpath, "%s/relay", tmpdir);
+    snprintf(g_lites_path, sizeof g_lites_path, "%s/lites", tmpdir);
+    setenv("TSPPC_SOCKET", sock, 1);
+
+    rc = load_state(statedir, &st);
+    st.have_login = 1;
+    t_true("relay: saved login written", rc == 0 && ts_state_save(&st, statedir, err, sizeof err) == 0);
+
+    rfd = listen_local(&rport);
+    lfd = listen_local(&cport);
+    if (rfd < 0 || lfd < 0) {
+        t_true("relay: fake servers listen", 0);
+        if (rfd >= 0) close(rfd);
+        if (lfd >= 0) close(lfd);
+        unsetenv("TSPPC_SOCKET");
+        remove_test_files(statedir, sock, logpath, countpath);
+        return;
+    }
+    /* Region 9's only node refuses connections: its probe fails. */
+    snprintf(g_relay_map, sizeof g_relay_map,
+             "{\"Node\":{\"ID\":1,\"Name\":\"" SELFNAME ".\",\"Key\":\"nodekey:" HA "\","
+             "\"Addresses\":[\"100.64.0.1/32\"],\"MachineAuthorized\":true},"
+             "\"Peers\":[{\"ID\":2,\"Name\":\"peer.example.test.\","
+             "\"Key\":\"nodekey:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\","
+             "\"Addresses\":[\"100.64.0.2/32\"],\"HomeDERP\":%d,\"Online\":true,\"MachineAuthorized\":true}],"
+             "\"DERPMap\":{\"Regions\":{"
+             "\"%d\":{\"RegionID\":%d,\"RegionCode\":\"tst\",\"Nodes\":[{\"Name\":\"%da\",\"RegionID\":%d,"
+             "\"HostName\":\"derp.example.test\",\"IPv4\":\"127.0.0.1\",\"DERPPort\":%u}]},"
+             "\"%d\":{\"RegionID\":%d,\"RegionCode\":\"dead\",\"Nodes\":[{\"Name\":\"%da\",\"RegionID\":%d,"
+             "\"HostName\":\"dead.example.test\",\"IPv4\":\"127.0.0.1\",\"DERPPort\":1}]}}}}",
+             RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION, (unsigned)rport, DEAD_REGION,
+             DEAD_REGION, DEAD_REGION, DEAD_REGION);
+
+    fk_init(&f, NULL, "");
+    f.handler = fk_relay_handler;
+    ts_hex_encode(key, sizeof key, f.control_pub, 32);
+    g_ctl_port = cport;
+    srv = fork();
+    if (srv == 0) {
+        close(rfd);
+        fake_server(lfd, &f, countpath);
+        _exit(0);
+    }
+    rsrv = fork();
+    if (rsrv == 0) {
+        close(lfd);
+        relay_server(rfd, evpath);
+        _exit(0);
+    }
+    close(lfd);
+    close(rfd);
+
+    pid = start_daemon(statedir, sock, logpath, key);
+    t_true("relay: socket appears", wait_socket(sock, pid, 120000) == 0);
+    t_true("relay: RUNNING", wait_status(sock, "state RUNNING\n", out, sizeof out, 120000));
+    t_true("relay: status shows the home region connected",
+           wait_status(sock, "\nrelay 7 connected\n", out, sizeof out, 60000));
+    t_true("relay: no tunnel problem with TSPPC_NO_TUN", !strstr(out, "tunnel driver"));
+    t_true("relay: the relay saw the handshake and NotePreferred 1",
+           wait_file_has(evpath, "u", 1000) && file_has(evpath, "r") && wait_file_has(evpath, "P", 10000));
+    t_true("relay: control got a lite update with the region",
+           wait_file_has(g_lites_path, "\"PreferredDERP\":7}", 30000));
+    t_true("relay: the dead region was not reported", !file_has(g_lites_path, "\"PreferredDERP\":9}"));
+    t_true("relay: the log names the home region", wait_file_has(logpath, "home relay: region 7", 1000));
+    t_true("relay: the log notes the relay up", file_has(logpath, "relay region 7 connected"));
+
+    rc = run_cli("down", out, sizeof out);
+    t_true("relay: down accepted", rc == 0);
+    t_true("relay: down goes IDLE", wait_status(sock, "state IDLE\n", out, sizeof out, 60000));
+    t_true("relay: down shows no relay", !strstr(out, "\nrelay "));
+    t_true("relay: down closes the relay connection", wait_file_has(evpath, "e", 10000));
+    t_true("relay: the log says the data plane stopped", wait_file_has(logpath, "data plane stopped", 1000));
+
+    /* up again: a fresh data plane, the same home, a new relay connection. */
+    raw_request(sock, "up\n", 3, out, sizeof out);
+    t_true("relay: up again accepted", strncmp(out, "ok\n", 3) == 0);
+    t_true("relay: up again connects the home relay", wait_status(sock, "\nrelay 7 connected\n", out, sizeof out, 120000));
+    t_true("relay: a second relay connection", wait_file_has(evpath, "eu", 5000));
+
+    kill(pid, SIGTERM);
+    t_true("relay: daemon exits", wait_exit(pid, 60000) == 0);
+    {
+        const uint8_t *keys[3];
+        keys[0] = st.node_priv;
+        keys[1] = st.machine_priv;
+        keys[2] = st.disco_priv;
+        t_true("relay: log holds no private keys", !log_has_key(logpath, keys, 3));
+    }
+    kill(srv, SIGKILL);
+    waitpid(srv, NULL, 0);
+    kill(rsrv, SIGKILL);
+    waitpid(rsrv, NULL, 0);
+    ts_wipe(&st, sizeof st);
+    unsetenv("TSPPC_SOCKET");
+    unlink(evpath);
+    unlink(g_lites_path);
+    remove_test_files(statedir, sock, logpath, countpath);
+}
+
 /* tsppc against a fake daemon that answers every request with reply. */
 static int cli_against(const char *sock, const char *reply, const char *arg, char *out, size_t cap)
 {
@@ -836,4 +1150,5 @@ void test_ipc(void)
     test_cli_replies();
     test_daemon();
     test_daemon_down();
+    test_daemon_relay();
 }

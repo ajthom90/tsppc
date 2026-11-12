@@ -19,7 +19,12 @@
  * In builds with -DTS_TEST_HOOKS only, TSPPC_CONTROL ("host" or "host:port";
  * with a port every control connection goes there, with TLS if it is 443),
  * TSPPC_CONTROL_KEY (control's public key in hex: no key fetch),
- * TSPPC_STATE_DIR and TSPPC_SOCKET override the defaults. */
+ * TSPPC_STATE_DIR and TSPPC_SOCKET override the defaults; TSPPC_NO_TUN and
+ * TSPPC_DERP_PLAIN are the data plane's (dataplane_io.h).
+ *
+ * The data plane (tun device, relays, home selection) runs from
+ * dataplane_io.c, synced with the session once per loop turn; while it runs
+ * the loop wakes at least every TS_DPIO_TICK_MS. */
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -35,6 +40,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "dataplane_io.h"
 #include "ipc.h"
 #include "src/control/noise.h"
 #include "src/control/session.h"
@@ -112,6 +118,8 @@ static struct {
     ino_t lino;
     int64_t accept_paused_until;
     client cl[TS_IPC_MAX_CLIENTS];
+
+    int fed;                        /* bytes reached the session this turn (the map may have changed) */
 
     int sigpipe[2];
     char logged_state[32];
@@ -300,6 +308,7 @@ static void conn_read(void)
             }
         }
         ts_sess_recv(D.sess, rbuf, (size_t)n);
+        D.fed = 1;
     }
 }
 
@@ -506,6 +515,14 @@ static void get_view(view *v)
                  (long)((ms < 0 ? 0 : ms + 999) / 1000));
         snprintf(v->problem, sizeof v->problem, "%s", D.kf_err);
     }
+    if (D.sess && D.want_up) {
+        ts_dpio_view dv;
+        ts_dpio_get_view(&dv);
+        if (dv.running && dv.problem[0]) {
+            size_t n = strlen(v->problem);
+            snprintf(v->problem + n, sizeof v->problem - n, "%s%s", n ? "; " : "", dv.problem);
+        }
+    }
     if (!D.sess && D.st.logout_pending) {
         size_t n = strlen(v->status);
         snprintf(v->status + n, sizeof v->status - n,
@@ -647,6 +664,15 @@ static void build_status(rbuild *b)
         if (nm->have_self && nm->self.have_ipv4) {
             fmt_ip(ip, sizeof ip, nm->self.ipv4);
             put(b, "ip", ip);
+        }
+        {
+            ts_dpio_view dv;
+            ts_dpio_get_view(&dv);
+            if (dv.running) {
+                if (dv.home > 0) snprintf(line, sizeof line, "%d %s", dv.home, dv.home_up ? "connected" : "connecting");
+                else snprintf(line, sizeof line, "none");
+                put(b, "relay", line);
+            }
         }
         for (i = 0; i < nm->npeers; i++) {
             const ts_node *p = &nm->peers[i];
@@ -832,6 +858,7 @@ static void log_state(void)
 static void shutdown_all(void)
 {
     int i;
+    ts_dpio_shutdown();
     for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) client_close(&D.cl[i]);
     if (D.lfd >= 0) {
         close(D.lfd);
@@ -927,8 +954,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsppcd: %s\n", err);
         return 1;
     }
+    /* After the socket: a second tsppcd, refused above, must not touch the
+     * running one's route. */
+    if (ts_dpio_init(logline) != 0) {
+        fprintf(stderr, "tsppcd: out of memory\n");
+        close(D.lfd);
+        ts_ipc_unlink(D.sock_path, D.ldev, D.lino);
+        return 1;
+    }
+    ts_dpio_cleanup_route();
     if (ts_state_load_or_create(&D.st, D.state_dir, err, sizeof err) != 0) {
         fprintf(stderr, "tsppcd: node state: %s\n", err);
+        ts_dpio_shutdown();
         close(D.lfd);
         ts_ipc_unlink(D.sock_path, D.ldev, D.lino);
         return 1;
@@ -949,6 +986,7 @@ int main(int argc, char **argv)
         struct timeval tv;
         int maxfd = D.sigpipe[0], kfmax = -1;
         unsigned gen;
+        int64_t tmo = LOOP_MS;
 
         if (D.sess) {
             ts_sess_tick(D.sess, (uint64_t)now_ms());
@@ -959,6 +997,8 @@ int main(int argc, char **argv)
         }
         kf_tick();
         conn_flush();
+        ts_dpio_sync(D.sess, D.want_up, D.fed, now_ms());
+        D.fed = 0;
         log_state();
 
         FD_ZERO(&r);
@@ -979,9 +1019,10 @@ int main(int argc, char **argv)
         if (D.kf_active && KF.fd < FD_SETSIZE && KF.res.fd < FD_SETSIZE &&
             ts_keyfetch_fds(&KF, &r, &w, &kfmax) == 0 && kfmax > maxfd)
             maxfd = kfmax;
+        ts_dpio_fds(&r, &w, &maxfd, &tmo);
         gen = D.gen;
-        tv.tv_sec = LOOP_MS / 1000;
-        tv.tv_usec = (LOOP_MS % 1000) * 1000;
+        tv.tv_sec = (long)(tmo / 1000);
+        tv.tv_usec = (int)(tmo % 1000) * 1000;
         /* Decrypted data already in the TLS engine shows on no descriptor:
          * do not sleep on it. */
         if (D.sess && D.cphase == C_OPEN && D.tls && ts_sess_want_read(D.sess) && ts_tls_pending(D.tls))
@@ -1002,6 +1043,7 @@ int main(int argc, char **argv)
             conn_events(&r, &w, gen);
         }
         kf_events();
+        ts_dpio_events(&r, &w, now_ms());
         for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) {
             client *c = &D.cl[i];
             if (c->fd < 0) continue;
