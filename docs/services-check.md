@@ -44,7 +44,7 @@ Copy new binaries to a temporary name and `mv` them into place: `cp` over the fi
 
 | From | To | Result |
 |---|---|---|
-| `<leopard>` (Leopard's `ssh`) | `<tiger>` by short name | logged in, ran `sw_vers` and `uname -n`; SYN and SYN-ACK on `tun0` |
+| `<leopard>` (Leopard's `ssh`) | `<tiger>` by short name | logged in, ran `sw_vers` and `uname -n`; SYN and SYN-ACK on `tun0`; `en0` saw no packets for `<tiger>`'s tailnet address (repeat run, see "Path evidence") |
 | `<tiger>` (Tiger's `ssh`) | `<leopard>` by short name | logged in, ran `sw_vers`, `uname -n`, `uptime`; SYN and SYN-ACK on `tun0`; `en0` saw no packets for `<leopard>`'s tailnet address |
 | `<host>` (official client) | each node by tailnet address | logged in, ran `uname -n` |
 
@@ -60,6 +60,8 @@ Personal File Sharing was turned on for the test only and turned back off afterw
 | `<tiger>` | `<leopard>` | same mount, into the share's Drop Box | write 38 s, MD5 matched |
 
 That is about 0.55 MB/s each way, through a DERP relay between two emulated G4s.
+
+**Path evidence**, from a repeat run the same day (5 MB file, same mount, MD5 matched), followed by an SSH login from `<leopard>` to `<tiger>` by name, with captures running on `<leopard>` throughout: `tun0` carried 6036 packets on port 548, starting with the SYN from `<leopard>`'s tailnet address to `<tiger>`'s port 548, and `en0` carried no packets to or from `<tiger>`'s tailnet address. So both the AFP traffic and the Leopard-to-Tiger SSH went through tsppc, not through the host's own Tailscale (see "Test environment caveat").
 
 Mounting in the other direction, from Tiger, did not work in an SSH-only session, and the failure happened before any packet was sent: with the AFP client extensions not loaded, `mount_afp` returned error 15 (ENOENT); after loading `asp_tcp.kext` and `afpfs.kext` by hand it still did, and `mount volume` through `osascript` waited for a dialog on the console. A TCP connection from Tiger to the server's port 548 over the tunnel opened. This is the old AFP client needing a login session, not the tunnel. Notes for next time: on Tiger, guests see each user's Public Folder under the user's short name; on Leopard, under "<full name>'s Public Folder".
 
