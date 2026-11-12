@@ -17,6 +17,7 @@ void test_ipc(void);
 void test_ipc_reply(void);
 void test_menu_model(void);
 void test_filter(void);
+void test_wg(void);
 
 int main(void)
 {
@@ -37,5 +38,6 @@ int main(void)
     test_ipc_reply();
     test_menu_model();
     test_filter();
+    test_wg();
     return t_summary();
 }
