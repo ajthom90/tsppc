@@ -76,7 +76,12 @@ static void setname(ts_node *n, const char *name, uint32_t ip)
 
 static int build(ts_netmap *nm, char *out, size_t cap, size_t *ne, size_t *ns)
 {
-    return ts_hosts_build(out, cap, nm, ne, ns);
+    return ts_hosts_build(out, cap, nm, NULL, 0, ne, ns);
+}
+
+static int buildold(ts_netmap *nm, char *out, size_t cap, const char *old)
+{
+    return ts_hosts_build(out, cap, nm, old, strlen(old), NULL, NULL);
 }
 
 /* build output is not NUL-terminated: compare by length */
@@ -127,32 +132,99 @@ static void test_build(void)
     t_true("build cap short", build(&nm, out2, (size_t)n - 1, NULL, NULL) == -1);
     t_true("build cap zero", build(&nm, out2, 0, NULL, NULL) == -1);
 
-    /* duplicate short names are withheld from both; full names stay */
+    /* duplicate short names (same suffix, so the same fqdn) are withheld from both */
     setname(&nm.self, "me.example.ts.net.", IP(100, 64, 0, 1));
-    setname(&peers[0], "dup.one.ts.net.", IP(100, 64, 0, 2));
-    setname(&peers[1], "Dup.two.ts.net.", IP(100, 64, 0, 3));
-    setname(&peers[2], "solo.one.ts.net.", IP(100, 64, 0, 4));
+    setname(&peers[0], "dup.example.ts.net.", IP(100, 64, 0, 2));
+    setname(&peers[1], "Dup.example.ts.net.", IP(100, 64, 0, 3));
+    setname(&peers[2], "solo.example.ts.net.", IP(100, 64, 0, 4));
     nm.npeers = 3;
     n = build(&nm, out, sizeof out, &ne, &ns);
     t_true("dup short withheld", is(out, n,
         B "\n"
         "100.64.0.1\tme.example.ts.net me\n"
-        "100.64.0.2\tdup.one.ts.net\n"
-        "100.64.0.3\tdup.two.ts.net\n"
-        "100.64.0.4\tsolo.one.ts.net solo\n"
+        "100.64.0.2\tdup.example.ts.net\n"
+        "100.64.0.3\tdup.example.ts.net\n"
+        "100.64.0.4\tsolo.example.ts.net solo\n"
         E "\n"));
-    /* a short name equal to another node's fqdn is withheld */
-    setname(&nm.self, "me.example.ts.net.", IP(100, 64, 0, 1));
-    setname(&peers[0], "other.example.ts.net.", IP(100, 64, 0, 2));
+    /* a single-label name is skipped and counted, even "localhost" */
+    setname(&peers[0], "localhost", IP(100, 64, 0, 2));
     setname(&peers[1], "other", IP(100, 64, 0, 3));
     nm.npeers = 2;
     n = build(&nm, out, sizeof out, &ne, &ns);
-    t_true("short equals fqdn withheld", is(out, n,
+    t_true("single label skipped", is(out, n, B "\n100.64.0.1\tme.example.ts.net me\n" E "\n") && ne == 1 && ns == 2);
+    /* reserved short names: fqdn only */
+    setname(&peers[0], "wpad.example.ts.net.", IP(100, 64, 0, 2));
+    setname(&peers[1], "localhost.example.ts.net.", IP(100, 64, 0, 3));
+    setname(&peers[2], "ip6-allnodes.example.ts.net.", IP(100, 64, 0, 4));
+    setname(&peers[3], "ISATAP.example.ts.net.", IP(100, 64, 0, 5));
+    setname(&peers[4], "broadcasthost.example.ts.net.", IP(100, 64, 0, 6));
+    setname(&peers[5], "ip6x.example.ts.net.", IP(100, 64, 0, 7));
+    nm.npeers = 6;
+    n = build(&nm, out, sizeof out, &ne, &ns);
+    t_true("reserved shorts withheld", is(out, n,
         B "\n"
         "100.64.0.1\tme.example.ts.net me\n"
-        "100.64.0.2\tother.example.ts.net\n"
-        "100.64.0.3\tother\n"
+        "100.64.0.2\twpad.example.ts.net\n"
+        "100.64.0.3\tlocalhost.example.ts.net\n"
+        "100.64.0.4\tip6-allnodes.example.ts.net\n"
+        "100.64.0.5\tisatap.example.ts.net\n"
+        "100.64.0.6\tbroadcasthost.example.ts.net\n"
+        "100.64.0.7\tip6x.example.ts.net ip6x\n"
         E "\n"));
+    /* a node of another tailnet gets its fqdn only; it does not steal the short name */
+    setname(&peers[0], "box.other.ts.net.", IP(100, 64, 0, 2));
+    setname(&peers[1], "box.example.ts.net.", IP(100, 64, 0, 3));
+    nm.npeers = 2;
+    n = build(&nm, out, sizeof out, &ne, &ns);
+    t_true("shared node fqdn only", is(out, n,
+        B "\n"
+        "100.64.0.1\tme.example.ts.net me\n"
+        "100.64.0.2\tbox.other.ts.net\n"
+        "100.64.0.3\tbox.example.ts.net box\n"
+        E "\n"));
+    /* self single-label: no short names at all (self is skipped too) */
+    setname(&nm.self, "me", IP(100, 64, 0, 1));
+    n = build(&nm, out, sizeof out, &ne, &ns);
+    t_true("bad self no shorts", is(out, n,
+        B "\n"
+        "100.64.0.2\tbox.other.ts.net\n"
+        "100.64.0.3\tbox.example.ts.net\n"
+        E "\n") && ns == 1);
+    nm.have_self = 0;
+    n = build(&nm, out, sizeof out, &ne, &ns);
+    t_true("no self no shorts", is(out, n,
+        B "\n"
+        "100.64.0.2\tbox.other.ts.net\n"
+        "100.64.0.3\tbox.example.ts.net\n"
+        E "\n") && ns == 0);
+    nm.have_self = 1;
+    /* the owner's own names are not shadowed */
+    setname(&nm.self, "me.example.ts.net.", IP(100, 64, 0, 1));
+    setname(&peers[0], "printer.example.ts.net.", IP(100, 64, 0, 2));
+    setname(&peers[1], "scanner.example.ts.net.", IP(100, 64, 0, 3));
+    setname(&peers[2], "nas.example.ts.net.", IP(100, 64, 0, 4));
+    setname(&peers[3], "cam.example.ts.net.", IP(100, 64, 0, 5));
+    nm.npeers = 4;
+    n = buildold(&nm, out, sizeof out,
+        "127.0.0.1 localhost\n"
+        "192.168.1.5 printer # office\n"
+        "192.168.1.6\tfoo\tSCANNER\r\n"
+        "# 192.168.1.7 nas\n"
+        B "\n100.64.0.9 cam\n" E "\n"
+        "192.168.1.8 cam.example.ts.net");
+    t_true("owner names kept", is(out, n,
+        B "\n"
+        "100.64.0.1\tme.example.ts.net me\n"
+        "100.64.0.2\tprinter.example.ts.net\n"
+        "100.64.0.3\tscanner.example.ts.net\n"
+        "100.64.0.4\tnas.example.ts.net nas\n"
+        "100.64.0.5\tcam.example.ts.net cam\n"
+        E "\n"));
+    /* the address token is skipped; a name as first token is not a host name */
+    n = buildold(&nm, out, sizeof out, "printer 1.2.3.4\nnas\n");
+    t_true("owner first token skipped", n > 0 && memmem(out, (size_t)n, "printer.example.ts.net printer", 30) != NULL &&
+                                            memmem(out, (size_t)n, "nas.example.ts.net nas", 22) != NULL);
+    t_true("old NULL", ts_hosts_build(out, sizeof out, &nm, NULL, 0, NULL, NULL) > 0);
     /* no self, no peers: markers only */
     nm.have_self = 0;
     nm.npeers = 0;

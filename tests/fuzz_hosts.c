@@ -99,7 +99,7 @@ static void target(const uint8_t *data, size_t len)
     strncpy(peers[1].name, name, sizeof peers[1].name - 1);
     peers[1].ipv4 = 0x64400003u;
     peers[1].have_ipv4 = 1;
-    bn = ts_hosts_build(blkout, sizeof blkout, &nm, NULL, NULL);
+    bn = ts_hosts_build(blkout, sizeof blkout, &nm, (const char *)oldp, ol, NULL, NULL);
     TS_FUZZ_ASSERT(bn > 0 && (size_t)bn <= sizeof blkout);
     TS_FUZZ_ASSERT(count_markers(blkout, (size_t)bn) == 2);
     {
@@ -107,10 +107,20 @@ static void target(const uint8_t *data, size_t len)
         for (i = 0; i < (size_t)bn; i++) TS_FUZZ_ASSERT(blkout[i] != 0 && (unsigned char)blkout[i] < 0x80);
     }
     {
+        /* every entry line (between the marker lines) is [0-9a-z.\t -] and a final \n */
+        size_t i, b0 = strlen(TS_HOSTS_BEGIN) + 1, e0 = (size_t)bn - strlen(TS_HOSTS_END) - 1;
+        TS_FUZZ_ASSERT(e0 >= b0 && (e0 == b0 || blkout[e0 - 1] == 0x0a));
+        for (i = b0; i < e0; i++) {
+            char c = blkout[i];
+            TS_FUZZ_ASSERT(c == '\n' || c == '\t' || c == ' ' || c == '.' || c == '-' || (c >= '0' && c <= '9') ||
+                           (c >= 'a' && c <= 'z'));
+        }
+    }
+    {
         char *twice = (char *)malloc((size_t)bn);
         TS_FUZZ_ASSERT(twice != NULL);
-        TS_FUZZ_ASSERT(ts_hosts_build(twice, (size_t)bn, &nm, NULL, NULL) == bn && memcmp(twice, blkout, (size_t)bn) == 0);
-        TS_FUZZ_ASSERT(ts_hosts_build(twice, (size_t)bn - 1, &nm, NULL, NULL) == -1);
+        TS_FUZZ_ASSERT(ts_hosts_build(twice, (size_t)bn, &nm, (const char *)oldp, ol, NULL, NULL) == bn && memcmp(twice, blkout, (size_t)bn) == 0);
+        TS_FUZZ_ASSERT(ts_hosts_build(twice, (size_t)bn - 1, &nm, (const char *)oldp, ol, NULL, NULL) == -1);
         free(twice);
     }
 

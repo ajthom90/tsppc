@@ -76,6 +76,14 @@ static void put_ip(wr *w, uint32_t ip)
     put(w, b, n);
 }
 
+/* Does line [s, s+len) equal m once trailing spaces, tabs and '\r' are dropped? */
+static int line_is(const char *s, size_t len, const char *m)
+{
+    size_t ml = strlen(m);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r')) len--;
+    return len == ml && memcmp(s, m, ml) == 0;
+}
+
 typedef struct {
     uint32_t ip;
     char fqdn[FQDN_CAP];
@@ -88,15 +96,86 @@ static int entry_before(const entry *a, const entry *b)
     return strcmp(a->fqdn, b->fqdn) < 0;
 }
 
-int ts_hosts_build(char *out, size_t cap, const ts_netmap *nm, size_t *nentries, size_t *nskipped)
+/* The part of an fqdn after its first label, or NULL for a single label. */
+static const char *suffix_of(const char *fqdn)
+{
+    const char *d = strchr(fqdn, '.');
+    return d ? d + 1 : NULL;
+}
+
+static int banned_short(const char *s)
+{
+    return strcmp(s, "localhost") == 0 || strcmp(s, "broadcasthost") == 0 || strcmp(s, "wpad") == 0 ||
+           strcmp(s, "isatap") == 0 || strncmp(s, "ip6-", 4) == 0;
+}
+
+/* Marks hide[i] for every entry whose short name is a host-name token of the
+ * owner's own lines (outside any tsppc section), compared case-insensitively. */
+static void hide_owner_names(const char *old, size_t oldlen, const entry *ents, size_t n, unsigned char *hide)
+{
+    size_t pos = 0;
+    int in_sec = 0;
+
+    while (pos < oldlen) {
+        const char *s = old + pos;
+        const char *nl = memchr(s, '\n', oldlen - pos);
+        size_t len = nl ? (size_t)(nl - s) + 1 : oldlen - pos;
+        size_t body = nl ? len - 1 : len, i = 0, tok = 0;
+        const char *h;
+        pos += len;
+        if (in_sec) {
+            if (line_is(s, body, TS_HOSTS_END)) in_sec = 0;
+            continue;
+        }
+        if (line_is(s, body, TS_HOSTS_BEGIN)) {
+            in_sec = 1;
+            continue;
+        }
+        h = memchr(s, '#', body);
+        if (h) body = (size_t)(h - s);
+        while (i < body) {
+            size_t st, k;
+            while (i < body && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r')) i++;
+            st = i;
+            while (i < body && s[i] != ' ' && s[i] != '\t' && s[i] != '\r') i++;
+            if (i == st) break;
+            if (tok++ == 0 || i - st > 63) continue;
+            for (k = 0; k < n; k++) {
+                size_t j;
+                if (hide[k] || strlen(ents[k].sh) != i - st) continue;
+                for (j = 0; j < i - st; j++) {
+                    char c = s[st + j];
+                    if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+                    if (c != ents[k].sh[j]) break;
+                }
+                if (j == i - st) hide[k] = 1;
+            }
+        }
+    }
+}
+
+int ts_hosts_build(char *out, size_t cap, const ts_netmap *nm, const char *old, size_t oldlen, size_t *nentries,
+                   size_t *nskipped)
 {
     entry ents[TS_MAX_PEERS + 1];
     int idx[TS_MAX_PEERS + 1];
     unsigned char hide[TS_MAX_PEERS + 1];
+    char selfsuf[FQDN_CAP];
     size_t n = 0, skipped = 0, i, j, np = nm->npeers;
+    int have_suf = 0;
     wr w;
 
     if (np > TS_MAX_PEERS) np = TS_MAX_PEERS;
+    if (oldlen > TS_HOSTS_FILE_MAX) oldlen = TS_HOSTS_FILE_MAX;
+    if (!old) oldlen = 0;
+    if (nm->have_self) {
+        char f[FQDN_CAP], sh[SHORT_CAP];
+        const char *suf;
+        if (ts_hosts_name_ok(nm->self.name, f, FQDN_CAP, sh, SHORT_CAP) == 0 && (suf = suffix_of(f)) != NULL) {
+            strcpy(selfsuf, suf);
+            have_suf = 1;
+        }
+    }
     for (i = 0; i < np + 1; i++) {
         const ts_node *nd;
         if (i == 0) {
@@ -106,20 +185,31 @@ int ts_hosts_build(char *out, size_t cap, const ts_netmap *nm, size_t *nentries,
             nd = &nm->peers[i - 1];
         }
         if (!nd->have_ipv4) continue;
-        if (ts_hosts_name_ok(nd->name, ents[n].fqdn, FQDN_CAP, ents[n].sh, SHORT_CAP) != 0) {
+        if (ts_hosts_name_ok(nd->name, ents[n].fqdn, FQDN_CAP, ents[n].sh, SHORT_CAP) != 0 ||
+            suffix_of(ents[n].fqdn) == NULL) {
             skipped++;
             continue;
         }
         ents[n].ip = nd->ipv4;
         n++;
     }
+    /* short names: only for our own tailnet's suffix, never the reserved ones */
     for (i = 0; i < n; i++) {
-        hide[i] = 0;
-        for (j = 0; j < n && !hide[i]; j++) {
-            if (j != i && strcmp(ents[i].sh, ents[j].sh) == 0) hide[i] = 1;
-            if (strcmp(ents[i].sh, ents[j].fqdn) == 0) hide[i] = 1;
-        }
+        hide[i] = !have_suf || strcmp(suffix_of(ents[i].fqdn), selfsuf) != 0 || banned_short(ents[i].sh);
     }
+    {
+        /* a short name held by more than one eligible node is withheld from all of them */
+        unsigned char h2[TS_MAX_PEERS + 1];
+        memcpy(h2, hide, n);
+        for (i = 0; i < n; i++) {
+            if (hide[i]) continue;
+            for (j = 0; j < n; j++) {
+                if (j != i && !hide[j] && strcmp(ents[i].sh, ents[j].sh) == 0) h2[i] = 1;
+            }
+        }
+        memcpy(hide, h2, n);
+    }
+    hide_owner_names(old, oldlen, ents, n, hide);
     /* insertion sort of indices: stable, at most 257 of them */
     for (i = 0; i < n; i++) {
         int v = (int)i;
@@ -147,14 +237,6 @@ int ts_hosts_build(char *out, size_t cap, const ts_netmap *nm, size_t *nentries,
     if (nentries) *nentries = n;
     if (nskipped) *nskipped = skipped;
     return w.over ? -1 : (int)w.n;
-}
-
-/* Does line [s, s+len) equal m once trailing spaces, tabs and '\r' are dropped? */
-static int line_is(const char *s, size_t len, const char *m)
-{
-    size_t ml = strlen(m);
-    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r')) len--;
-    return len == ml && memcmp(s, m, ml) == 0;
 }
 
 int ts_hosts_merge(char *out, size_t cap, const char *old, size_t oldlen, const char *block, size_t blocklen)
