@@ -109,3 +109,31 @@ Other accepted limits of the TLS client:
 - **No session resumption.** Every connection does a full handshake, including
   the RSA-4096 or P-384 chain checks. On the emulated G4 that takes about a
   second.
+
+## Tunnel over DERP (milestone 4)
+
+Accepted limits of the first tunnel. `docs/tunnel-check.md` records the live
+check.
+
+- **Home relay by TCP connect time.** Upstream, without UDP, picks the home
+  region by HTTPS latency to each region. tsppc times a TCP connect to the
+  first node of each eligible region instead (`src/daemon/dataplane_io.h`),
+  then applies upstream's stickiness rules. A connect time leaves out the TLS
+  handshake, which on an emulated G4 costs about a second, so the two can rank
+  regions differently. Decision: accepted. The choice only moves which relay
+  the node calls home, and every peer can still reach it there.
+- **DERP only.** Every WireGuard packet goes through a relay. There is no UDP
+  socket, no STUN and no disco, so `tailscale ping` to a tsppc node times out
+  and no direct path is ever tried. Direct paths belong to milestone 8.
+- **No hybrid post-quantum handshake.** Tailscale's WireGuard fork
+  (`tailscale/wireguard-go`) also has a hybrid ML-KEM handshake. tsppc
+  implements only `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`. `ts_wg_receive`
+  accepts a handshake initiation or response only at its classic size, so a
+  hybrid one is dropped by its size, and a peer that requires the hybrid
+  handshake will not connect. Nothing turns it on at the upstream commit this
+  milestone follows, and the live check connected to the official client with
+  the classic handshake. If Tailscale turns it on, it must be implemented.
+- **TokenBucket hints ignored.** A relay's ServerInfo may carry
+  `TokenBucketBytesPerSecond` and `TokenBucketBytesBurst`. tsppc checks
+  ServerInfo but ignores those fields and does not pace its sends to them.
+  Decision: accepted. A G4's traffic through one relay is small.
