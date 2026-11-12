@@ -1681,13 +1681,13 @@ static void test_daemon_wake(void)
     kill(pid, SIGUSR1);
     do {
         ok = file_size(countpath) > c0 && file_size(g_maps_path) > m0 && same_lines(g_relay_keys_path, &same) > k0 &&
-             file_has(logpath, "woke from sleep (test signal)") && file_has(logpath, "rebinding relays (woke from sleep)");
+             file_has(logpath, "woke from sleep (test signal)") && file_has(logpath, "rebinding relays (woke from sleep");
         if (!ok) nap_ms(100);
     } while (!ok && mono_ms() - t0 < 5000);
     t_true("wake: the daemon is still there", waitpid(pid, &rc, WNOHANG) == 0);
     t_true("wake: the log says woke from sleep (test signal)", file_has(logpath, "woke from sleep (test signal)"));
-    t_true("wake: the log says rebinding relays (woke from sleep)",
-           file_has(logpath, "rebinding relays (woke from sleep)"));
+    t_true("wake: the log says rebinding relays (woke from sleep; sessions reset)",
+           file_has(logpath, "rebinding relays (woke from sleep; sessions reset)"));
     t_true("wake: control accepted a second connection", file_size(countpath) == c0 + 1);
     t_true("wake: and a second Noise handshake (a second map stream)", file_size(g_maps_path) == m0 + 1);
     k1 = same_lines(g_relay_keys_path, &same);
@@ -1699,14 +1699,23 @@ static void test_daemon_wake(void)
     /* Two network changes close together: one more control connection, and
      * only once the gap since the wake's rebind has passed. */
     c1 = file_size(countpath);
+    t0 = mono_ms();
     kill(pid, SIGUSR2);
     nap_ms(300);
     kill(pid, SIGUSR2);
-    t0 = mono_ms();
-    while (mono_ms() - t0 < 15000) nap_ms(200);
+    /* The connection within 15 s; then a settle until 11 s after the first
+     * signal (and at least 1 s), past the rest of the gate's gap, in which no
+     * third one may come. */
+    while (file_size(countpath) <= c1 && mono_ms() - t0 < 15000) nap_ms(100);
+    {
+        int64_t settle = mono_ms() + 1000;
+        if (settle < t0 + 11000) settle = t0 + 11000;
+        while (mono_ms() < settle) nap_ms(100);
+    }
     t_true("wake: the log says network changed (test signal)", file_has(logpath, "network changed (test signal)"));
-    t_true("wake: the log says rebinding relays (network changed)",
-           file_has(logpath, "rebinding relays (network changed)"));
+    t_true("wake: the log says rebinding relays (network changed), sessions kept",
+           file_has(logpath, "rebinding relays (network changed)\n") &&
+               !file_has(logpath, "rebinding relays (network changed; sessions reset)"));
     t_true("wake: exactly one more control connection", file_size(countpath) == c1 + 1);
     t_true("wake: exactly two rebinds", count_in_file(logpath, "rebinding relays (") == 2);
     t_true("wake: RUNNING after the network change", wait_status(sock, "state RUNNING\n", out, sizeof out, 30000));

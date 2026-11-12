@@ -914,7 +914,7 @@ void ts_dpio_rebind(const char *why, int probe_again, int reset_sessions)
     int i;
     if (!G.dp || !G.running || G.stopping || G.rebinding) return;
     /* G.now, never later than the next sync's time: that tick redials. */
-    G.log("rebinding relays (%s)", why ? why : "");
+    G.log("rebinding relays (%s%s)", why ? why : "", reset_sessions ? "; sessions reset" : "");
     G.rebinding = 1;
     ts_dp_rebind(G.dp, G.now, reset_sessions);
     G.rebinding = 0;

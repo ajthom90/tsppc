@@ -586,7 +586,7 @@ static void test_dpio_rebind(void)
     logbuf[0] = 0;
 
     ts_dpio_rebind("test", 1, 1);
-    t_true("rebind: logged", has(logbuf, "rebinding relays (test)"));
+    t_true("rebind: logged, with the sessions reset", has(logbuf, "rebinding relays (test; sessions reset)"));
     ts_dpio_get_view(&v);
     t_true("rebind: home down at once", v.running && !v.home_up);
     t_true("rebind: a probe round wanted", ts_dpio_test_probe_wanted() == 1);
@@ -612,7 +612,8 @@ static void test_dpio_rebind(void)
                 probing |= ts_dpio_test_probe_wanted();
             }
         }
-        t_true("rebind: rebinds logged", has(logbuf, "rebinding relays (network changed)"));
+        t_true("rebind: rebinds logged, sessions kept",
+               has(logbuf, "rebinding relays (network changed)") && !has(logbuf, "sessions reset"));
         t_true("rebind: no home failure count", !has(logbuf, "failed") && !probing);
         t_true("rebind: home up after the last rebind", home_up_within(2000));
     }

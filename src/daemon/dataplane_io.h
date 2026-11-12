@@ -84,7 +84,8 @@ void ts_dpio_fds(fd_set *r, fd_set *w, int *maxfd, int64_t *timeout_ms);
 /* After select. While a ping is outstanding it ticks the data plane first
  * (pong latency, timeouts on time); otherwise the tick waits for sync. */
 void ts_dpio_events(fd_set *r, fd_set *w, int64_t now_ms);
-/* After a wake or a network change: logs "rebinding relays (<why>)", calls
+/* After a wake or a network change: logs "rebinding relays (<why>)" (with
+ * "; sessions reset" after <why> when reset_sessions), calls
  * ts_dp_rebind (reset_sessions passed on: 1 after a real sleep, 0 for a
  * network change or a clock stepped back, when peers would refuse new
  * initiations with an older timestamp) and closes every relay socket; the
