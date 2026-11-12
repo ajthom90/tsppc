@@ -128,7 +128,11 @@ static void test_seal(void)
            DV_NONCE, DV_OUR_TXID, DV_B_NODE) == -1);
     t_true("disco seal pong short cap", ts_disco_seal_pong(out, TS_DISCO_PONG_LEN - 1, DV_B_PUB, &s,
            DV_NONCE, DV_OUR_TXID, v4, 7) == -1);
-    t_true("disco seal short cap writes nothing", out[0] == 0x77 && out[TS_DISCO_PING_LEN - 2] == 0x77);
+    {
+        uint8_t fill[TS_DISCO_MAX];
+        memset(fill, 0x77, sizeof fill);
+        t_true("disco seal short cap writes nothing", memcmp(out, fill, sizeof out) == 0);
+    }
     t_true("disco seal ping exact cap", ts_disco_seal_ping(out, TS_DISCO_PING_LEN, DV_B_PUB, &s,
            DV_NONCE, DV_OUR_TXID, DV_B_NODE) == TS_DISCO_PING_LEN);
     t_true("disco seal pong exact cap", ts_disco_seal_pong(out, TS_DISCO_PONG_LEN, DV_B_PUB, &s,
@@ -167,16 +171,20 @@ static void test_reject(void)
     ts_disco_shared_init(&other, DV_B_PRIV, DV_B_PUB);
     t_true("disco wrong key", ts_disco_open(&m, DV_UP_PING, sizeof DV_UP_PING, &other) == -1);
 
-    /* Version 1 ping and pong. */
+    /* The version byte is ignored, as upstream's parsePing/parsePong do. */
     memset(plain, 0, sizeof plain);
     memcpy(plain, DV_OUR_PING_PLAIN, sizeof DV_OUR_PING_PLAIN);
     plain[1] = 1;
     n = craft(p, plain, sizeof DV_OUR_PING_PLAIN);
-    t_true("disco ping version 1", ts_disco_open(&m, p, n, &s) == -1);
+    t_true("disco ping version 1 parsed", ts_disco_open(&m, p, n, &s) == 0 &&
+           m.type == TS_DISCO_PING && memcmp(m.txid, DV_OUR_TXID, 12) == 0 &&
+           m.have_node_key && memcmp(m.node_key, DV_B_NODE, 32) == 0);
     memcpy(plain, DV_OUR_PONG_PLAIN, sizeof DV_OUR_PONG_PLAIN);
     plain[1] = 1;
     n = craft(p, plain, sizeof DV_OUR_PONG_PLAIN);
-    t_true("disco pong version 1", ts_disco_open(&m, p, n, &s) == -1);
+    t_true("disco pong version 1 parsed", ts_disco_open(&m, p, n, &s) == 0 &&
+           m.type == TS_DISCO_PONG && memcmp(m.txid, DV_OUR_TXID, 12) == 0 &&
+           m.src_port == DV_DERP_SRC_PORT);
 
     /* Unknown types: reported by their byte. */
     memset(plain, 0x33, 40);
@@ -193,7 +201,7 @@ static void test_reject(void)
     plain[0] = 9;
     plain[1] = 2;
     n = craft(p, plain, 2);
-    t_true("disco unknown type version 2", ts_disco_open(&m, p, n, &s) == -1);
+    t_true("disco unknown type version 2 reported", ts_disco_open(&m, p, n, &s) == 0 && m.type == 9);
 
     /* Ping: zero node key is padding; non-zero bytes after a key are padding. */
     memset(plain, 0, sizeof plain);

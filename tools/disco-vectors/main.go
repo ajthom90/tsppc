@@ -8,8 +8,10 @@
 //	(cd tools/disco-vectors && go run .) > tests/disco_vectors.inc
 //
 // The module needs the Go toolchain go.mod names (Go's automatic toolchain
-// download fetches it). Upstream's Seal uses a random nonce, so the "UP_"
-// packets change on every run; tests only open them. The "OUR_" packets use
+// download fetches it). Upstream's Seal uses a random nonce, so regenerating
+// rewrites the "UP_" packet bytes by design; tests only open them. DV_SHARED
+// comes from x/crypto box.Precompute; the UP_ packets, sealed by upstream's
+// DiscoShared, opening under it proves the two agree. The "OUR_" packets use
 // a fixed nonce and are deterministic. All keys are made-up test keys.
 package main
 
@@ -119,8 +121,11 @@ func main() {
 		" * disco and types/key packages). Do not edit. Regenerate with\n"+
 		" *   (cd tools/disco-vectors && go run .) > tests/disco_vectors.inc\n"+
 		" * A is the upstream peer, B is us. All keys are made-up test keys.\n"+
-		" * UP_* packets were sealed by A with upstream's random nonce; OUR_*\n"+
-		" * packets are B to A with nonce DV_NONCE. */\n\n")
+		" * UP_* packets were sealed by A with upstream's random nonce (so\n"+
+		" * regenerating rewrites their bytes by design); OUR_*\n"+
+		" * packets are B to A with nonce DV_NONCE. DV_SHARED is x/crypto\n"+
+		" * box.Precompute; UP_* (sealed by upstream's DiscoShared) opening under\n"+
+		" * it proves the two agree. */\n\n")
 	emit("DV_A_PRIV", aRaw)
 	emit("DV_A_PUB", aPub[:])
 	emit("DV_B_PRIV", bRaw)

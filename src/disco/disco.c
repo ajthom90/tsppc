@@ -92,7 +92,7 @@ static int parse(ts_disco_msg *m, const uint8_t *b, size_t n)
     size_t dn, i;
     uint8_t acc = 0;
 
-    if (n < 2 || b[1] != 0) return -1;
+    if (n < 2) return -1;   /* b[1], the version, is ignored as upstream does */
     d = b + 2;
     dn = n - 2;
     m->type = b[0];

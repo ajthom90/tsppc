@@ -67,11 +67,11 @@ typedef struct {
 
 /* Open and parse a packet (header included) with the shared key for its
  * sender. Returns 0 with m filled, or -1 (bad magic or length, n >
- * TS_DISCO_MAX, forged box, version not 0, ping payload under 12 bytes, pong
- * payload under 30 bytes). Bytes after a message are ignored. Ping NodeKey:
- * set only if the 32 bytes after the TxID exist and are not all zero. Types
- * other than ping and pong return 0 with only m->type set. Stricter than
- * upstream, which ignores the version byte. */
+ * TS_DISCO_MAX, forged box, plaintext under 2 bytes, ping payload under 12
+ * bytes, pong payload under 30 bytes). The version byte is ignored, as
+ * upstream's parsePing/parsePong do. Bytes after a message are ignored. Ping
+ * NodeKey: set only if the 32 bytes after the TxID exist and are not all
+ * zero. Types other than ping and pong return 0 with only m->type set. */
 int ts_disco_open(ts_disco_msg *m, const uint8_t *p, size_t n,
                   const ts_disco_shared *s);
 

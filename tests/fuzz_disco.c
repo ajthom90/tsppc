@@ -14,7 +14,7 @@
  * the header and length checks). Odd: the rest is a plaintext, sealed under
  * the shared key into a buffer of exactly the packet's length and opened, so
  * the parser sees arbitrary authentic plaintexts; the result must match the
- * parse rules (version 0, ping payload >= 12, pong payload >= 30) and the
+ * parse rules (any version byte, ping payload >= 12, pong payload >= 30) and the
  * fields must be the plaintext's bytes. Keys are made up. */
 
 #define MY_PRIV   "b0c1d2e3f405162738495a6b7c8d9eafb0c1d2e3f405162738495a6b7c8d9e6f"
@@ -88,7 +88,7 @@ static void sealed_plain(const uint8_t *plain, size_t plen)
     memcpy(p + 38, NONCE, 24);
     ts_secretbox_seal(p + 62, g_s.k, NONCE, plain, plen);
 
-    want = plen >= 2 && plain[1] == 0;
+    want = plen >= 2;
     if (want && plain[0] == TS_DISCO_PING) want = plen >= 14;
     if (want && plain[0] == TS_DISCO_PONG) want = plen >= 32;
     r = ts_disco_open(&m, p, n, &g_s);

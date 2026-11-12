@@ -2,8 +2,11 @@
  * disco and types/key packages). Do not edit. Regenerate with
  *   (cd tools/disco-vectors && go run .) > tests/disco_vectors.inc
  * A is the upstream peer, B is us. All keys are made-up test keys.
- * UP_* packets were sealed by A with upstream's random nonce; OUR_*
- * packets are B to A with nonce DV_NONCE. */
+ * UP_* packets were sealed by A with upstream's random nonce (so
+ * regenerating rewrites their bytes by design); OUR_*
+ * packets are B to A with nonce DV_NONCE. DV_SHARED is x/crypto
+ * box.Precompute; UP_* (sealed by upstream's DiscoShared) opening under
+ * it proves the two agree. */
 
 static const uint8_t DV_A_PRIV[32] = {
     0x10, 0x13, 0x16, 0x19, 0x1c, 0x1f, 0x22, 0x25, 0x28, 0x2b, 0x2e, 0x31,
