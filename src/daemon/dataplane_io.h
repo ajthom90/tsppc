@@ -25,7 +25,15 @@
  *   SIGTERM and SIGINT.
  * - If no /dev/tunN opens, relays and home selection still run, packets for
  *   the tun device are dropped (counted), status shows "tunnel driver not
- *   loaded", and opening is retried every TS_DPIO_TUN_RETRY_MS.
+ *   loaded", and opening is retried every TS_DPIO_TUN_RETRY_MS. The same
+ *   happens when the address or the tailnet route cannot be set (the device
+ *   is then taken down and closed first: no half-configured tunnel is left)
+ *   and when a read from the device fails or returns end of file.
+ * - The interface and route commands block (up to 10 s each): the clock is
+ *   read again after them, and a home probe round they interrupted starts
+ *   over, so no probe is timed across them.
+ * - A new DERP map without the current home region (or with no usable node
+ *   in it) starts a probe round at once.
  *
  * Relays: each slot is a non-blocking TCP connect to the node's IPv4 and port,
  * then TLS with the node's name (unless TSPPC_DERP_PLAIN in test builds);
@@ -53,9 +61,10 @@
 #define TS_DPIO_READS 16               /* reads per relay connection per loop turn */
 
 typedef void (*ts_dpio_log_fn)(const char *fmt, ...);
+typedef int64_t (*ts_dpio_clock_fn)(void);   /* monotonic ms, as the now_ms arguments */
 
 /* Set up (no I/O). 0, or -1 if out of memory. */
-int ts_dpio_init(ts_dpio_log_fn logf);
+int ts_dpio_init(ts_dpio_log_fn logf, ts_dpio_clock_fn clock);
 /* At start: delete a route left by a crash, quietly. */
 void ts_dpio_cleanup_route(void);
 /* After the session's calls each loop turn: start, stop or restart the data
@@ -77,6 +86,7 @@ typedef struct {
     int home_up;              /* the home relay is connected and verified */
     int home_down;            /* not up, and the data plane says why (no usable relay, a failed connection) */
     char filter[16];          /* "none", "ok", "too large" or "invalid" */
+    unsigned long filtered;   /* inbound packets the filter dropped */
     int tun_open;
     char ifname[16];
     char problem[256];        /* "" or a short reason ("tunnel driver not loaded", the data plane's) */
@@ -85,5 +95,11 @@ typedef struct {
 void ts_dpio_get_view(ts_dpio_view *v);
 /* ts_dp_peer_status of the running data plane; -1 when it is not running. */
 int ts_dpio_peer_status(uint32_t ipv4, ts_wg_stats *st, int *region);
+
+#ifdef TS_TEST_HOOKS
+/* Replace the tun device and the commands (NULL: the real ones). */
+extern int (*ts_dpio_test_tun_open)(char ifname[16]);
+extern int (*ts_dpio_test_run)(const char *const *argv);
+#endif
 
 #endif

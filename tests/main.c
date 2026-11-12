@@ -30,7 +30,10 @@ void test_dp_peer_change(void);
 void test_dp_conns(void);
 void test_dp_pick_home(void);
 void test_dp_stress(void);
+void test_dp_expiry(void);
+void test_dp_relay_full(void);
 void test_tun_cmds(void);
+void test_dpio(void);
 
 int main(void)
 {
@@ -64,6 +67,9 @@ int main(void)
     test_dp_conns();
     test_dp_pick_home();
     test_dp_stress();
+    test_dp_expiry();
+    test_dp_relay_full();
     test_tun_cmds();
+    test_dpio();
     return t_summary();
 }

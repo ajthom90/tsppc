@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <mach/mach_time.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -169,11 +170,15 @@ int ts_tun_cmd_ifconfig_down(const char **argv, size_t max, char *buf, size_t ca
     return b_end(&b);
 }
 
+/* Monotonic milliseconds (mach_absolute_time, as the daemon's clock): a
+ * wall clock step cannot shorten or stretch the wait. */
 static int64_t mono_ms(void)
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);   /* only to bound a wait: a clock step shortens or stretches it */
-    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    static mach_timebase_info_data_t tb;
+    uint64_t t = mach_absolute_time(), ns;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    ns = (t / tb.denom) * tb.numer + (t % tb.denom) * tb.numer / tb.denom;
+    return (int64_t)(ns / 1000000u);
 }
 
 int ts_run(const char *const *argv)

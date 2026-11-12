@@ -32,6 +32,7 @@ typedef struct {
     int http_done, have_key, preferred, npref;
     uint8_t key[32];
     unsigned long nsend;            /* SendPacket frames from this client */
+    int full;                       /* conn_send says there is no room */
     uint8_t first_dst[32], last_dst[32];
     size_t c2s_n, s2c_n;
     uint8_t c2s[BUFCAP];
@@ -107,18 +108,20 @@ static int cb_dial(void *user, int slot, const ts_derp_node *node)
     return 0;
 }
 
-static void cb_conn_send(void *user, int slot, const uint8_t *p, size_t len)
+static int cb_conn_send(void *user, int slot, const uint8_t *p, size_t len)
 {
     tnode *n = (tnode *)user;
     tconn *c = &n->c[slot];
     if (!c->dialed || !c->up) {
         n->bad_tun++;   /* bytes for a stream that is not up */
-        return;
+        return 0;
     }
+    if (c->full) return -1;
     if (c->c2s_n + len <= BUFCAP) {
         memcpy(c->c2s + c->c2s_n, p, len);
         c->c2s_n += len;
     }
+    return 0;
 }
 
 static void cb_conn_close(void *user, int slot)
@@ -379,6 +382,8 @@ static size_t addf(char *s, size_t cap, size_t n, const char *fmt, ...)
 
 /* A MapResponse for self with peers, regions 1..nregions and, if filter is
  * not NULL, "PacketFilter": filter. self NULL leaves out Node. */
+static const char *g_peer_expiry;   /* KeyExpiry for every peer, if not NULL */
+
 static char *map_json(const tnode *self, const pspec *p, size_t np, int nregions, const char *filter)
 {
     size_t cap = np * 400 + (size_t)nregions * 200 + (filter ? strlen(filter) : 0) + 1024, n = 0, i;
@@ -406,6 +411,7 @@ static char *map_json(const tnode *self, const pspec *p, size_t np, int nregions
             if (p[i].flags & P_JAILED) n = addf(s, cap, n, ",\"IsJailed\":true");
             if (p[i].flags & P_EXPIRED) n = addf(s, cap, n, ",\"Expired\":true");
             if (p[i].flags & P_WGONLY) n = addf(s, cap, n, ",\"IsWireGuardOnly\":true");
+            if (g_peer_expiry) n = addf(s, cap, n, ",\"KeyExpiry\":\"%s\"", g_peer_expiry);
             n = addf(s, cap, n, ",\"Online\":true,\"MachineAuthorized\":true}");
         }
         n = addf(s, cap, n, "],");
@@ -625,6 +631,8 @@ void test_dp_peer_change(void);
 void test_dp_conns(void);
 void test_dp_pick_home(void);
 void test_dp_stress(void);
+void test_dp_expiry(void);
+void test_dp_relay_full(void);
 
 void test_dp_ping(void)
 {
@@ -1385,4 +1393,126 @@ void test_dp_stress(void)
     t_true("stress: at most 8 open", N[0].max_active <= TS_DP_MAX_CONNS && N[1].max_active <= TS_DP_MAX_CONNS);
     nodes_free();
     ts_dp_test_on_deliver = NULL;
+}
+
+/* Local peer expiry by control's clock (upstream flagExpiredPeers). */
+#define EXP_AT 1794484800   /* 2026-11-12T12:00:00Z */
+
+void test_dp_expiry(void)
+{
+    ts_wg_stats ws;
+    int region;
+
+    mk_key(s_priv, s_pub, 99);
+    setup(2, ALLOW_ALL_ICMP);
+    g_peer_expiry = "2026-11-12T12:00:00Z";
+    t_true("expiry: map with a KeyExpiry", map_of(0, 3, ALLOW_ALL_ICMP) == 0);
+    t_true("expiry: no control time: the peer stays", ping(0, 1, 1) && ping(1, 0, 2));
+
+    ts_dp_set_control_time(N[0].dp, EXP_AT - 60, g_now);
+    advance(58000);   /* control-now: 2 s before the expiry */
+    t_true("expiry: before KeyExpiry the peer stays", ping(0, 1, 3) && ping(1, 0, 4));
+    advance(2000 + TS_DP_EXPIRY_CHECK_MS);
+    t_true("expiry: at KeyExpiry (checked within 5 s) the peer is gone",
+           ts_dp_peer_status(N[0].dp, N[1].ip, &ws, &region) == -1);
+    t_true("expiry: its sessions are wiped", !ts_dp_test_has_keys(N[0].dp, N[1].pub));
+    t_true("expiry: nothing goes to it", !ping(0, 1, 5));
+    t_true("expiry: nothing from it is delivered", !ping(1, 0, 6));
+    t_true("expiry: a map with the same peer does not bring it back",
+           map_of(0, 3, ALLOW_ALL_ICMP) == 0 && ts_dp_peer_status(N[0].dp, N[1].ip, &ws, &region) == -1);
+    /* A renewed key: back at once. */
+    g_peer_expiry = "2027-11-12T12:00:00Z";
+    t_true("expiry: renewed", map_of(0, 3, ALLOW_ALL_ICMP) == 0 && ping(0, 1, 7) && ping(1, 0, 8));
+
+    /* The clock survives a restart; an epoch expiry (-1) is expired. */
+    g_peer_expiry = "1970-01-01T00:00:00Z";
+    ts_dp_stop(N[0].dp);
+    node_start(&N[0]);
+    t_true("expiry: restart map", map_of(0, 3, ALLOW_ALL_ICMP) == 0);
+    ts_dp_set_home(N[0].dp, 1);
+    pump();
+    t_true("expiry: the 1970 expiry is expired at once after a restart",
+           ts_dp_peer_status(N[0].dp, N[1].ip, &ws, &region) == -1);
+
+    /* A control time before upstream's sanity epoch is not used. */
+    ts_dp_set_control_time(N[0].dp, 1600000000, g_now);
+    g_peer_expiry = "2001-01-01T00:00:00Z";
+    t_true("expiry: implausible control time ignored",
+           map_of(0, 3, ALLOW_ALL_ICMP) == 0 && ts_dp_peer_status(N[0].dp, N[1].ip, &ws, &region) == 0);
+    nodes_free();
+
+    /* Never the Mac's clock: with no control time, a long-past KeyExpiry
+     * keeps the peer (control's Expired flag is what counts then). */
+    setup(2, ALLOW_ALL_ICMP);
+    g_peer_expiry = "2001-01-01T00:00:00Z";
+    t_true("expiry: no control time, past KeyExpiry: kept", map_of(0, 3, ALLOW_ALL_ICMP) == 0 && ping(0, 1, 9));
+    g_peer_expiry = NULL;
+    nodes_free();
+}
+
+/* A relay connection whose output is full drops packets (counted) but is
+ * kept; any other frame that does not fit ends the connection. */
+void test_dp_relay_full(void)
+{
+    ts_dp_status st;
+    uint8_t b[64];
+    size_t len;
+    int s1, s3, i, closes, before;
+
+    mk_key(s_priv, s_pub, 99);
+    setup(2, ALLOW_ALL_ICMP);
+    t_true("full: ping", ping(0, 1, 1));
+    s1 = slot_of(&N[0], 1);
+    N[0].c[s1].full = 1;
+    closes = N[0].nclose;
+    before = N[1].tun_n;
+    for (i = 0; i < 5; i++) {
+        len = icmp_pkt(b, N[0].ip, N[1].ip, 8, 10 + i);
+        ts_dp_from_tun(N[0].dp, b, len);
+    }
+    advance(300);
+    ts_dp_get_status(N[0].dp, &st);
+    t_true("full: five packets dropped and counted", st.relay_full == 5 && N[1].tun_n == before);
+    t_true("full: the connection is kept", N[0].nclose == closes && slot_of(&N[0], 1) == s1 && st.home_up);
+    N[0].c[s1].full = 0;
+    t_true("full: traffic flows again", ping(0, 1, 20));
+
+    /* NotePreferred(0) to the old home cannot be queued: that connection ends. */
+    N[0].c[s1].full = 1;
+    ts_dp_set_home(N[0].dp, 2);
+    advance(300);
+    t_true("full: a control frame that does not fit ends the connection",
+           N[0].nclose == closes + 1 && N[0].closed_region[closes] == 1);
+    ts_dp_get_status(N[0].dp, &st);
+    t_true("full: the new home is up", st.home == 2 && st.home_up);
+
+    /* The upgrade request that does not fit: closed at once. */
+    N[0].auto_up = 0;
+    ts_dp_set_home(N[0].dp, 3);
+    s3 = slot_of(&N[0], 3);
+    t_true("full: region 3 dialed", s3 >= 0);
+    if (s3 >= 0) {
+        N[0].c[s3].full = 1;
+        N[0].c[s3].up = 1;
+        ts_dp_conn_up(N[0].dp, s3);
+        t_true("full: upgrade not queued: closed", N[0].nclose == closes + 2 && N[0].closed_region[closes + 1] == 3);
+    }
+    t_true("full: no bad callbacks", N[0].bad_tun == 0);
+
+    /* The filter's drop counter. */
+    {
+        ts_dp_status s0;
+        N[0].auto_up = 1;
+        ts_dp_set_home(N[0].dp, 1);
+        advance(3000);
+        ts_dp_get_status(N[0].dp, &s0);
+        len = udp_pkt(b, N[1].ip, N[0].ip, 1000, 53);
+        ts_dp_from_tun(N[1].dp, b, len);
+        pump();
+        advance(100);
+        ts_dp_get_status(N[0].dp, &st);
+        t_true("filter count: a UDP packet against an ICMP-only filter is counted",
+               st.filtered == s0.filtered + 1);
+    }
+    nodes_free();
 }

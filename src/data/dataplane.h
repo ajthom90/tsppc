@@ -22,6 +22,15 @@
  * compiled packet filter accepts it. Before the first filter, and after a
  * filter that is too large or invalid, every inbound packet is dropped.
  *
+ * Peer expiry (upstream ipnlocal/expiry.go): a peer is left out exactly as
+ * an Expired one is (removed from the WireGuard device, its sessions wiped)
+ * when its KeyExpiry is set and not after control's current time, which is
+ * the last ControlTime given by ts_dp_set_control_time plus the monotonic
+ * time since it arrived. The Mac's own clock is never used for this: with no
+ * ControlTime yet, or one before 2023-01-10 (upstream's sanity epoch), only
+ * control's Expired flag counts. Checked on every ts_dp_set_netmap, on
+ * ts_dp_set_control_time and every TS_DP_EXPIRY_CHECK_MS in ts_dp_tick.
+ *
  * Outbound: a tun packet that parses as IPv4 and is addressed to a configured
  * peer is recorded in the flow table (UDP) and handed to WireGuard; anything
  * else is dropped.
@@ -60,11 +69,15 @@
 #define TS_DP_QUEUE_PER_CONN 32            /* packets queued while a relay connects */
 #define TS_DP_REDIAL_MIN_MS 1000
 #define TS_DP_REDIAL_MAX_MS 30000
+#define TS_DP_EXPIRY_CHECK_MS 5000
 typedef struct {
     /* Open a stream to node (TCP to node->ipv4:port, then TLS for node->host). Later
      * ts_dp_conn_up / ts_dp_conn_down report on slot. 0 started, -1 failed now. */
     int (*dial)(void *user, int slot, const ts_derp_node *node);
-    void (*conn_send)(void *user, int slot, const uint8_t *p, size_t n);
+    /* 0 queued, or -1: no room (the frame is not sent). A SendPacket that
+     * finds no room is dropped and counted (relay_full); any other frame
+     * (the upgrade request, the handshake, keepalives) fails the connection. */
+    int (*conn_send)(void *user, int slot, const uint8_t *p, size_t n);
     void (*conn_close)(void *user, int slot);
     void (*tun_write)(void *user, const uint8_t *ip, size_t n);
     int (*random)(void *user, uint8_t *out, size_t n);
@@ -82,6 +95,10 @@ int ts_dp_running(const ts_dp *dp);
  * their gens changed. Never keeps a pointer into m. */
 void ts_dp_set_netmap(ts_dp *dp, const ts_netmap *m);
 void ts_dp_set_home(ts_dp *dp, int region);
+/* Control's clock: unix_sec (as ts_netmap.control_time) was control's time
+ * when the message carrying it arrived at now_ms (the clock of ts_dp_tick).
+ * Kept across ts_dp_start and ts_dp_stop. */
+void ts_dp_set_control_time(ts_dp *dp, int64_t unix_sec, int64_t now_ms);
 void ts_dp_from_tun(ts_dp *dp, const uint8_t *ip, size_t n);
 void ts_dp_conn_up(ts_dp *dp, int slot);
 void ts_dp_conn_recv(ts_dp *dp, int slot, const uint8_t *p, size_t n);
@@ -94,6 +111,8 @@ int ts_dp_pick_home(const ts_derp_region *r, size_t n, const int *lat_ms, int cu
 typedef struct {
     int home; int home_up; const char *filter;    /* "none", "ok", "too large", "invalid" */
     char problem[200];
+    unsigned long filtered;      /* packets from peers the filter dropped (since ts_dp_new) */
+    unsigned long relay_full;    /* packets dropped: a relay connection's output was full */
 } ts_dp_status;
 void ts_dp_get_status(const ts_dp *dp, ts_dp_status *st);
 int ts_dp_peer_status(const ts_dp *dp, uint32_t ipv4, ts_wg_stats *st, int *region);

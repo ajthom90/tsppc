@@ -696,7 +696,10 @@ static void build_status(rbuild *b)
             snprintf(line, sizeof line, "off");
         }
         put(b, "tunnel", line);
-        if (dv.running) put(b, "filter", filter_word(dv.filter));
+        if (dv.running) {
+            snprintf(line, sizeof line, "%s dropped %lu", filter_word(dv.filter), dv.filtered);
+            put(b, "filter", line);
+        }
         for (i = 0; i < nm->npeers; i++) {
             const ts_node *p = &nm->peers[i];
             if (p->have_ipv4) fmt_ip(ip, sizeof ip, p->ipv4);
@@ -998,7 +1001,7 @@ int main(int argc, char **argv)
     }
     /* After the socket: a second tsppcd, refused above, must not touch the
      * running one's route. */
-    if (ts_dpio_init(logline) != 0) {
+    if (ts_dpio_init(logline, now_ms) != 0) {
         fprintf(stderr, "tsppcd: out of memory\n");
         close(D.lfd);
         ts_ipc_unlink(D.sock_path, D.ldev, D.lino);

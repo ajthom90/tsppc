@@ -30,7 +30,9 @@ typedef struct {
     int idx;
     int state;           /* S_* */
     int region;          /* 0 when free */
-    int dead;            /* failed inside its own feed: torn down when the feed returns */
+    int dead;            /* failed inside a DERP call: torn down when that returns */
+    const char *dead_why;
+    int sending_packet;  /* inside ts_derp_send_packet: a frame with no room is dropped */
     int ever_ready;      /* reached ready since the last dial */
     size_t node;         /* which of the region's nodes the next dial uses */
     int64_t last_write;  /* last WireGuard message queued or sent (or created) */
@@ -45,6 +47,7 @@ typedef struct {
     uint8_t key[32];
     uint32_t ipv4;
     int have_ipv4, home, online, jailed, expired, wgonly;
+    int64_t key_expiry;  /* KeyExpiry, Unix seconds; 0 none */
     int configured;      /* in the WireGuard device */
     int rx_region;       /* region we last received this peer on, 0 none */
     int tx_region;       /* region last used to send to it, 0 none */
@@ -73,6 +76,10 @@ struct ts_dp {
     int home;
     char home_err[120];
     int feeding;               /* slot inside ts_derp_feed, or -1 */
+    int have_ct;               /* control's clock: ct_sec was its time at ct_mono (our clock) */
+    int64_t ct_sec, ct_mono;
+    int64_t next_expiry_check;
+    unsigned long filtered, relay_full;
     slot *slots[TS_DP_MAX_CONNS];
 #ifdef TS_TEST_HOOKS
     ts_dp_test_counts cnt;
@@ -92,6 +99,19 @@ static int key_zero(const uint8_t k[32])
     size_t i;
     for (i = 0; i < 32; i++) acc |= k[i];
     return acc == 0;
+}
+
+/* Upstream's flagExpiredPeersEpoch: a control time before this is not used. */
+#define CT_EPOCH 1673373066
+
+/* KeyExpiry set and not after control's current time (never our own clock). */
+static int locally_expired(const ts_dp *dp, int64_t key_expiry)
+{
+    int64_t now;
+    if (!dp->have_ct || key_expiry == 0) return 0;
+    now = dp->ct_sec + (dp->now > dp->ct_mono ? (dp->now - dp->ct_mono) / 1000 : 0);
+    if (now < CT_EPOCH) return 0;
+    return key_expiry <= now;
 }
 
 /* ---- Lookups --------------------------------------------------------------- */
@@ -151,11 +171,18 @@ static void queue_clear(slot *s)
     s->qhead = s->qn = 0;
 }
 
+static void send_packet(slot *s, const uint8_t dst[32], const uint8_t *msg, size_t n)
+{
+    s->sending_packet = 1;
+    ts_derp_send_packet(s->d, dst, msg, n);
+    s->sending_packet = 0;
+}
+
 static void flush(slot *s)
 {
     while (s->qn && slot_ready(s)) {
         qent *e = &s->q[s->qhead];
-        ts_derp_send_packet(s->d, e->dst, e->b, e->n);
+        send_packet(s, e->dst, e->b, e->n);
         ts_wipe(e, sizeof *e);
         s->qhead = (s->qhead + 1) % TS_DP_QUEUE_PER_CONN;
         s->qn--;
@@ -172,6 +199,7 @@ static void slot_free(slot *s)
     s->state = S_FREE;
     s->region = 0;
     s->dead = 0;
+    s->dead_why = NULL;
     s->ever_ready = 0;
     s->node = 0;
     s->backoff = TS_DP_REDIAL_MIN_MS;
@@ -203,6 +231,7 @@ static void slot_down(slot *s, int close_stream, const char *why)
     if (close_stream && (s->state == S_DIALING || s->state == S_UP)) dp->io.conn_close(dp->user, s->idx);
     ts_derp_free(s->d);
     s->dead = 0;
+    s->dead_why = NULL;
     if (dp->running && region_usable(dp, s->region) && (s->region == dp->home || s->qn > 0)) {
         if (!s->ever_ready) s->node++;   /* try the region's next node */
         s->ever_ready = 0;
@@ -306,7 +335,7 @@ static void slot_send(slot *s, const uint8_t dst[32], const uint8_t *msg, size_t
     if (n > MSG_MAX) return;
     flush(s);
     if (s->qn == 0 && slot_ready(s)) {
-        ts_derp_send_packet(s->d, dst, msg, n);
+        send_packet(s, dst, msg, n);
         return;
     }
     if (s->qn == TS_DP_QUEUE_PER_CONN) {
@@ -325,7 +354,7 @@ static void after_feed(slot *s, int rc)
 {
     ts_dp *dp = s->dp;
     if (rc != 0 || s->dead) {
-        slot_down(s, 1, s->d->err ? s->d->err : "relay connection failed");
+        slot_down(s, 1, s->d->err ? s->d->err : s->dead_why ? s->dead_why : "relay connection failed");
         return;
     }
     if (!s->ever_ready && ts_derp_ready(s->d)) {
@@ -341,7 +370,13 @@ static void after_feed(slot *s, int rc)
 static void derp_send(void *user, const uint8_t *p, size_t n)
 {
     slot *s = (slot *)user;
-    if (s->state == S_UP && !s->dead) s->dp->io.conn_send(s->dp->user, s->idx, p, n);
+    if (s->state != S_UP || s->dead || s->dp->io.conn_send(s->dp->user, s->idx, p, n) == 0) return;
+    if (s->sending_packet) {
+        s->dp->relay_full++;   /* as upstream's full write queue: this packet only */
+        return;
+    }
+    s->dead = 1;               /* torn down once the DERP call returns */
+    s->dead_why = "the relay is not reading";
 }
 
 static void derp_recv(void *user, const uint8_t src[32], const uint8_t *p, size_t n)
@@ -440,6 +475,7 @@ static void wg_deliver(void *user, const uint8_t key[32], const uint8_t *ip, siz
     }
     if (!ts_filter_in(dp->filter, &dp->flows, &pk, NULL)) {
         COUNT(dp, filtered);
+        dp->filtered++;
         return;
     }
     dp->io.tun_write(dp->user, ip, pk.len);
@@ -576,7 +612,8 @@ static void set_peers(ts_dp *dp, const ts_netmap *m)
         p->home = src->home_derp;
         p->online = src->online;
         p->jailed = src->jailed;
-        p->expired = src->expired;
+        p->key_expiry = src->key_expiry;
+        p->expired = src->expired || locally_expired(dp, src->key_expiry);
         p->wgonly = src->wireguard_only;
         p->configured = !p->jailed && !p->expired && !p->wgonly && p->have_ipv4 && !key_zero(p->key);
         for (j = 0; j < i && p->configured; j++)   /* one entry per key */
@@ -610,6 +647,28 @@ static void set_peers(ts_dp *dp, const ts_netmap *m)
     memcpy(dp->peers, dp->stage, n * sizeof dp->peers[0]);
     ts_wipe(dp->stage, sizeof dp->stage);
     dp->npeers = n;
+}
+
+/* Peers whose key has expired by control's clock leave the device. */
+static void expire_check(ts_dp *dp)
+{
+    size_t i;
+    dp->next_expiry_check = dp->now + TS_DP_EXPIRY_CHECK_MS;
+    for (i = 0; i < dp->npeers; i++) {
+        dpeer *p = &dp->peers[i];
+        if (!p->configured || !locally_expired(dp, p->key_expiry)) continue;
+        p->expired = 1;
+        p->configured = 0;
+        ts_wg_remove_peer(dp->wg, p->key);
+    }
+}
+
+void ts_dp_set_control_time(ts_dp *dp, int64_t unix_sec, int64_t now_ms)
+{
+    dp->have_ct = 1;
+    dp->ct_sec = unix_sec;
+    dp->ct_mono = now_ms;
+    if (dp->running) expire_check(dp);
 }
 
 static void set_filter(ts_dp *dp, const ts_netmap *m)
@@ -683,6 +742,7 @@ void ts_dp_conn_up(ts_dp *dp, int i)
     if (!s || s->state != S_DIALING) return;
     s->state = S_UP;
     ts_derp_start(s->d, dp->now);
+    if (s->dead) slot_down(s, 1, s->dead_why);
 }
 
 void ts_dp_conn_recv(ts_dp *dp, int i, const uint8_t *p, size_t n)
@@ -708,6 +768,7 @@ void ts_dp_tick(ts_dp *dp, int64_t now_ms)
     int i;
     dp->now = now_ms;
     if (!dp->running) return;
+    if (now_ms >= dp->next_expiry_check) expire_check(dp);
     ts_wg_tick(dp->wg, now_ms);
     for (i = 0; i < TS_DP_MAX_CONNS; i++) {
         slot *s = dp->slots[i];
@@ -716,9 +777,12 @@ void ts_dp_tick(ts_dp *dp, int64_t now_ms)
             slot_free(s);
             continue;
         }
-        if (s->state == S_UP) {
+        if (s->state == S_UP && !s->dead) {
             if (ts_derp_tick(s->d, now_ms) != 0) slot_down(s, 1, s->d->err);
             else flush(s);
+        }
+        if (s->state == S_UP && s->dead) {
+            slot_down(s, 1, s->dead_why);
         } else if (s->state == S_BACKOFF && now_ms >= s->redial_at) {
             if (s->region == dp->home || s->qn > 0) dial(s);
             else slot_free(s);
@@ -784,6 +848,8 @@ void ts_dp_get_status(const ts_dp *dp, ts_dp_status *st)
     default: st->filter = "none"; break;
     }
     st->problem[0] = 0;
+    st->filtered = dp->filtered;
+    st->relay_full = dp->relay_full;
     if (dp->fstate == F_BIG)
         snprintf(st->problem, sizeof st->problem, "packet filter too large; inbound traffic blocked");
     else if (dp->fstate == F_INVALID)

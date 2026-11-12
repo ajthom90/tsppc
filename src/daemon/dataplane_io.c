@@ -33,7 +33,6 @@ typedef struct {
     char host[254];
     uint8_t *out;
     size_t outlen, outcap;
-    const char *fail;          /* a failure found inside a callback, reported later */
 } rslot;
 
 typedef struct {
@@ -44,9 +43,14 @@ typedef struct {
 
 static struct {
     ts_dpio_log_fn log;
+    ts_dpio_clock_fn clock;
     ts_dp *dp;
     int no_tun, plain;
     int64_t now;
+    int blocked;               /* a command ran since the clock was last read */
+    uint32_t ct_gen;           /* control_time_gen last handed to the data plane */
+    int ct_logged;             /* 1: said whether ControlTime came; 2: said it came */
+    uint32_t seen_derp_gen;    /* derp_gen of the last map checked for the home */
 
     /* The running data plane and what it was started with. */
     int running;
@@ -109,7 +113,6 @@ static void slot_close(rslot *s)
     s->out = NULL;
     s->outlen = s->outcap = 0;
     s->phase = R_NONE;
-    s->fail = NULL;
     s->region = 0;
     s->gen++;
 }
@@ -159,25 +162,21 @@ static int io_dial(void *user, int i, const ts_derp_node *node)
     return 0;
 }
 
-static void io_conn_send(void *user, int i, const uint8_t *p, size_t n)
+/* A whole frame or nothing: -1 when it does not fit (the data plane then
+ * drops a packet, or ends the connection for anything else). */
+static int io_conn_send(void *user, int i, const uint8_t *p, size_t n)
 {
     rslot *s = &G.s[i];
     (void)user;
-    if (s->phase != R_UP || s->fail) return;
-    if (n > OUT_MAX - s->outlen) {
-        s->fail = "the relay is not reading";   /* a whole frame or nothing */
-        return;
-    }
+    if (s->phase != R_UP) return 0;   /* not connected: nothing to send on */
+    if (n > OUT_MAX - s->outlen) return -1;
     if (s->outlen + n > s->outcap) {
         size_t nc = s->outcap ? s->outcap : 8192;
         uint8_t *nb;
         while (nc < s->outlen + n) nc *= 2;
         if (nc > OUT_MAX) nc = OUT_MAX;
         nb = (uint8_t *)malloc(nc);
-        if (!nb) {
-            s->fail = "out of memory";
-            return;
-        }
+        if (!nb) return -1;
         if (s->outlen) memcpy(nb, s->out, s->outlen);
         if (s->out) {
             ts_wipe(s->out, s->outlen);
@@ -188,6 +187,7 @@ static void io_conn_send(void *user, int i, const uint8_t *p, size_t n)
     }
     memcpy(s->out + s->outlen, p, n);
     s->outlen += n;
+    return 0;
 }
 
 /* The data plane ends a stream: a failure it found (a DERP error or
@@ -267,7 +267,7 @@ static void slot_read(int i)
     rslot *s = &G.s[i];
     unsigned g = s->gen;
     int k;
-    for (k = 0; k < TS_DPIO_READS && s->gen == g && s->phase == R_UP && !s->fail; k++) {
+    for (k = 0; k < TS_DPIO_READS && s->gen == g && s->phase == R_UP; k++) {
         ssize_t n;
         if (s->tls) {
             int r = ts_tls_read(s->tls, rbuf, sizeof rbuf);
@@ -314,10 +314,6 @@ static void slot_events(int i, fd_set *r, fd_set *w)
     unsigned g = s->gen;
     int rc;
     if (s->gen != s->sel_gen || s->phase == R_NONE) return;
-    if (s->fail) {
-        slot_fail(i, s->fail);
-        return;
-    }
     if ((s->phase == R_TCP || s->phase == R_TLS) && G.now > s->deadline) {
         slot_fail(i, "timed out connecting to the relay");
         return;
@@ -350,7 +346,7 @@ static void slot_events(int i, fd_set *r, fd_set *w)
         return;
     case R_UP:
         if (s->tls || FD_ISSET(s->fd, r)) slot_read(i);
-        if (s->gen != g || s->fail) return;
+        if (s->gen != g) return;
         slot_flush(i);
         if (s->gen == g && s->tls && FD_ISSET(s->fd, w) && ts_tls_step(s->tls) < 0) slot_fail(i, ts_tls_error(s->tls));
         return;
@@ -361,9 +357,26 @@ static void slot_events(int i, fd_set *r, fd_set *w)
 
 /* ---- The tun device ------------------------------------------------------- */
 
+#ifdef TS_TEST_HOOKS
+int (*ts_dpio_test_tun_open)(char ifname[16]);
+int (*ts_dpio_test_run)(const char *const *argv);
+#define TUN_OPEN(n) (ts_dpio_test_tun_open ? ts_dpio_test_tun_open(n) : ts_tun_open(n))
+#define RUN(a) (ts_dpio_test_run ? ts_dpio_test_run(a) : ts_run(a))
+#else
+#define TUN_OPEN(n) ts_tun_open(n)
+#define RUN(a) ts_run(a)
+#endif
+
+/* Every command blocks: the clock must be read again afterwards. */
+static int run_quiet(const char *const *argv)
+{
+    G.blocked = 1;
+    return RUN(argv);
+}
+
 static int run_cmd(const char *const *argv, const char *what)
 {
-    int rc = ts_run(argv);
+    int rc = run_quiet(argv);
     if (rc != 0) G.log("%s failed (status %d)", what, rc);
     return rc;
 }
@@ -373,22 +386,29 @@ static void route_delete(int quiet)
     const char *argv[8];
     char buf[128];
     if (ts_tun_cmd_route_delete(argv, 8, buf, sizeof buf) < 0) return;
-    if (quiet) (void)ts_run(argv);
+    if (quiet) (void)run_quiet(argv);
     else (void)run_cmd(argv, "deleting the tailnet route");
 }
 
-static void tun_close(void)
+/* Remove our address, take the interface down and close the device. */
+static void tun_teardown(void)
 {
     const char *argv[16];
     char buf[256];
     if (G.tun_fd < 0) return;
-    route_delete(0);
     if (ts_tun_cmd_ifconfig_down(argv, 16, buf, sizeof buf, G.ifname, G.self_ip) > 0) {
         (void)run_cmd(argv, "removing the tunnel address");
         (void)run_cmd(argv + 6, "taking the tunnel interface down");
     }
     close(G.tun_fd);
     G.tun_fd = -1;
+}
+
+static void tun_close(void)
+{
+    if (G.tun_fd < 0) return;
+    route_delete(0);
+    tun_teardown();
 }
 
 static void tun_problem(const char *p)
@@ -405,7 +425,7 @@ static void tun_open(void)
     int fd;
     if (G.no_tun || G.tun_fd >= 0) return;
     G.tun_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
-    fd = ts_tun_open(G.ifname);
+    fd = TUN_OPEN(G.ifname);
     if (fd < 0) {
         G.tun_err = errno;
         if (errno == ENOENT) tun_problem("tunnel driver not loaded");
@@ -419,18 +439,32 @@ static void tun_open(void)
         return;
     }
     G.tun_fd = fd;
-    if (ts_tun_cmd_ifconfig_up(argv, 16, buf, sizeof buf, G.ifname, G.self_ip) < 0 ||
-        run_cmd(argv, "configuring the tunnel interface") != 0) {
+    if (ts_tun_cmd_ifconfig_up(argv, 16, buf, sizeof buf, G.ifname, G.self_ip) < 0) {
         close(G.tun_fd);
         G.tun_fd = -1;
         tun_problem("cannot configure the tunnel interface");
         return;
     }
-    if (ts_tun_cmd_route_add(argv, 16, buf, sizeof buf, G.ifname) < 0 || ts_run(argv) != 0) {
+    if (run_cmd(argv, "configuring the tunnel interface") != 0) {
+        tun_teardown();   /* whatever part of it was set */
+        tun_problem("cannot configure the tunnel interface");
+        return;
+    }
+    /* Without the route, replies to the tailnet would leave in the clear by
+     * the default route: take the tunnel down, retried in
+     * TS_DPIO_TUN_RETRY_MS. */
+    if (ts_tun_cmd_route_add(argv, 16, buf, sizeof buf, G.ifname) < 0) {
+        tun_teardown();
+        tun_problem("cannot add the tailnet route");
+        return;
+    }
+    if (run_quiet(argv) != 0) {
         route_delete(1);   /* a stale route from another interface */
         if (run_cmd(argv, "adding the tailnet route") != 0) {
+            route_delete(1);
+            tun_teardown();
             tun_problem("cannot add the tailnet route");
-            return;   /* kept open: retried on the next start */
+            return;
         }
     }
     G.tun_err = 0;
@@ -444,7 +478,15 @@ static void tun_events(fd_set *r)
     if (G.tun_fd < 0 || !FD_ISSET(G.tun_fd, r)) return;
     for (k = 0; k < TS_DPIO_TUN_READS && G.running && G.tun_fd >= 0; k++) {
         ssize_t n = read(G.tun_fd, tbuf, sizeof tbuf);
-        if (n <= 0) return;   /* EAGAIN: nothing more */
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;   /* nothing more */
+        if (n <= 0) {
+            /* The device is gone or broken: never spin on it. */
+            G.log("tunnel %s: %s", G.ifname, n == 0 ? "end of file" : "read failed");
+            tun_close();
+            tun_problem("the tunnel device failed");
+            G.tun_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
+            return;
+        }
         ts_dp_from_tun(G.dp, tbuf, (size_t)n);
     }
 }
@@ -561,6 +603,29 @@ static void probes_apply(ts_sess *sess, const ts_netmap *nm)
 
 /* ---- Lifecycle ------------------------------------------------------------ */
 
+/* After commands that blocked: read the clock again, and start over a probe
+ * round they interrupted (its connects would look slow). */
+static void after_block(void)
+{
+    if (!G.blocked) return;
+    G.blocked = 0;
+    if (G.clock) G.now = G.clock();
+    if (G.running) ts_dp_tick(G.dp, G.now);
+    if (G.probing) {
+        probes_cancel();
+        G.probe_want = 1;
+    }
+}
+
+/* Is region id in the map with a usable node? */
+static int map_region_usable(const ts_netmap *nm, int id)
+{
+    size_t i;
+    for (i = 0; i < nm->nregions; i++)
+        if (nm->regions[i].id == id) return nm->regions[i].nnodes > 0;
+    return 0;
+}
+
 static void dp_stop(const char *why)
 {
     int i;
@@ -622,6 +687,13 @@ void ts_dpio_sync(ts_sess *sess, int want_up, int map_changed, int64_t now_ms)
     state = ts_sess_get_state(sess);
     nm = ts_sess_netmap(sess);
     st = ts_sess_node_state(sess);
+    /* Control's clock, stamped in the turn its message arrived. */
+    if (nm->control_time_gen != G.ct_gen) {
+        G.ct_gen = nm->control_time_gen;
+        ts_dp_set_control_time(G.dp, nm->control_time, now_ms);
+        if (G.ct_logged != 2) G.log("control time received");
+        G.ct_logged = 2;
+    }
     if ((int)state != G.last_state) {
         map_changed = 1;
         G.last_state = (int)state;
@@ -640,16 +712,31 @@ void ts_dpio_sync(ts_sess *sess, int want_up, int map_changed, int64_t now_ms)
         map_changed = 0;   /* just given */
     }
     if (!G.running) return;
+    if (!G.ct_logged) {
+        G.log("control time: none yet (peer expiry follows control's Expired flag only)");
+        G.ct_logged = 1;
+    }
 
-    ts_dp_tick(G.dp, now_ms);
+    after_block();
+    ts_dp_tick(G.dp, G.now);
     if (map_changed && state == TS_SESS_RUNNING) {
         g_nm = nm;
         ts_dp_set_netmap(G.dp, nm);
+        if (nm->derp_gen != G.seen_derp_gen) {
+            G.seen_derp_gen = nm->derp_gen;
+            /* The home left the map (or lost its nodes): choose again now. */
+            if (G.cur > 0 && !map_region_usable(nm, G.cur)) {
+                G.log("home relay region %d is no longer in the map", G.cur);
+                probes_cancel();
+                G.probe_want = 1;
+            }
+        }
     }
-    if (!G.no_tun && G.tun_fd < 0 && now_ms >= G.tun_retry_at) tun_open();
+    if (!G.no_tun && G.tun_fd < 0 && G.now >= G.tun_retry_at) tun_open();
+    after_block();
 
     /* Home probes. */
-    if (now_ms >= G.next_probe_at) G.probe_want = 1;
+    if (G.now >= G.next_probe_at) G.probe_want = 1;
     if (G.home_fails >= TS_DPIO_HOME_FAILS) {
         G.log("home relay failed %d times: measuring the regions again", G.home_fails);
         G.home_fails = 0;
@@ -675,10 +762,6 @@ void ts_dpio_fds(fd_set *r, fd_set *w, int *maxfd, int64_t *timeout_ms)
         int rd = 0, wr = 0;
         if (s->phase == R_UP) slot_flush(i);
         s->sel_gen = s->gen;
-        if (s->fail) {
-            *timeout_ms = 0;
-            continue;
-        }
         switch (s->phase) {
         case R_TCP:
             wr = 1;
@@ -721,14 +804,16 @@ void ts_dpio_events(fd_set *r, fd_set *w, int64_t now_ms)
     if (!G.running) return;
     for (i = 0; i < TS_DP_MAX_CONNS && G.running; i++) slot_events(i, r, w);
     if (G.running) tun_events(r);
+    after_block();
     if (G.running) probe_events(w);
 }
 
-int ts_dpio_init(ts_dpio_log_fn logf)
+int ts_dpio_init(ts_dpio_log_fn logf, ts_dpio_clock_fn clock)
 {
     int i;
     memset(&G, 0, sizeof G);
     G.log = logf;
+    G.clock = clock;
     G.tun_fd = -1;
     G.last_state = -1;
     for (i = 0; i < TS_DP_MAX_CONNS; i++) G.s[i].fd = -1;
@@ -780,6 +865,7 @@ void ts_dpio_get_view(ts_dpio_view *v)
     v->home_up = ds.home_up;
     v->home_down = ds.home > 0 && !ds.home_up && strncmp(ds.problem, "home relay", 10) == 0;
     snprintf(v->filter, sizeof v->filter, "%s", ds.filter);
+    v->filtered = ds.filtered;
     v->tun_open = G.tun_fd >= 0;
     snprintf(v->ifname, sizeof v->ifname, "%s", v->tun_open ? G.ifname : "");
     snprintf(v->problem, sizeof v->problem, "%s%s%s", G.tun_problem, G.tun_problem[0] && ds.problem[0] ? "; " : "",

@@ -842,14 +842,14 @@ static void test_daemon_relay(void)
            wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 60000));
     t_true("relay: no tunnel problem with TSPPC_NO_TUN", !strstr(out, "tunnel driver"));
     t_true("relay: status has tunnel off, filter none and a path line for the peer",
-           strstr(out, "\ntunnel off\n") && strstr(out, "\nfilter none\n") &&
+           strstr(out, "\ntunnel off\n") && strstr(out, "\nfilter none dropped 0\n") &&
                strstr(out, "\npath 100.64.0.2 - 0 0 -\n"));
     t_true("relay: the path line follows the peer line",
            strstr(out, "\npeer 100.64.0.2 online peer.example.test.\n") < strstr(out, "\npath "));
     rc = run_cli("status", out2, sizeof out2);
     t_true("relay: tsppc status prints relay, tunnel and filter lines",
            rc == 0 && strstr(out2, "relay: 7 tst connected\n") && strstr(out2, "tunnel: off\n") &&
-               strstr(out2, "filter: none\n"));
+               strstr(out2, "filter: none dropped 0\n"));
     t_true("relay: tsppc status peer line has no counters without a session",
            strstr(out2, "peer.example.test.\n") && !strstr(out2, "rx "));
     t_true("relay: the relay saw the handshake and NotePreferred 1",
