@@ -565,6 +565,7 @@ static void test_dpio_rebind(void)
         close(ev[0]);
         sink.event = relay_ev;
         sink.on_send = NULL;
+        sink.on_client = NULL;
         sink.ctx = &ev[1];
         fr_server(lfd, &sink);
         _exit(0);

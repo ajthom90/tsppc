@@ -8,7 +8,8 @@
  * Events go to sink->event: 'u' upgraded, 'r' ServerInfo sent, 'P'/'p'
  * NotePreferred 1/0, 'b' a broken ClientInfo, 'e' closed after the upgrade.
  * Every SendPacket body (destination key, then packet) goes to sink->on_send
- * if set, which may answer with fr_frame on fd.
+ * if set, which may answer with fr_frame on fd. The client's public key from
+ * each good ClientInfo goes to sink->on_client if set.
  *
  * Needs, before inclusion: <errno.h>, <fcntl.h>, <unistd.h>, <sys/socket.h>,
  * src/core/bytes.h, src/crypto/nacl.h, src/crypto/x25519.h, src/derp/derp.h
@@ -17,6 +18,7 @@
 typedef struct {
     void (*event)(void *ctx, char e);
     void (*on_send)(void *ctx, int fd, const uint8_t *body, size_t len);
+    void (*on_client)(void *ctx, const uint8_t key[32]);
     void *ctx;
 } fr_sink;
 
@@ -92,6 +94,7 @@ static void fr_serve(int fd, const fr_sink *sink, const uint8_t s_priv[32], cons
                 break;
             }
             memcpy(cpub, body, 32);
+            if (sink->on_client) sink->on_client(sink->ctx, cpub);
             for (i = 0; i < 24; i++) info[i] = (uint8_t)(0x40 + i);
             ts_box_seal(info + 24, info, cpub, s_priv, (const uint8_t *)sj, sizeof sj - 1);
             fr_frame(fd, TS_DERP_SERVER_INFO, info, 24 + 16 + sizeof sj - 1);

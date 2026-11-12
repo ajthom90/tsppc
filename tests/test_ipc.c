@@ -732,11 +732,27 @@ static void relay_note(void *ctx, char e)
     note((const char *)ctx, s);
 }
 
+/* When set (test_daemon_wake), each relay client's public key, in hex and a
+ * newline, is appended here. */
+static char g_relay_keys_path[128];
+
+static void relay_client(void *ctx, const uint8_t key[32])
+{
+    char hex[66];
+    (void)ctx;
+    if (!g_relay_keys_path[0]) return;
+    ts_hex_encode(hex, 65, key, 32);
+    hex[64] = '\n';
+    hex[65] = 0;
+    note(g_relay_keys_path, hex);
+}
+
 static void relay_server(int lfd, const char *evpath)
 {
     fr_sink sink;
     sink.event = relay_note;
     sink.on_send = relay_answer;
+    sink.on_client = relay_client;
     sink.ctx = (void *)evpath;
     fr_server(lfd, &sink);
 }
@@ -1526,6 +1542,199 @@ static void test_daemon(void)
     rmdir(tmpdir);
 }
 
+/* ---- Sleep and network change: a rebind ---------------------------------- */
+
+static char g_maps_path[128];   /* the fake control appends 'm' per streaming map request */
+
+/* fk_relay_handler, but a streaming map request (only made once the Noise
+ * handshake on that connection is done) is first noted in g_maps_path. */
+static void fk_wake_handler(fake *f, fk_req *r)
+{
+    if (strcmp(r->path, "/machine/map") == 0 && !(r->body && strstr(r->body, "\"Stream\":false")))
+        note(g_maps_path, "m");
+    fk_relay_handler(f, r);
+}
+
+/* How many times want occurs in the file at path (its first 64 KiB). */
+static int count_in_file(const char *path, const char *want)
+{
+    static char buf[65536];
+    FILE *f = fopen(path, "r");
+    size_t n;
+    int k = 0;
+    const char *p;
+    if (!f) return 0;
+    n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    for (p = strstr(buf, want); p; p = strstr(p + strlen(want), want)) k++;
+    return k;
+}
+
+/* All lines of the file at path are the same as its first; how many lines. */
+static int same_lines(const char *path, int *same)
+{
+    char first[128], line[128];
+    FILE *f = fopen(path, "r");
+    int n = 0;
+    *same = 1;
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        if (n == 0) snprintf(first, sizeof first, "%s", line);
+        else if (strcmp(first, line) != 0) *same = 0;
+        n++;
+    }
+    fclose(f);
+    return n;
+}
+
+/* SIGUSR1 (a wake, test builds) closes and reopens the control connection
+ * and the relay connections; SIGUSR2 (a network change) does the same, but
+ * two of them close together give one rebind, and none within
+ * TS_REBIND_MIN_GAP_MS of the last. */
+static void test_daemon_wake(void)
+{
+    static fake f;
+    char statedir[128], sock[128], logpath[128], countpath[128], evpath[128], key[65], out[8192], err[256];
+    ts_state st;
+    pid_t pid, srv, rsrv;
+    int lfd, rfd, rc, k0, k1, same, ok;
+    long c0, c1, m0;
+    int64_t t0;
+    uint16_t cport, rport;
+
+    if (access(TS_BIN_DIR "/tsppcd", X_OK) != 0 || access(TS_BIN_DIR "/tsppc", X_OK) != 0) {
+        printf("SKIP: wake tests (no " TS_BIN_DIR "/tsppcd or tsppc here)\n");
+        return;
+    }
+    if (make_tmpdir() != 0) {
+        t_true("wake: temp dir", 0);
+        return;
+    }
+    snprintf(statedir, sizeof statedir, "%s/state", tmpdir);
+    snprintf(sock, sizeof sock, "%s/sock", tmpdir);
+    snprintf(logpath, sizeof logpath, "%s/log", tmpdir);
+    snprintf(countpath, sizeof countpath, "%s/conns", tmpdir);
+    snprintf(evpath, sizeof evpath, "%s/relay", tmpdir);
+    snprintf(g_lites_path, sizeof g_lites_path, "%s/lites", tmpdir);
+    snprintf(g_maps_path, sizeof g_maps_path, "%s/maps", tmpdir);
+    snprintf(g_relay_keys_path, sizeof g_relay_keys_path, "%s/keys", tmpdir);
+    setenv("TSPPC_SOCKET", sock, 1);
+
+    rc = load_state(statedir, &st);
+    st.have_login = 1;
+    t_true("wake: saved login written", rc == 0 && ts_state_save(&st, statedir, err, sizeof err) == 0);
+
+    rfd = listen_local(&rport);
+    lfd = listen_local(&cport);
+    if (rfd < 0 || lfd < 0) {
+        t_true("wake: fake servers listen", 0);
+        if (rfd >= 0) close(rfd);
+        if (lfd >= 0) close(lfd);
+        unsetenv("TSPPC_SOCKET");
+        g_relay_keys_path[0] = 0;
+        remove_test_files(statedir, sock, logpath, countpath);
+        return;
+    }
+    snprintf(g_relay_map, sizeof g_relay_map,
+             "{\"Node\":{\"ID\":1,\"Name\":\"" SELFNAME ".\",\"Key\":\"nodekey:" HA "\","
+             "\"Addresses\":[\"100.64.0.1/32\"],\"MachineAuthorized\":true},"
+             "\"Peers\":[{\"ID\":2,\"Name\":\"peer.example.test.\","
+             "\"Key\":\"nodekey:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\","
+             "\"Addresses\":[\"100.64.0.2/32\"],\"HomeDERP\":%d,\"Online\":true,\"MachineAuthorized\":true}],"
+             "\"DERPMap\":{\"Regions\":{"
+             "\"%d\":{\"RegionID\":%d,\"RegionCode\":\"tst\",\"Nodes\":[{\"Name\":\"%da\",\"RegionID\":%d,"
+             "\"HostName\":\"derp.example.test\",\"IPv4\":\"127.0.0.1\",\"DERPPort\":%u}]}}}}",
+             RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION, (unsigned)rport);
+
+    fk_init(&f, NULL, "");
+    f.handler = fk_wake_handler;
+    ts_hex_encode(key, sizeof key, f.control_pub, 32);
+    g_ctl_port = cport;
+    srv = fork();
+    if (srv == 0) {
+        close(rfd);
+        fake_server(lfd, &f, countpath);
+        _exit(0);
+    }
+    rsrv = fork();
+    if (rsrv == 0) {
+        close(lfd);
+        relay_server(rfd, evpath);
+        _exit(0);
+    }
+    close(lfd);
+    close(rfd);
+
+    pid = start_daemon(statedir, sock, logpath, key);
+    t_true("wake: socket appears", wait_socket(sock, pid, 120000) == 0);
+    t_true("wake: RUNNING", wait_status(sock, "state RUNNING\n", out, sizeof out, 120000));
+    t_true("wake: home relay connected", wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 60000));
+    t_true("wake: one control connection, one map stream, one relay client",
+           file_size(countpath) == 1 && wait_file_has(g_maps_path, "m", 10000) && wait_file_has(g_relay_keys_path, "\n", 10000));
+    c0 = file_size(countpath);
+    m0 = file_size(g_maps_path);
+    k0 = same_lines(g_relay_keys_path, &same);
+
+    /* A wake: everything reconnects within 5 s. */
+    t0 = mono_ms();
+    kill(pid, SIGUSR1);
+    do {
+        ok = file_size(countpath) > c0 && file_size(g_maps_path) > m0 && same_lines(g_relay_keys_path, &same) > k0 &&
+             file_has(logpath, "woke from sleep (test signal)") && file_has(logpath, "rebinding relays (woke from sleep)");
+        if (!ok) nap_ms(100);
+    } while (!ok && mono_ms() - t0 < 5000);
+    t_true("wake: the daemon is still there", waitpid(pid, &rc, WNOHANG) == 0);
+    t_true("wake: the log says woke from sleep (test signal)", file_has(logpath, "woke from sleep (test signal)"));
+    t_true("wake: the log says rebinding relays (woke from sleep)",
+           file_has(logpath, "rebinding relays (woke from sleep)"));
+    t_true("wake: control accepted a second connection", file_size(countpath) == c0 + 1);
+    t_true("wake: and a second Noise handshake (a second map stream)", file_size(g_maps_path) == m0 + 1);
+    k1 = same_lines(g_relay_keys_path, &same);
+    t_true("wake: the relay saw a new connection from the same client key", k1 > k0 && same);
+    t_true("wake: status RUNNING again within 5 s",
+           wait_status(sock, "state RUNNING\n", out, sizeof out, (int)(5000 - (mono_ms() - t0) > 0 ? 5000 - (mono_ms() - t0) : 1)));
+    t_true("wake: home relay connected again", wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 30000));
+
+    /* Two network changes close together: one more control connection, and
+     * only once the gap since the wake's rebind has passed. */
+    c1 = file_size(countpath);
+    kill(pid, SIGUSR2);
+    nap_ms(300);
+    kill(pid, SIGUSR2);
+    t0 = mono_ms();
+    while (mono_ms() - t0 < 15000) nap_ms(200);
+    t_true("wake: the log says network changed (test signal)", file_has(logpath, "network changed (test signal)"));
+    t_true("wake: the log says rebinding relays (network changed)",
+           file_has(logpath, "rebinding relays (network changed)"));
+    t_true("wake: exactly one more control connection", file_size(countpath) == c1 + 1);
+    t_true("wake: exactly two rebinds", count_in_file(logpath, "rebinding relays (") == 2);
+    t_true("wake: RUNNING after the network change", wait_status(sock, "state RUNNING\n", out, sizeof out, 30000));
+    t_true("wake: still the same relay client key", same_lines(g_relay_keys_path, &same) > k1 && same);
+
+    kill(pid, SIGTERM);
+    t_true("wake: daemon exits", wait_exit(pid, 60000) == 0);
+    {
+        const uint8_t *keys[3];
+        keys[0] = st.node_priv;
+        keys[1] = st.machine_priv;
+        keys[2] = st.disco_priv;
+        t_true("wake: log holds no private keys", !log_has_key(logpath, keys, 3));
+    }
+    kill(srv, SIGKILL);
+    waitpid(srv, NULL, 0);
+    kill(rsrv, SIGKILL);
+    waitpid(rsrv, NULL, 0);
+    ts_wipe(&st, sizeof st);
+    unsetenv("TSPPC_SOCKET");
+    unlink(evpath);
+    unlink(g_lites_path);
+    unlink(g_maps_path);
+    unlink(g_relay_keys_path);
+    g_relay_keys_path[0] = 0;
+    remove_test_files(statedir, sock, logpath, countpath);
+}
+
 void test_ipc(void)
 {
     test_parse();
@@ -1538,4 +1747,5 @@ void test_ipc(void)
     test_daemon_down();
     test_daemon_relay();
     test_daemon_ping();
+    test_daemon_wake();
 }

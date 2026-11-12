@@ -36,7 +36,21 @@
  * of the data plane); its deadline is then the ping timeout plus
  * TS_IPC_PING_MARGIN_MS. A client that closes or sends more cancels its
  * ping. At most TS_IPC_MAX_PINGS clients wait at once, so status and the
- * menu bar always have a slot. Only refused pings are logged. */
+ * menu bar always have a slot. Only refused pings are logged.
+ *
+ * Sleep and network changes (conditions.h): each turn, after the data plane
+ * sync, the wall clock (gettimeofday) is compared with the monotonic one; a
+ * jump of TS_WAKE_JUMP_MS or more means the Mac slept (or the clock was
+ * stepped). Every TS_NET_POLL_MS the IPv4 addresses and default route are
+ * fingerprinted (netinfo.h); a failed snapshot is ignored. Either asks for a
+ * rebind, at most one per TS_REBIND_MIN_GAP_MS: the control connection, if
+ * any, is closed and the session told (its own backoff then decides when it
+ * reconnects), and the relays are redialed with a new home probe round
+ * (ts_dpio_rebind). WireGuard sessions are reset only when a forward wake was
+ * seen since the last rebind; a clock stepped back or a network change keeps
+ * them. The loop never sleeps longer than LOOP_MS, so a wake is seen within a
+ * second. In test builds SIGUSR1 stands for a wake and SIGUSR2 for a network
+ * change. */
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -52,6 +66,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "conditions.h"
 #include "dataplane_io.h"
 #include "ipc.h"
 #include "names_io.h"
@@ -143,6 +158,14 @@ static struct {
 
     int fed;                        /* bytes reached the session this turn (the map may have changed) */
 
+    /* Sleep and network changes. */
+    ts_wake wake;
+    ts_rebind_gate gate;
+    int rebind_reset;               /* a forward wake was seen since the last rebind */
+    int net_primed;
+    uint64_t net_fp;
+    int64_t net_next;
+
     int sigpipe[2];
     char logged_state[32];
     char logged_reason[TEXT_MAX];
@@ -152,6 +175,9 @@ static ts_keyfetch KF;              /* about 100 KiB: not on the stack */
 static uint8_t rbuf[READ_CHUNK];
 static mach_timebase_info_data_t tb;
 static volatile sig_atomic_t got_signal;
+#ifdef TS_TEST_HOOKS
+static volatile sig_atomic_t got_test_wake, got_test_net;
+#endif
 
 /* ---- Time and logging --------------------------------------------------- */
 
@@ -1026,6 +1052,84 @@ static void on_signal(int sig)
     errno = e;
 }
 
+#ifdef TS_TEST_HOOKS
+/* SIGUSR1: act as after a wake; SIGUSR2: as after a network change. */
+static void on_test_signal(int sig)
+{
+    int e = errno;
+    char b = 1;
+    if (sig == SIGUSR1) got_test_wake = 1;
+    else got_test_net = 1;
+    (void)write(D.sigpipe[1], &b, 1);
+    errno = e;
+}
+#endif
+
+/* Wall clock milliseconds, for spotting a sleep only. */
+static int64_t wall_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* Notice a wake or a network change, and rebind when the gate allows. From
+ * the loop body only (ts_dpio_rebind is not for callbacks). */
+static void check_conditions(void)
+{
+    int64_t now = now_ms(), jump;
+    char why[64];
+
+    jump = ts_wake_check(&D.wake, wall_ms(), now);
+    if (jump != 0) {
+        logline("woke from sleep (wall clock jumped %ld s)", (long)(jump / 1000));
+        ts_rebind_request(&D.gate, "woke from sleep", now);
+        if (jump > 0) D.rebind_reset = 1;
+    }
+#ifdef TS_TEST_HOOKS
+    if (got_test_wake) {
+        got_test_wake = 0;
+        logline("woke from sleep (test signal)");
+        ts_rebind_request(&D.gate, "woke from sleep", now);
+        D.rebind_reset = 1;
+    }
+    if (got_test_net) {
+        got_test_net = 0;
+        logline("network changed (test signal)");
+        ts_rebind_request(&D.gate, "network changed", now);
+    }
+#endif
+    if (now >= D.net_next) {
+        /* More than the fingerprint keeps: it sorts, then cuts. */
+        ts_ifaddr a[2 * TS_NET_MAX_ADDRS];
+        size_t n = 0;
+        uint32_t gw = 0;
+        char gw_if[16];
+        D.net_next = now + TS_NET_POLL_MS;
+        if (ts_net_snapshot(a, sizeof a / sizeof a[0], &n, &gw, gw_if) == 0) {
+            uint64_t fp = ts_net_fingerprint(a, n, gw, gw_if);
+            if (!D.net_primed) {
+                D.net_primed = 1;
+                D.net_fp = fp;
+            } else if (fp != D.net_fp) {
+                D.net_fp = fp;
+                logline("network changed");
+                ts_rebind_request(&D.gate, "network changed", now);
+            }
+        }
+    }
+    if (ts_rebind_due(&D.gate, now, why)) {
+        int reset = D.rebind_reset;
+        D.rebind_reset = 0;
+        if (D.cphase != C_NONE) {
+            logline("closing the control connection (%s)", why);
+            conn_close();
+            if (D.sess) ts_sess_disconnected(D.sess, why);
+        }
+        ts_dpio_rebind(why, 1, reset);
+    }
+}
+
 static void log_state(void)
 {
     view v;
@@ -1126,6 +1230,11 @@ int main(int argc, char **argv)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
+#ifdef TS_TEST_HOOKS
+    sa.sa_handler = on_test_signal;
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGUSR2, &sa, NULL);
+#endif
 
     D.out = (uint8_t *)malloc(OUT_MAX);
     if (!D.out) {
@@ -1192,6 +1301,7 @@ int main(int argc, char **argv)
         kf_tick();
         conn_flush();
         ts_dpio_sync(D.sess, D.want_up, D.fed, now_ms());
+        check_conditions();
         finish_pings();
         {
             ts_dpio_view dv;
