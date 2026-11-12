@@ -6,6 +6,7 @@
 #include <sys/select.h>
 
 #include "src/control/session.h"
+#include "src/wg/device.h"
 
 /* The daemon's data-plane I/O: the tun device and its address and route, the
  * relay connections' TCP and TLS, the home relay probes, and when the data
@@ -74,11 +75,15 @@ typedef struct {
     int running;
     int home;                 /* region, 0 none */
     int home_up;              /* the home relay is connected and verified */
+    int home_down;            /* not up, and the data plane says why (no usable relay, a failed connection) */
+    char filter[16];          /* "none", "ok", "too large" or "invalid" */
     int tun_open;
     char ifname[16];
     char problem[256];        /* "" or a short reason ("tunnel driver not loaded", the data plane's) */
     unsigned long tun_dropped;  /* packets for a tun device that is not open */
 } ts_dpio_view;
 void ts_dpio_get_view(ts_dpio_view *v);
+/* ts_dp_peer_status of the running data plane; -1 when it is not running. */
+int ts_dpio_peer_status(uint32_t ipv4, ts_wg_stats *st, int *region);
 
 #endif

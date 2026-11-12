@@ -643,11 +643,30 @@ static void fmt_ip(char *out, size_t cap, uint32_t a)
              (unsigned)(a >> 8 & 255), (unsigned)(a & 255));
 }
 
+/* A region's code for status: "-" when the map has none. */
+static const char *region_code(const ts_netmap *nm, int id)
+{
+    size_t i;
+    for (i = 0; i < nm->nregions; i++)
+        if (nm->regions[i].id == id) return nm->regions[i].code[0] ? nm->regions[i].code : "-";
+    return "-";
+}
+
+/* The data plane's filter state as one word. */
+static const char *filter_word(const char *f)
+{
+    if (strcmp(f, "ok") == 0) return "ok";
+    if (strcmp(f, "too large") == 0) return "too-large";
+    if (strcmp(f, "invalid") == 0) return "invalid";
+    return "none";
+}
+
 static void build_status(rbuild *b)
 {
     view v;
     char line[TS_NODE_NAME_MAX + 64], ip[16];
     const char *url;
+    ts_dpio_view dv;
     get_view(&v);
     put(b, "ok", NULL);
     put(b, "state", v.name);
@@ -665,21 +684,44 @@ static void build_status(rbuild *b)
             fmt_ip(ip, sizeof ip, nm->self.ipv4);
             put(b, "ip", ip);
         }
-        {
-            ts_dpio_view dv;
-            ts_dpio_get_view(&dv);
-            if (dv.running) {
-                if (dv.home > 0) snprintf(line, sizeof line, "%d %s", dv.home, dv.home_up ? "connected" : "connecting");
-                else snprintf(line, sizeof line, "none");
+        ts_dpio_get_view(&dv);
+        if (dv.running) {
+            if (dv.home > 0) {
+                snprintf(line, sizeof line, "%d %s %s", dv.home, region_code(nm, dv.home),
+                         dv.home_up ? "connected" : dv.home_down ? "down" : "connecting");
                 put(b, "relay", line);
             }
+            snprintf(line, sizeof line, "%s%s%s", dv.tun_open ? dv.ifname : "off", dv.problem[0] ? " " : "", dv.problem);
+        } else {
+            snprintf(line, sizeof line, "off");
         }
+        put(b, "tunnel", line);
+        if (dv.running) put(b, "filter", filter_word(dv.filter));
         for (i = 0; i < nm->npeers; i++) {
             const ts_node *p = &nm->peers[i];
             if (p->have_ipv4) fmt_ip(ip, sizeof ip, p->ipv4);
             else snprintf(ip, sizeof ip, "-");
             snprintf(line, sizeof line, "%s %s %s", ip, p->online ? "online" : "offline", p->name);
             put(b, "peer", line);
+        }
+        /* After the peers: the menu bar needs them, these are for the CLI. */
+        if (dv.running) {
+            int64_t now = now_ms();
+            for (i = 0; i < nm->npeers; i++) {
+                const ts_node *p = &nm->peers[i];
+                ts_wg_stats ws;
+                char age[24] = "-";
+                int region = -1;
+                if (!p->have_ipv4 || ts_dpio_peer_status(p->ipv4, &ws, &region) != 0) continue;
+                if (ws.last_handshake_ms >= 0) {
+                    int64_t a = (now - ws.last_handshake_ms) / 1000;
+                    snprintf(age, sizeof age, "%lu", (unsigned long)(a > 0 ? a : 0));
+                }
+                fmt_ip(ip, sizeof ip, p->ipv4);
+                snprintf(line, sizeof line, "%s %s %lu %lu %s", ip, region > 0 ? region_code(nm, region) : "-",
+                         (unsigned long)ws.rx_packets, (unsigned long)ws.tx_packets, age);
+                put(b, "path", line);
+            }
         }
     }
 }

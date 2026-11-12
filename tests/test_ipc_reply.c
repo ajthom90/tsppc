@@ -68,6 +68,13 @@ static void test_parse(void)
     t_true("reply: unknown and upper-case keys skipped, first state wins",
            rc == 0 && strcmp(g_r.state, "A") == 0 && strcmp(g_r.status, "s") == 0 && g_r.npeers == 0);
 
+    rc = parse("ok\nstate RUNNING\nip 100.64.0.1\nrelay 7 tst connected\ntunnel off tunnel driver not loaded\n"
+               "filter ok\npeer 100.64.0.2 online a.example.test.\npath 100.64.0.2 tst 1 2 3\n");
+    t_true("reply: relay, tunnel, filter and path lines are ignored, the model unchanged",
+           rc == 0 && strcmp(g_r.state, "RUNNING") == 0 && g_r.have_ipv4 && g_r.ipv4 == 0x64400001u &&
+               g_r.npeers == 1 && g_peers[0].ipv4 == 0x64400002u && g_peers[0].online &&
+               strcmp(g_peers[0].name, "a.example.test.") == 0 && !g_r.truncated);
+
     rc = parse("ok\nstate RUNNING\npeer 100.64.0.1 online a\x1b[2Jb\x07\n");
     t_true("reply: control byte in a name becomes ?", rc == 0 && g_r.npeers == 1 &&
            strcmp(g_peers[0].name, "a?[2Jb?") == 0);

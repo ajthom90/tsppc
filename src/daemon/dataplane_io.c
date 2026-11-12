@@ -53,7 +53,6 @@ static struct {
     uint32_t self_ip;
     uint8_t node_priv[32];
     int last_state;
-    int self_home_logged;      /* the self HomeDERP last logged, -1 none */
     int up_logged;             /* the home region last logged connected, 0 none */
     int home;                  /* the home chosen by the last probe round (kept across restarts) */
     int cur;                   /* the home the data plane has now (ts_dp_set_home), 0 none */
@@ -577,7 +576,6 @@ static void dp_stop(const char *why)
     G.running = 0;
     G.self_ip = 0;
     G.up_logged = 0;
-    G.self_home_logged = -1;
     G.home_fails = 0;
     G.tun_problem[0] = 0;
     g_nm = NULL;
@@ -647,10 +645,6 @@ void ts_dpio_sync(ts_sess *sess, int want_up, int map_changed, int64_t now_ms)
     if (map_changed && state == TS_SESS_RUNNING) {
         g_nm = nm;
         ts_dp_set_netmap(G.dp, nm);
-    }
-    if (state == TS_SESS_RUNNING && nm->have_self && nm->self.home_derp != G.self_home_logged) {
-        G.self_home_logged = nm->self.home_derp;
-        G.log("control's map shows our home relay as region %d", nm->self.home_derp);
     }
     if (!G.no_tun && G.tun_fd < 0 && now_ms >= G.tun_retry_at) tun_open();
 
@@ -737,7 +731,6 @@ int ts_dpio_init(ts_dpio_log_fn logf)
     G.log = logf;
     G.tun_fd = -1;
     G.last_state = -1;
-    G.self_home_logged = -1;
     for (i = 0; i < TS_DP_MAX_CONNS; i++) G.s[i].fd = -1;
     for (i = 0; i < TS_DPIO_PROBES_AT_ONCE; i++) G.pa[i].fd = -1;
 #ifdef TS_TEST_HOOKS
@@ -785,8 +778,16 @@ void ts_dpio_get_view(ts_dpio_view *v)
     v->running = 1;
     v->home = ds.home;
     v->home_up = ds.home_up;
+    v->home_down = ds.home > 0 && !ds.home_up && strncmp(ds.problem, "home relay", 10) == 0;
+    snprintf(v->filter, sizeof v->filter, "%s", ds.filter);
     v->tun_open = G.tun_fd >= 0;
     snprintf(v->ifname, sizeof v->ifname, "%s", v->tun_open ? G.ifname : "");
     snprintf(v->problem, sizeof v->problem, "%s%s%s", G.tun_problem, G.tun_problem[0] && ds.problem[0] ? "; " : "",
              ds.problem);
+}
+
+int ts_dpio_peer_status(uint32_t ipv4, ts_wg_stats *st, int *region)
+{
+    if (!G.running || !G.dp) return -1;
+    return ts_dp_peer_status(G.dp, ipv4, st, region);
 }

@@ -765,7 +765,7 @@ static int wait_file_has(const char *path, const char *want, int ms)
 static void test_daemon_relay(void)
 {
     static fake f;
-    char statedir[128], sock[128], logpath[128], countpath[128], evpath[128], key[65], out[8192], err[256];
+    char statedir[128], sock[128], logpath[128], countpath[128], evpath[128], key[65], out[8192], out2[8192], err[256];
     ts_state st;
     pid_t pid, srv, rsrv;
     int lfd, rfd, rc;
@@ -839,8 +839,19 @@ static void test_daemon_relay(void)
     t_true("relay: socket appears", wait_socket(sock, pid, 120000) == 0);
     t_true("relay: RUNNING", wait_status(sock, "state RUNNING\n", out, sizeof out, 120000));
     t_true("relay: status shows the home region connected",
-           wait_status(sock, "\nrelay 7 connected\n", out, sizeof out, 60000));
+           wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 60000));
     t_true("relay: no tunnel problem with TSPPC_NO_TUN", !strstr(out, "tunnel driver"));
+    t_true("relay: status has tunnel off, filter none and a path line for the peer",
+           strstr(out, "\ntunnel off\n") && strstr(out, "\nfilter none\n") &&
+               strstr(out, "\npath 100.64.0.2 - 0 0 -\n"));
+    t_true("relay: the path line follows the peer line",
+           strstr(out, "\npeer 100.64.0.2 online peer.example.test.\n") < strstr(out, "\npath "));
+    rc = run_cli("status", out2, sizeof out2);
+    t_true("relay: tsppc status prints relay, tunnel and filter lines",
+           rc == 0 && strstr(out2, "relay: 7 tst connected\n") && strstr(out2, "tunnel: off\n") &&
+               strstr(out2, "filter: none\n"));
+    t_true("relay: tsppc status peer line has no counters without a session",
+           strstr(out2, "peer.example.test.\n") && !strstr(out2, "rx "));
     t_true("relay: the relay saw the handshake and NotePreferred 1",
            wait_file_has(evpath, "u", 1000) && file_has(evpath, "r") && wait_file_has(evpath, "P", 10000));
     t_true("relay: control got a lite update with the region",
@@ -852,14 +863,15 @@ static void test_daemon_relay(void)
     rc = run_cli("down", out, sizeof out);
     t_true("relay: down accepted", rc == 0);
     t_true("relay: down goes IDLE", wait_status(sock, "state IDLE\n", out, sizeof out, 60000));
-    t_true("relay: down shows no relay", !strstr(out, "\nrelay "));
+    t_true("relay: down shows no relay, tunnel, filter or path",
+           !strstr(out, "\nrelay ") && !strstr(out, "\ntunnel") && !strstr(out, "\nfilter") && !strstr(out, "\npath "));
     t_true("relay: down closes the relay connection", wait_file_has(evpath, "e", 10000));
     t_true("relay: the log says the data plane stopped", wait_file_has(logpath, "data plane stopped", 1000));
 
     /* up again: a fresh data plane, the same home, a new relay connection. */
     raw_request(sock, "up\n", 3, out, sizeof out);
     t_true("relay: up again accepted", strncmp(out, "ok\n", 3) == 0);
-    t_true("relay: up again connects the home relay", wait_status(sock, "\nrelay 7 connected\n", out, sizeof out, 120000));
+    t_true("relay: up again connects the home relay", wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 120000));
     t_true("relay: a second relay connection", wait_file_has(evpath, "eu", 5000));
 
     kill(pid, SIGTERM);
@@ -933,6 +945,20 @@ static void test_cli_replies(void)
     t_true("cli: an error key alone, the same", rc == 1 && strcmp(out, "tsppc: unexpected reply from tsppcd\n") == 0);
     rc = cli_against(sock, "error busy now\n", "ip", out, sizeof out);
     t_true("cli: an error with text prints it", rc == 1 && strcmp(out, "tsppc: busy now\n") == 0);
+    rc = cli_against(sock,
+                     "ok\nstate RUNNING\nstatus up\nlogin yes\nwanted up\nip 100.64.0.1\n"
+                     "relay 7 tst connected\ntunnel utun3 tunnel driver\x01 odd\nfilter too-large\n"
+                     "peer 100.64.0.2 online a.example.test.\npeer 100.64.0.3 online b.example.test.\n"
+                     "peer 100.64.0.4 offline c.example.test.\n"
+                     "path 100.64.0.2 nyc 12 34 7\npath 100.64.0.3 - 0 0 -\n",
+                     "status", out, sizeof out);
+    t_true("cli: status prints relay, tunnel (cleaned) and filter lines",
+           rc == 0 && strstr(out, "relay: 7 tst connected\n") && strstr(out, "tunnel: utun3 tunnel driver? odd\n") &&
+               strstr(out, "filter: too-large\n"));
+    t_true("cli: a peer with a session shows its relay and packet counts",
+           strstr(out, "online   a.example.test.  relay nyc  rx 12 tx 34\n") != NULL);
+    t_true("cli: a peer without a session, or a path line, shows none",
+           strstr(out, "b.example.test.\n") && strstr(out, "c.example.test.\n") && !strstr(out, "path"));
     unsetenv("TSPPC_SOCKET");
 }
 

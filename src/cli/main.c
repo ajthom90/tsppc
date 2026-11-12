@@ -28,6 +28,7 @@
 
 /* ts_reply and its peers are large: kept off the stack. */
 static char *rbuf;
+static size_t rlen;          /* bytes in rbuf */
 static ts_reply R;
 static ts_reply_peer *peers;
 static mach_timebase_info_data_t tb;
@@ -59,6 +60,7 @@ static int request(ts_ipc_cmd cmd)
     const char *path = ts_ipc_socket_path();
     size_t len = 0;
     char safe[256];
+    rlen = 0;
     ts_req_result rc;
 
     errno = 0;
@@ -83,6 +85,7 @@ static int request(ts_ipc_cmd cmd)
         fprintf(stderr, "tsppc: tsppcd closed the connection (busy?)\n");
         return -1;
     }
+    rlen = len;
     if (ts_reply_parse(&R, peers, rbuf, len) != 0) {
         fprintf(stderr, "tsppc: unexpected reply from tsppcd\n");
         return -1;
@@ -105,26 +108,88 @@ static void fmt_ip(char *out, size_t cap, uint32_t a)
              (unsigned)(a >> 8 & 255), (unsigned)(a & 255));
 }
 
+/* The status keys ts_reply_parse leaves out: relay, tunnel, filter, and one
+ * path line per peer with a WireGuard peer. Lines are taken from the reply
+ * as received; values are cleaned before they are printed. */
+typedef struct {
+    char relay[TS_IPC_VALUE_MAX], tunnel[TS_IPC_VALUE_MAX], filter[TS_IPC_VALUE_MAX];
+    int have_relay, have_tunnel, have_filter;
+} extra_keys;
+
+static void scan_extras(extra_keys *x, const char *buf, size_t len)
+{
+    size_t pos = 0;
+    memset(x, 0, sizeof *x);
+    while (pos < len) {
+        const char *line = buf + pos;
+        size_t n = 0, klen, voff;
+        while (pos + n < len && line[n] != '\n') n++;
+        pos += n + 1;
+        if (ts_ipc_split(line, n, &klen, &voff) != 0) continue;
+        if (klen == 5 && memcmp(line, "relay", 5) == 0 && !x->have_relay) {
+            ts_ipc_clean(x->relay, sizeof x->relay, line + voff, n - voff, 0);
+            x->have_relay = 1;
+        } else if (klen == 6 && memcmp(line, "tunnel", 6) == 0 && !x->have_tunnel) {
+            ts_ipc_clean(x->tunnel, sizeof x->tunnel, line + voff, n - voff, 0);
+            x->have_tunnel = 1;
+        } else if (klen == 6 && memcmp(line, "filter", 6) == 0 && !x->have_filter) {
+            ts_ipc_clean(x->filter, sizeof x->filter, line + voff, n - voff, 0);
+            x->have_filter = 1;
+        }
+    }
+}
+
+/* "relay <code>  rx <n> tx <n>" for the peer at ip (a.b.c.d), from its path
+ * line, or "" when there is none or no session yet (a handshake age of "-"). */
+static void peer_path(char *out, size_t cap, const char *buf, size_t len, const char *ip)
+{
+    size_t pos = 0, iplen = strlen(ip);
+    out[0] = 0;
+    while (pos < len) {
+        const char *line = buf + pos;
+        size_t n = 0, klen, voff;
+        char val[TS_IPC_VALUE_MAX], code[40], age[24], addr[24];
+        unsigned long long rx, tx;
+        while (pos + n < len && line[n] != '\n') n++;
+        pos += n + 1;
+        if (ts_ipc_split(line, n, &klen, &voff) != 0 || klen != 4 || memcmp(line, "path", 4) != 0) continue;
+        ts_ipc_clean(val, sizeof val, line + voff, n - voff, 0);
+        if (strncmp(val, ip, iplen) != 0 || val[iplen] != ' ') continue;
+        if (sscanf(val, "%23s %39s %llu %llu %23s", addr, code, &rx, &tx, age) != 5) continue;
+        if (strcmp(age, "-") == 0) return;
+        snprintf(out, cap, "  relay %s  rx %llu tx %llu", code, rx, tx);
+        return;
+    }
+}
+
 static int cmd_status(void)
 {
     size_t i;
     int down;
+    extra_keys x;
     if (request(TS_IPC_STATUS) != 0 || check_ok() != 0) return 1;
     down = strcmp(R.wanted, "down") == 0 && strcmp(R.login, "yes") == 0;
     if (down) printf("Disconnected (tsppc up to connect)\n");
     else if (R.status[0]) printf("%s\n", R.status);
     if (R.url[0]) printf("Log in at: %s\n", R.url);
     if (R.problem[0]) printf("Problem: %s\n", R.problem);
+    scan_extras(&x, rbuf, rlen);
     if (R.have_ipv4) {
         char ip[16];
         fmt_ip(ip, sizeof ip, R.ipv4);
         printf("Tailnet IP: %s\n", ip);
     }
+    if (x.have_relay) printf("relay: %s\n", x.relay);
+    if (x.have_tunnel) printf("tunnel: %s\n", x.tunnel);
+    if (x.have_filter) printf("filter: %s\n", x.filter);
     if (R.npeers) printf("Peers:\n");
     for (i = 0; i < R.npeers; i++) {
-        char ip[16] = "-";
-        if (R.peers[i].have_ipv4) fmt_ip(ip, sizeof ip, R.peers[i].ipv4);
-        printf("  %-15s  %-7s  %s\n", ip, R.peers[i].online ? "online" : "offline", R.peers[i].name);
+        char ip[16] = "-", path[128] = "";
+        if (R.peers[i].have_ipv4) {
+            fmt_ip(ip, sizeof ip, R.peers[i].ipv4);
+            peer_path(path, sizeof path, rbuf, rlen, ip);
+        }
+        printf("  %-15s  %-7s  %s%s\n", ip, R.peers[i].online ? "online" : "offline", R.peers[i].name, path);
     }
     if (R.truncated) printf("(list truncated)\n");
     return 0;

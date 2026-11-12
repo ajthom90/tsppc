@@ -28,9 +28,25 @@
  *                           with a trailing dot), when known
  *   ip <a.b.c.d>            the node's tailnet IPv4 address, when known
  *   peer <a.b.c.d|-> <online|offline> <name>
+ *   relay <id> <code> <connected|connecting|down>
+ *                           the home relay (code "-" if unknown); left out
+ *                           when there is none or the data plane is not running
+ *   tunnel <ifname|off> [problem text]
+ *                           the tun interface, or "off" (not open, or the data
+ *                           plane is not running), then why, if known
+ *   filter <ok|none|too-large|invalid>
+ *                           the packet filter's state (data plane running)
+ *   path <a.b.c.d> <relay-code|-> <rx-packets> <tx-packets> <handshake-age-s|->
+ *                           one per peer with a configured WireGuard peer: the
+ *                           region last used to send to it, IP packets
+ *                           delivered from and sent to it, whole seconds since
+ *                           the last handshake; after all peer lines
  *   truncated               the reply hit TS_IPC_RESP_MAX
- * self, ip and peer come from the current map, and are left out while wanted
- * is down (the last map is stale then).
+ * self, ip, peer, relay, tunnel, filter and path come from the current map, and
+ * are left out while wanted is down (the last map is stale then).
+ * The menu bar's parser (ts_reply_parse) ignores relay, tunnel, filter and path.
+ * Size: a path line is at most 116 bytes and a peer line 300, so 256 peers
+ * take about 105 KB, under TS_IPC_RESP_MAX; "truncated" covers the rest.
  * The daemon replaces control bytes in every value. Clients still treat the
  * reply as untrusted and clean it (ts_ipc_clean) before printing it.
  *
