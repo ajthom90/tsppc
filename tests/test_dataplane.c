@@ -45,7 +45,7 @@ typedef struct {
     uint8_t priv[32], pub[32], disco[32];
     uint32_t ip;
     tconn c[TS_DP_MAX_CONNS];
-    int auto_up, dial_fail, rand_mode;
+    int auto_up, dial_fail, fail_region, rand_mode;
     uint64_t rng;
     int ndial, nclose, last_dial_region, max_active;
     int closed_region[32];
@@ -100,7 +100,7 @@ static int cb_dial(void *user, int slot, const ts_derp_node *node)
     if (c->dialed) n->bad_tun++;   /* dialed twice without close or down */
     conn_reset(c);
     c->c2s_n = c->s2c_n = 0;
-    if (n->dial_fail) return -1;
+    if (n->dial_fail || (n->fail_region && region == n->fail_region)) return -1;
     c->dialed = 1;
     c->region = region;
     if (active_conns(n) > n->max_active) n->max_active = active_conns(n);
@@ -999,6 +999,23 @@ void test_dp_peer_change(void)
     t_true("change: removed drops", !ping(0, 1, 7));
     t_true("change: no bad tun", N[1].bad_tun == 0);
     nodes_free();
+
+    /* A key the device refuses (low order) is not configured and holds no
+     * keys, and the other peers still work. */
+    setup(2, ALLOW_ALL_ICMP);
+    {
+        uint8_t low[32];
+        pspec q[2];
+        memset(low, 0, sizeof low);
+        low[0] = 1;
+        q[0].id = 1; q[0].key = N[0].pub; q[0].ip = N[0].ip; q[0].home = 1; q[0].flags = 0;
+        q[1].id = 9; q[1].key = low; q[1].ip = IP_OF(9); q[1].home = 1; q[1].flags = 0;
+        t_true("low order: map", apply_json(&N[1], map_json(&N[1], q, 2, 3, NULL)) == 0);
+        t_true("low order: not configured", ts_dp_peer_status(N[1].dp, IP_OF(9), &ws, NULL) == -1 &&
+                                                !ts_dp_test_has_keys(N[1].dp, low));
+        t_true("low order: others work", ping(0, 1, 1));
+    }
+    nodes_free();
 }
 
 static void conns_map(tnode *n, int npeers, int region_of_all, int nregions, uint8_t (*keys)[32])
@@ -1178,6 +1195,51 @@ void test_dp_conns(void)
     g_now += TS_DP_IDLE_CLOSE_MS + 1000;
     t_true("conns: no bad callbacks", a->bad_tun == 0);
     nodes_free();
+
+    /* A home that cannot be dialed is named in the status. */
+    setup(1, "[]");
+    ts_dp_set_home(a->dp, 7);
+    ts_dp_get_status(a->dp, &st);
+    t_true("home status: not in the map", st.home == 7 && st.home_up == 0 &&
+                                              strstr(st.problem, "not in the map") != NULL);
+    t_true("home status: no slot", slot_of(a, 7) < 0);
+    t_true("home status: map without nodes", apply_json(a, strdup(
+        "{\"DERPMap\":{\"Regions\":{\"1\":{\"RegionCode\":\"r1\",\"Nodes\":[{\"Name\":\"1a\","
+        "\"HostName\":\"r1.derp.test\",\"IPv4\":\"192.0.2.1\"}]},"
+        "\"5\":{\"RegionCode\":\"r5\",\"Nodes\":[]}}}}")) == 0);
+    ts_dp_set_home(a->dp, 5);
+    ts_dp_get_status(a->dp, &st);
+    t_true("home status: no usable relay", st.home == 5 && st.home_up == 0 &&
+                                               strstr(st.problem, "no usable relay") != NULL);
+    ts_dp_set_home(a->dp, 1);
+    pump();
+    ts_dp_get_status(a->dp, &st);
+    t_true("home status: back up", st.home == 1 && st.home_up == 1 && st.problem[0] == 0);
+    nodes_free();
+
+    /* The peer's home connection is in backoff while the one we heard the
+     * peer on is ready: replies go on the ready one, not into the queue. */
+    setup(2, ALLOW_ALL_ICMP);
+    {
+        pspec p;
+        ts_wg_stats ws;
+        int reg = 0;
+        p.id = 1;
+        p.key = N[0].pub;
+        p.ip = N[0].ip;
+        p.home = 2;
+        p.flags = 0;
+        t_true("backoff home: map", apply_json(&N[1], map_json(&N[1], &p, 1, 3, NULL)) == 0);
+        N[1].fail_region = 2;
+        send_to(&N[1], N[0].ip);   /* B opens region 2, whose dial fails: backoff, queued */
+        pump();
+        t_true("backoff home: region 2 in backoff", N[1].ndial == 2 && slot_of(&N[1], 2) < 0);
+        t_true("backoff home: A to B", ping(0, 1, 1));
+        t_true("backoff home: B to A", ping(1, 0, 2));
+        t_true("backoff home: sent on region 1",
+               ts_dp_peer_status(N[1].dp, N[0].ip, &ws, &reg) == 0 && reg == 1);
+    }
+    nodes_free();
 }
 
 static void region(ts_derp_region *r, int id)
@@ -1226,14 +1288,25 @@ void test_dp_pick_home(void)
     t_true("pick: avoid, no_home, no nodes skipped", ts_dp_pick_home(r, 4, lat, 0, 0) == 4);
     t_true("pick: ineligible current not kept", ts_dp_pick_home(r, 4, lat, 1, 0) == 4);
 
-    /* No latencies: keep current, else upstream's fallback over all regions. */
+    /* No latencies: keep a current that can be dialed (in the list, with a
+     * node), else upstream's fallback over the regions with a node (here
+     * 1 avoid, 2 no_home, 4; region 3 has none). */
     for (i = 0; i < 4; i++) lat[i] = -1;
-    t_true("pick: no data keeps current", ts_dp_pick_home(r, 4, lat, 3, 7) == 3);
-    t_true("pick: fallback", ts_dp_pick_home(r, 4, lat, 0, 5) == 2);
-    t_true("pick: fallback includes avoid", ts_dp_pick_home(r, 4, lat, 0, 4) == 1);
+    t_true("pick: no data keeps current", ts_dp_pick_home(r, 4, lat, 4, 7) == 4);
+    t_true("pick: no data keeps a no_home current", ts_dp_pick_home(r, 4, lat, 2, 0) == 2);
+    t_true("pick: no data, current without nodes", ts_dp_pick_home(r, 4, lat, 3, 7) == 2);
+    t_true("pick: no data, current not in the map", ts_dp_pick_home(r, 4, lat, 9, 0) == 1);
+    t_true("pick: fallback", ts_dp_pick_home(r, 4, lat, 0, 5) == 4);
+    t_true("pick: fallback 2", ts_dp_pick_home(r, 4, lat, 0, 4) == 2);
+    t_true("pick: fallback includes avoid", ts_dp_pick_home(r, 4, lat, 0, 3) == 1);
     lat[0] = 5;   /* only an ineligible region measured: no data */
-    t_true("pick: only ineligible measured", ts_dp_pick_home(r, 4, lat, 0, 6) == 3);
-    t_true("pick: empty", ts_dp_pick_home(r, 0, lat, 0, 6) == 0);
+    t_true("pick: only ineligible measured", ts_dp_pick_home(r, 4, lat, 0, 6) == 1);
+    for (i = 0; i < 4; i++) {
+        r[i].nnodes = 0;
+        lat[i] = -1;
+    }
+    t_true("pick: no region with a node", ts_dp_pick_home(r, 4, lat, 4, 6) == 0);
+    t_true("pick: empty", ts_dp_pick_home(r, 0, lat, 5, 6) == 0);
 }
 
 /* Random events, garbage and out-of-range slots, under the sanitizers. Every

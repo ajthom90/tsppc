@@ -281,10 +281,19 @@ static slot *slot_open(ts_dp *dp, int region)
 
 static void ensure_home(ts_dp *dp)
 {
+    const ts_derp_region *r;
     slot *s;
     if (!dp->running || dp->home <= 0 || slot_for_region(dp, dp->home)) return;
+    r = region_find(dp, dp->home);
+    if (!r || r->nnodes == 0) {
+        snprintf(dp->home_err, sizeof dp->home_err, "%s",
+                 r ? "home relay region has no usable relay" : "home relay region not in the map");
+        return;
+    }
     s = slot_open(dp, dp->home);
-    if (s) dial(s);
+    if (!s) return;
+    dp->home_err[0] = 0;
+    dial(s);
 }
 
 /* One SendPacket on s: sent if the relay is ready (after anything queued),
@@ -381,20 +390,29 @@ static void wg_send(void *user, const uint8_t key[32], const uint8_t *msg, size_
 {
     ts_dp *dp = (ts_dp *)user;
     dpeer *peer = peer_by_key(dp, key);
-    slot *s = NULL;
+    slot *home, *rx, *s;
 
     if (!peer) return;
-    /* B1: the peer's home region, else where we last heard it, else dial home. */
-    s = slot_for_region(dp, peer->home);
-    if (!s) s = slot_for_region(dp, peer->rx_region);
-    if (!s) {
+    /* B1: the peer's home connection if it is open (ready), else the ready
+     * connection we last heard the peer on, else queue on the home region's
+     * connection (dialing it if there is none); the receive connection in
+     * any state is the last resort (no usable home region). */
+    home = slot_for_region(dp, peer->home);
+    rx = slot_for_region(dp, peer->rx_region);
+    if (home && slot_ready(home)) s = home;
+    else if (rx && slot_ready(rx)) s = rx;
+    else if (home) s = home;
+    else {
         s = slot_open(dp, peer->home);
-        if (!s) return;
-        peer->tx_region = s->region;
-        slot_send(s, key, msg, n);   /* queued before the dial, so a failed dial keeps it */
-        dial(s);
-        return;
+        if (s) {
+            peer->tx_region = s->region;
+            slot_send(s, key, msg, n);   /* queued before the dial, so a failed dial keeps it */
+            dial(s);
+            return;
+        }
+        s = rx;
     }
+    if (!s) return;
     peer->tx_region = s->region;
     slot_send(s, key, msg, n);
 }
@@ -583,7 +601,10 @@ static void set_peers(ts_dp *dp, const ts_netmap *m)
                 break;
             }
         }
-        if (ts_wg_set_peer(dp->wg, p->key, p->ipv4) != 0) p->configured = 0;
+        if (ts_wg_set_peer(dp->wg, p->key, p->ipv4) != 0) {
+            p->configured = 0;
+            ts_wg_remove_peer(dp->wg, p->key);   /* no stale sessions under this key */
+        }
     }
     ts_wipe(dp->peers, sizeof dp->peers);
     memcpy(dp->peers, dp->stage, n * sizeof dp->peers[0]);
@@ -728,8 +749,19 @@ int ts_dp_pick_home(const ts_derp_region *r, size_t n, const int *lat_ms, int cu
         }
     }
     if (!have) {
-        if (current > 0 || n == 0) return current;
-        return r[rand32 % n].id;   /* upstream pickDERPFallback: any region */
+        /* Keep a current home that can still be dialed; else upstream's
+         * pickDERPFallback over every region with a usable node. */
+        size_t k = 0;
+        for (i = 0; i < n; i++)
+            if (r[i].id == current && current > 0 && r[i].nnodes > 0) return current;
+        for (i = 0; i < n; i++) k += r[i].nnodes > 0;
+        if (k == 0) return 0;
+        k = rand32 % k;
+        for (i = 0; i < n; i++) {
+            if (r[i].nnodes == 0) continue;
+            if (k-- == 0) return r[i].id;
+        }
+        return 0;
     }
     /* Stickiness: keep the current home unless the best is clearly better. */
     if (cur_ok && best_id != current && (cur - best < 10.0 || best > cur * 2.0 / 3.0)) return current;

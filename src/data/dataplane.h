@@ -105,7 +105,11 @@ int ts_dp_peer_status(const ts_dp *dp, uint32_t ipv4, ts_wg_stats *st, int *regi
  * - ts_dp_set_home: region 0 means none. The home connection is dialed at
  *   once and kept open (redialed when it goes down); the old home is told
  *   NotePreferred 0 and becomes an ordinary connection.
- * - ts_dp_pick_home returns a region ID, or 0 when n is 0 (and current is 0).
+ * - ts_dp_pick_home returns a region ID. With no usable latency it keeps
+ *   current only if current is in r with a node, else picks among the regions
+ *   with a node (rand32), else returns 0.
+ * - A home region missing from the map, or with no usable node, is not
+ *   dialed; ts_dp_get_status's problem then says so.
  * - ts_dp_get_status: problem is "" or a short reason, never filter content.
  * - ts_dp_peer_status: 0, or -1 if no configured peer has that ipv4. region is
  *   the region last used to send to the peer, or -1. */
