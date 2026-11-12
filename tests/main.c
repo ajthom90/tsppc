@@ -22,6 +22,14 @@ void test_wg_device(void);
 void test_derp_handshake(void);
 void test_derp_frames(void);
 void test_derp_send(void);
+void test_dp_ping(void);
+void test_dp_filter(void);
+void test_dp_spoof(void);
+void test_dp_disco_and_unknown(void);
+void test_dp_peer_change(void);
+void test_dp_conns(void);
+void test_dp_pick_home(void);
+void test_dp_stress(void);
 
 int main(void)
 {
@@ -47,5 +55,13 @@ int main(void)
     test_derp_handshake();
     test_derp_frames();
     test_derp_send();
+    test_dp_ping();
+    test_dp_filter();
+    test_dp_spoof();
+    test_dp_disco_and_unknown();
+    test_dp_peer_change();
+    test_dp_conns();
+    test_dp_pick_home();
+    test_dp_stress();
     return t_summary();
 }
