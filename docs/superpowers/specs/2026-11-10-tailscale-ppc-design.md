@@ -243,7 +243,9 @@ If the driver can't be made to work on Tiger, the project continues as a Leopard
     - killing the daemon with `kill -9` and then starting it, or uninstalling, leaves no stray routes or DNS changes;
     - all of the above works on Leopard and Tiger, and from the CLI and the menu bar app. **[Call]**
 
-**Order and first release.** It is not yet decided whether milestones 12 and 13 go into the first public release (milestone 10) or come after it. The owner decides. **[Open]**
+**Order and first release.** Milestones 12 (menu bar app) and 13 (exit nodes) are both in the first public release, so milestone 10 comes after them. **[Owner]**
+
+Exit node testing uses two exit nodes on the owner's tailnet. One shares the VMs' gateway, so it proves routing but not a change of public IP. The other is on a different network, and routing through it must change the Mac's public IP. **[Owner]**
 
 G3 and real G5 support are designed for but can't be verified by the owner. The release must say so, and ask for reports from people with those machines.
 
