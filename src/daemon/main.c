@@ -1,4 +1,6 @@
-/* tsppcd: the daemon. Runs in the foreground (no launchd yet) as root.
+/* tsppcd: the daemon. Runs in the foreground as root (launchd runs it with
+ * -l <logfile>: stderr goes to that file, capped by logfile.c; tsppcd --cleanup
+ * removes what a crash left, and exits 1 if a daemon is running).
  *
  * One select() loop over the control connection, the DNS helper's pipe, the
  * control key fetch, the local socket and its clients, and a signal pipe.
@@ -69,6 +71,8 @@
 #include "conditions.h"
 #include "dataplane_io.h"
 #include "ipc.h"
+#include "ipc_reply.h"
+#include "logfile.h"
 #include "names_io.h"
 #include "src/control/noise.h"
 #include "src/control/session.h"
@@ -190,6 +194,7 @@ static int64_t now_ms(void)
 }
 
 static int64_t t_start;
+static int g_logfile;   /* -l: check the log file's size after each line */
 
 /* Log a line. Callers never pass keys or the login URL. */
 static void logline(const char *fmt, ...)
@@ -202,6 +207,7 @@ static void logline(const char *fmt, ...)
     va_end(ap);
     ts_ipc_clean(safe, sizeof safe, msg, strlen(msg), 0);
     fprintf(stderr, "tsppcd: [%5ld.%03ld] %s\n", (long)(t / 1000), (long)(t % 1000), safe);
+    if (g_logfile) ts_logfile_check();
 }
 
 /* ---- The control connection (the session's I/O) ------------------------- */
@@ -1199,6 +1205,33 @@ static int setup_control_host(void)
     return 0;
 }
 
+/* tsppcd --cleanup, for the uninstaller: with no daemon answering on the
+ * control socket, remove the route and the /etc/hosts block a crash left.
+ * Loads no state, keys or network. */
+static int run_cleanup(void)
+{
+    char buf[TS_IPC_RESP_MAX];
+    size_t len = 0;
+
+    mach_timebase_info(&tb);
+    t_start = now_ms();
+    /* Only "nothing there" (no socket, or a stale one) means no daemon. */
+    if (ts_ipc_request(ts_ipc_socket_path(), TS_IPC_STATUS, 3000, buf, sizeof buf, &len) != TS_REQ_NO_DAEMON) {
+        fprintf(stderr, "tsppcd is running; stop it first\n");
+        return 1;
+    }
+    if (ts_dpio_init(logline, now_ms) != 0) {
+        fprintf(stderr, "tsppcd: out of memory\n");
+        return 1;
+    }
+    ts_dpio_cleanup_route();
+    ts_names_init(logline);
+    ts_names_cleanup();
+    ts_dpio_shutdown();
+    ts_names_shutdown();
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct sigaction sa;
@@ -1207,10 +1240,25 @@ int main(int argc, char **argv)
     int i, code = 0;
     gid_t gid = TS_IPC_GROUP_GID;
 
-    (void)argv;
-    if (argc != 1) {
-        fprintf(stderr, "usage: tsppcd (runs in the foreground)\n");
+    const char *logpath = NULL;
+    int cleanup = 0;
+
+    if (argc == 1) {
+    } else if (argc == 2 && strcmp(argv[1], "--cleanup") == 0) {
+        cleanup = 1;
+    } else if (argc == 3 && strcmp(argv[1], "-l") == 0 && argv[2][0]) {
+        logpath = argv[2];
+    } else {
+        fprintf(stderr, "usage: tsppcd [-l <logfile>] | --cleanup\n");
         return 2;
+    }
+    if (cleanup) return run_cleanup();
+    if (logpath) {
+        if (ts_logfile_open(logpath, err, sizeof err) != 0) {
+            fprintf(stderr, "tsppcd: %s\n", err);
+            return 1;
+        }
+        g_logfile = 1;
     }
     memset(&D, 0, sizeof D);
     D.fd = D.lfd = -1;

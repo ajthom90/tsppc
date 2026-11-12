@@ -799,11 +799,34 @@ static int wait_file_has(const char *path, const char *want, int ms)
 /* The daemon runs the data plane once RUNNING: probes pick the reachable
  * region, the relay connection comes up as home, control hears the region in
  * a lite update, and down stops it all. */
+/* Run "tsppcd --cleanup" with the test overrides (never the real route or
+ * /etc/hosts). Returns its exit status, or -1. Its output goes to outpath. */
+static int run_cleanup(const char *sock, const char *outpath)
+{
+    char hosts[128];
+    pid_t pid = fork();
+    if (pid == 0) {
+        int fd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) {
+            dup2(fd, 1);
+            dup2(fd, 2);
+            close(fd);
+        }
+        setenv("TSPPC_SOCKET", sock, 1);
+        setenv("TSPPC_NO_TUN", "1", 1);
+        snprintf(hosts, sizeof hosts, "%s/hosts", tmpdir);
+        setenv("TSPPC_HOSTS_FILE", hosts, 1);
+        execl(TS_BIN_DIR "/tsppcd", "tsppcd", "--cleanup", (char *)NULL);
+        _exit(127);
+    }
+    return wait_exit(pid, 30000);
+}
+
 static void test_daemon_relay(void)
 {
     static fake f;
     char statedir[128], sock[128], logpath[128], countpath[128], evpath[128], key[65], out[8192], out2[8192], err[256];
-    char hostspath[128];
+    char hostspath[128], cleanout[128];
     ts_state st;
     pid_t pid, srv, rsrv;
     int lfd, rfd, rc;
@@ -915,6 +938,13 @@ static void test_daemon_relay(void)
     t_true("relay: tsppc status prints the names line after filter",
            rc == 0 && strstr(out2, "filter: none dropped 0\nnames: 2 names\n"));
 
+    /* --cleanup with the daemon running: refused, the block stays. */
+    snprintf(cleanout, sizeof cleanout, "%s/cleanup", tmpdir);
+    t_true("relay: cleanup refuses while running", run_cleanup(sock, cleanout) == 1);
+    t_true("relay: cleanup says to stop it first", file_has(cleanout, "tsppcd is running; stop it first\n"));
+    t_true("relay: the running daemon's block is still there",
+           file_has(hostspath, "\n100.64.0.2\tpeer.example.test peer\n") && file_has(hostspath, TS_HOSTS_BEGIN "\n"));
+
     rc = run_cli("down", out, sizeof out);
     t_true("relay: down accepted", rc == 0);
     t_true("relay: down goes IDLE", wait_status(sock, "state IDLE\n", out, sizeof out, 60000));
@@ -951,6 +981,27 @@ static void test_daemon_relay(void)
         keys[1] = st.machine_priv;
         keys[2] = st.disco_priv;
         t_true("relay: log holds no private keys", !log_has_key(logpath, keys, 3));
+    }
+
+    /* kill -9 with the block written, then --cleanup: the owner's part only. */
+    st.have_login = 1;
+    st.down = 0;
+    t_true("relay: login saved again", ts_state_save(&st, statedir, err, sizeof err) == 0);
+    pid = start_daemon(statedir, sock, logpath, key);
+    t_true("relay: second daemon writes the block",
+           wait_file_has(hostspath, "\n100.64.0.2\tpeer.example.test peer\n", 120000) && file_has(hostspath, TS_HOSTS_BEGIN "\n"));
+    kill(pid, SIGKILL);
+    t_true("relay: kill -9 took the daemon", wait_exit(pid, 10000) == 128 + SIGKILL);
+    t_true("relay: the block is left behind", file_has(hostspath, TS_HOSTS_BEGIN "\n"));
+    t_true("relay: cleanup after kill -9 exits 0", run_cleanup(sock, cleanout) == 0);
+    {
+        FILE *hf = fopen(hostspath, "r");
+        char got[256];
+        size_t n = hf ? fread(got, 1, sizeof got - 1, hf) : 0;
+        if (hf) fclose(hf);
+        got[n] = 0;
+        t_true("relay: the hosts file is the owner's part only, byte for byte",
+               strcmp(got, "127.0.0.1\tlocalhost\n10.0.0.1 nas\n") == 0);
     }
     kill(srv, SIGKILL);
     waitpid(srv, NULL, 0);

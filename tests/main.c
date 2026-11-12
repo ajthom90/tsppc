@@ -45,6 +45,7 @@ void test_tun_cmds(void);
 void test_dpio(void);
 void test_names_io(void);
 void test_conditions(void);
+void test_logfile(void);
 
 int main(void)
 {
@@ -93,5 +94,6 @@ int main(void)
     test_dpio();
     test_names_io();
     test_conditions();
+    test_logfile();
     return t_summary();
 }
