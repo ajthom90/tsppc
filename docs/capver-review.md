@@ -49,7 +49,7 @@ Owner: Tasks 8 (parse), 9 (hooks, `want_read`), 10 (daemon exit hook, honours `w
 **Decision: answer no c2n request, in this plan or the next ones.** Reasons:
 
 - Upstream's own c2n-less builds do this (see Result), and still advertise the current version.
-- Every handler is either diagnostic, or serves a feature this client does not have (updates, SSH, app connectors, VIP services, Wake-on-LAN, netfilter, posture, Tailnet Lock). `/update` is how control asks a client to self-update, and this project has no updater by design.
+- Every handler is either diagnostic, or serves a feature this client does not have (updates, SSH, app connectors, VIP services, Wake-on-LAN, netfilter, posture, Tailnet Lock). `/update` is how control asks a client to self-update. This client never lets control drive an update: its own updater (milestone 14, added 2026-11-12) runs only when the user clicks it in the menu bar app.
 - [Inference] unanswered c2n only makes the requester (an admin console action or a support tool) time out. Nothing in the map stream depends on it.
 
 What to do when one arrives: log "c2n request ignored" with no payload and no URL, and drop it. Do not parse `Payload`.

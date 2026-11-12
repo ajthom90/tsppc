@@ -187,6 +187,7 @@ The builder's notes below are all **[Call]**.
   - When login is needed, "Log in…", which shows and copies the link.
   - "Log out…", with a confirmation.
   - "Quit".
+  - A "Settings" submenu (added 2026-11-12, **[Owner]**; its contents are **[Call]**): "Start at Login" (adds or removes the app in the user's Login Items; no root), "Use Tailnet Names" (the `/etc/hosts` block), "Check for Updates Automatically", and "About tsppc" (version, the not-affiliated notice, project link). The exit-node items stay in their own submenu. See "Updates" for the update items.
   - There's no separate preferences window in the first version.
 - **Starting at login.** The installer offers to add the app to the user's Login Items. Quitting the app leaves the daemon and the tunnel running.
 - **Identity.** It must use its own icon and name, never Tailscale's logo or app name. This is the "Passing off" anti-goal.
@@ -243,7 +244,9 @@ If the driver can't be made to work on Tiger, the project continues as a Leopard
     - killing the daemon with `kill -9` and then starting it, or uninstalling, leaves no stray routes or DNS changes;
     - all of the above works on Leopard and Tiger, and from the CLI and the menu bar app. **[Call]**
 
-**Order and first release.** Milestones 12 (menu bar app) and 13 (exit nodes) are both in the first public release, so milestone 10 comes after them. **[Owner]**
+14. **Settings and one-click updates.** **[Owner]** This needs the install work (milestone 7) and the release tooling. *Passes when:* on Leopard and Tiger, the Settings items work (Start at Login survives a reboot, Use Tailnet Names adds and removes the block); a test release signed with a test key is found, offered and installed from the menu, and the daemon comes back on the new version with no login; a manifest or package with a bad signature, wrong size, wrong hash or an older version is refused with a clear reason and nothing installed. **[Call]**
+
+**Order and first release.** Milestones 12 (menu bar app), 13 (exit nodes) and 14 (settings and updates) are all in the first public release, so milestone 10 comes after them. **[Owner]**
 
 Exit node testing uses two exit nodes on the owner's tailnet. One shares the VMs' gateway, so it proves routing but not a change of public IP. The other is on a different network, and routing through it must change the Mac's public IP. **[Owner]**
 
@@ -275,7 +278,19 @@ The owner wants others to be able to use this. **[Owner]** Everything else here 
 - **Licence:** BSD-3-Clause for this project. It matches Tailscale's reference code and is compatible with BearSSL's MIT-style licence and tuntaposx's BSD-style terms. tuntaposx's terms allow redistribution in source and binary form, with its copyright notice and disclaimer retained. Keep every upstream notice, including for any code ported from a reference.
 - **Naming and affiliation:** say plainly in the README and at install that this is unofficial and not affiliated with or endorsed by Tailscale Inc. Before publishing, check Tailscale's trademark guidance and terms of service, and rename the project if needed. The working name `tailscale-ppc` may not survive that check.
 - **Distribution:** a standard Installer package for Tiger and Leopard, plus an uninstaller. Publish source and SHA-256 checksums. Old Macs may be unable to download from modern HTTPS sites, so instructions must cover downloading on a modern machine and copying across.
-- **Updates:** published releases only. No automatic updater, because a root-level self-updater on these systems is more risk than benefit. Compiled-in root certificates and the capability version are updated through releases.
+- **Updates:** one-click updates from the menu bar app. **[Owner]**, 2026-11-12, replacing the earlier "no automatic updater" call; a notify-only design was offered and declined. The rest is **[Call]**:
+  - Never unattended. The daemon checks about once a day (if "Check for Updates Automatically" is on) for a signed manifest on the project's latest GitHub release: version, package URL, size, SHA-256, minimum OS. A newer version shows "Install Update <version>…" in the menu. Installing needs that click and a confirmation, from an admin user (the socket is admin-only).
+  - The daemon downloads the package with a size limit, checks size, SHA-256 and an Ed25519 signature against a public key compiled into the binary, refuses any version not newer than the running one, then runs `/usr/sbin/installer -pkg <pkg> -target /`. The package's scripts restart the daemon through launchd.
+  - The signing key is the owner's, made and kept offline before the first release; it never goes in the repository, the VMs or CI. Ed25519 verification is new crypto code and gets RFC 8032 vectors, sanitizers and fuzzing like every other parser.
+  - TLS to GitHub needs its certificate roots compiled in beside ISRG's. The signature, not TLS, is what makes an update trusted.
+  - No automatic rollback: the previous package is kept under `/var/db/tsppc/` so it can be reinstalled by hand.
+  - Compiled-in root certificates and the capability version are updated through releases.
+- **How releases are built and published:** **[Call]**
+  - Shipping binaries come from the Leopard VM's toolchain (gcc-4.0, 10.4u SDK). GitHub's hosted runners cannot build them.
+  - `tools/release.sh`, run on the Leopard VM from a clean checkout of a tag: full PowerPC suite and the release, constant-time and app checks, then the Installer package, the uninstaller and SHA-256 checksums.
+  - The package is installed and smoke-tested on the Tiger VM before publishing.
+  - The manifest is signed on the owner's Mac, and `gh release create` there uploads package, uninstaller, checksums and signed manifest. Each publish is asked for.
+  - GitHub Actions runs the host suite (clang, sanitizers, a short fuzz run) on every push. It covers the portable core only.
 - **Existing tuntaposx installs:** detect one and avoid replacing or breaking it.
 - **Users' tailnets vary:** clear errors for what's unsupported, including Tailnet Lock and tailnets over the peer limit. Device approval must work without a special mode.
 - **Repository hygiene:** no keys, state files, login URLs or personal machine details in the repository or its test fixtures.
