@@ -1341,6 +1341,9 @@ static int apply_inner(ts_netmap *m, const char *json, size_t len, fstage *fs, c
         m->sleep_ms = 0;
         return 0;
     }
+    if ((have_node && (!m->have_self || memcmp(&m->self, &self, sizeof self) != 0)) || sn != m->npeers ||
+        (sn && memcmp(m->stage, m->peers, sn * sizeof *m->peers) != 0))
+        m->nodes_gen++;
     if (have_node) {
         m->self = self;
         m->have_self = 1;
@@ -1455,6 +1458,7 @@ void ts_netmap_reset(ts_netmap *m)
     m->derp_stage = keep.derp_stage;
     m->nregions = keep.nregions;
     m->derp_gen = keep.derp_gen;
+    m->nodes_gen = keep.nodes_gen + 1;   /* self and peers are gone */
     m->scores = keep.scores;
     m->score_stage = keep.score_stage;
     m->nscores = keep.nscores;

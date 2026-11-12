@@ -24,23 +24,28 @@
 int ts_hosts_name_ok(const char *name, char *fqdn, size_t fqdn_cap, char *shortname, size_t short_cap);
 
 /* Writes the whole block: begin line, one line per node (self included) that
- * has an IPv4 address and a valid name of at least two labels,
+ * has an IPv4 address and a valid name of at least two labels ending, at a
+ * label boundary, in self's suffix (self's fqdn minus its first label; none
+ * without a valid self) or in "ts.net" (so control cannot point a name such
+ * as www.example.com at a tailnet address):
  * "<a.b.c.d>\t<fqdn> <short>\n" (just the fqdn when the short name is
- * withheld), end line. Sorted by IPv4 then fqdn, so a map gives the same bytes
- * every time. A node with an address and an invalid or single-label name is
- * counted in *nskipped and never written. Short names are written only for
- * nodes whose fqdn minus its first label equals self's (so none without a
- * valid self, and none for nodes shared in from another tailnet), and are
- * withheld when: it is localhost, broadcasthost, wpad, isatap or starts with
- * "ip6-"; more than one such node has it; or it is a host-name token
- * (case-insensitive; the first token of a line is the address and is skipped;
- * '#' starts a comment) of a line of old outside any tsppc section, so the
- * owner's own names are never shadowed. old may be NULL with oldlen 0.
+ * withheld), then the end line. Sorted by IPv4 then fqdn, so a map gives the
+ * same bytes every time. A node with an address whose name is invalid,
+ * single-label or outside both suffixes is counted in *nskipped and never
+ * written. Short names are written only for nodes whose fqdn minus its first
+ * label equals self's (so none without a valid self, and none for nodes
+ * shared in from another tailnet), and are withheld when: it is localhost,
+ * broadcasthost, wpad, isatap or starts with "ip6-"; it equals local_short
+ * (this Mac's own host name, lowercased; NULL for none) and the node is not
+ * self; more than one such node has it; or it is a host-name token
+ * (case-insensitive; the first token of a line is the address and is
+ * skipped; '#' starts a comment) of a line of old outside any tsppc section,
+ * so the owner's own names are never shadowed. old may be NULL with oldlen 0.
  * Returns the length (not NUL-terminated), or -1 if cap is too small.
  * *nentries counts the lines (either count pointer may be NULL).
  * Uses about 85 KB of stack. */
-int ts_hosts_build(char *out, size_t cap, const ts_netmap *nm, const char *old, size_t oldlen, size_t *nentries,
-                   size_t *nskipped);
+int ts_hosts_build(char *out, size_t cap, const ts_netmap *nm, const char *old, size_t oldlen,
+                   const char *local_short, size_t *nentries, size_t *nskipped);
 
 /* Copies old without any tsppc section (a line equal to TS_HOSTS_BEGIN through
  * the next line equal to TS_HOSTS_END, both included; trailing spaces, tabs

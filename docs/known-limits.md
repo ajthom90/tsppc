@@ -154,10 +154,13 @@ check.
 ## Peer names (milestone 5)
 
 - Names only: tsppc writes a block of peer names into `/etc/hosts`. There is no 100.100.100.100 resolver, no split DNS and no search domain, so other tailnet DNS records (for example services) do not resolve.
-- Names are in the file only while the tunnel is up. `tsppc down`, logging out, stopping the daemon or the tailnet's `disable-hosts-file-updates` setting removes them.
+- Names are in the file only while the tunnel is up (the data plane running with the tun device open). `tsppc down`, logging out, stopping the daemon, the tun device closing or the tailnet's `disable-hosts-file-updates` setting removes them.
+- Only full names in this tailnet's own suffix (the part of this Mac's tailnet name after its first label) or under `ts.net` are written; any other name control sends (for example `www.example.com`) is skipped and counted as skipped in `tsppc status`.
 - Short names (`<name>` as well as `<name>.<suffix>`) are written only for nodes in this Mac's own tailnet. Machines shared in from another tailnet get their full name only.
-- A short name is left out when two nodes would share it, when it is `localhost`, `broadcasthost`, `wpad`, `isatap` or starts with `ip6-`, or when the owner's own lines in `/etc/hosts` already use it. The full name is still written.
+- A short name is left out when two nodes would share it, when it is `localhost`, `broadcasthost`, `wpad`, `isatap` or starts with `ip6-`, when it is this Mac's own host name (and the node is another machine), or when the owner's own lines in `/etc/hosts` already use it. The full name is still written.
 - A hosts file that is a symbolic link, is not a regular file, is larger than 1 MiB, or has a tsppc begin marker with no end marker is never written; `tsppc status` says why.
 - A block deleted by hand comes back at the next network map change, not on a timer.
+- If removing the block fails (a broken tsppc section, or the file cannot be written), the names stay in `/etc/hosts` until the owner fixes the file; `tsppc status` says why, and tsppc tries again every 30 s while it runs and at its next start.
+- Deleting only the begin marker line by hand turns the old entries into ordinary owner lines: tsppc no longer recognises them as its own and never removes them (a lone end marker is removed). Delete the whole section, or neither marker.
 - An edit the owner makes in the moment between tsppc reading the file and replacing it is lost. The window is very short and only exists while a map change is being written.
-- The resolver cache flush (`dscacheutil` on 10.5, `lookupd` on 10.4) runs in the daemon's loop and can hold it for up to 10 s if the command hangs.
+- The resolver cache flush (`dscacheutil` on 10.5, `lookupd` on 10.4) runs in the daemon's loop and can hold it for up to 10 s if the command hangs (the data plane then restarts any relay probe round it interrupted).

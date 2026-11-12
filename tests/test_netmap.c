@@ -1082,8 +1082,35 @@ static void test_no_hosts_file(void)
     ts_netmap_free(&m);
 }
 
+/* nodes_gen bumps only when self or the peers' stored bytes change. */
+static void test_nodes_gen(void)
+{
+    ts_netmap m;
+    uint32_t g;
+
+    ts_netmap_init(&m);
+    t_true("nodes_gen: 0 at first", m.nodes_gen == 0);
+    t_true("nodes_gen: first map bumps", apply(&m, FULL_MAP) == 0 && m.nodes_gen != 0);
+    g = m.nodes_gen;
+    t_true("nodes_gen: same map again, no bump", apply(&m, FULL_MAP) == 0 && m.nodes_gen == g);
+    t_true("nodes_gen: keep-alive, no bump", apply(&m, "{\"KeepAlive\":true}") == 0 && m.nodes_gen == g);
+    t_true("nodes_gen: self change bumps", apply(&m, SELF_WITH("\"CapMap\":{\"" NH "\":[]}")) == 0 && m.nodes_gen != g);
+    g = m.nodes_gen;
+    t_true("nodes_gen: same self again, no bump",
+           apply(&m, SELF_WITH("\"CapMap\":{\"" NH "\":[]}")) == 0 && m.nodes_gen == g);
+    t_true("nodes_gen: peers back bumps", apply(&m, FULL_MAP) == 0 && m.nodes_gen != g);
+    g = m.nodes_gen;
+    t_true("nodes_gen: rejected message, no bump", apply(&m, "{\"Peers\":7}") != 0 && m.nodes_gen == g);
+    ts_netmap_reset(&m);
+    t_true("nodes_gen: reset bumps (kept across sessions)", m.nodes_gen != g && m.nodes_gen != 0 && !m.have_self);
+    g = m.nodes_gen;
+    t_true("nodes_gen: map after reset bumps", apply(&m, FULL_MAP) == 0 && m.nodes_gen != g);
+    ts_netmap_free(&m);
+}
+
 void test_netmap(void)
 {
+    test_nodes_gen();
     test_no_hosts_file();
     test_full_map();
     test_authorization();

@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "src/names/hosts.h"
 #include "src/platform/hostsfile.h"
@@ -15,7 +17,7 @@ enum { M_NONE, M_OFF, M_DISABLED, M_ON };
 static struct {
     ts_dpio_log_fn log;
     char path[1024];
-    int no_flush;
+    int no_tun;                 /* test builds, TSPPC_NO_TUN=1: no flush, the tunnel counts as open */
     char *file;                 /* the file as read (TS_HOSTS_FILE_MAX) */
     size_t filelen;
     char *out;                  /* the merged text (OUT_CAP) */
@@ -29,10 +31,20 @@ static struct {
     int64_t retry_at;
     char err[128];              /* "" or why the last attempt failed */
     size_t nentries, nskipped;
+    /* What the last successful apply saw: with the same map nodes, host name
+     * and file, applying again cannot change anything. */
+    int have_snap;
+    uint32_t snap_gen;
+    char snap_local[64];
+    dev_t snap_dev;
+    ino_t snap_ino;
+    off_t snap_size;
+    time_t snap_mtime, snap_ctime;
 } N;
 
 #ifdef TS_TEST_HOOKS
-unsigned long ts_names_test_writes, ts_names_test_flushes;
+unsigned long ts_names_test_writes, ts_names_test_flushes, ts_names_test_reads;
+void (*ts_names_test_flush)(void);
 #define COUNT(x) ((x)++)
 #else
 #define COUNT(x) ((void)0)
@@ -68,7 +80,7 @@ void ts_names_init(ts_dpio_log_fn logf)
         const char *e = getenv("TSPPC_HOSTS_FILE");
         if (e && e[0]) snprintf(N.path, sizeof N.path, "%s", e);
         e = getenv("TSPPC_NO_TUN");
-        N.no_flush = e && strcmp(e, "1") == 0;
+        N.no_tun = e && strcmp(e, "1") == 0;
     }
 #endif
 }
@@ -90,7 +102,13 @@ static void succeeded(void)
 static void flush(void)
 {
     COUNT(ts_names_test_flushes);
-    if (N.no_flush) return;
+#ifdef TS_TEST_HOOKS
+    if (ts_names_test_flush) {
+        ts_names_test_flush();
+        return;
+    }
+#endif
+    if (N.no_tun) return;
     ts_hostsfile_flush_cache();
     ts_dpio_note_blocked();   /* up to TS_RUN_LIMIT_MS: no probe is timed across it */
 }
@@ -102,6 +120,7 @@ static int read_file(int64_t retry_at)
         fail("out of memory", retry_at);
         return -1;
     }
+    COUNT(ts_names_test_reads);
     if (ts_hostsfile_read(N.path, N.file, TS_HOSTS_FILE_MAX, &N.filelen, err, sizeof err) != 0) {
         fail(err, retry_at);
         return -1;
@@ -147,12 +166,54 @@ static int remove_block(int64_t retry_at)
     return 0;
 }
 
+/* This Mac's host name, first label, lowercased ("" if unknown). */
+static void local_short(char out[64])
+{
+    char h[256];
+    size_t i;
+    out[0] = 0;
+    if (gethostname(h, sizeof h) != 0) return;
+    h[sizeof h - 1] = 0;
+    for (i = 0; i < 63 && h[i] && h[i] != '.'; i++) out[i] = (h[i] >= 'A' && h[i] <= 'Z') ? (char)(h[i] + 32) : h[i];
+    out[i] = 0;
+}
+
+static int snap_matches(const ts_netmap *nm, const char *local)
+{
+    struct stat sb;
+    if (!N.have_snap || nm->nodes_gen != N.snap_gen || strcmp(local, N.snap_local) != 0) return 0;
+    if (lstat(N.path, &sb) != 0) return 0;
+    return sb.st_dev == N.snap_dev && sb.st_ino == N.snap_ino && sb.st_size == N.snap_size &&
+           sb.st_mtime == N.snap_mtime && sb.st_ctime == N.snap_ctime;
+}
+
+static void snap_take(const ts_netmap *nm, const char *local)
+{
+    struct stat sb;
+    N.have_snap = lstat(N.path, &sb) == 0;
+    if (!N.have_snap) return;
+    N.snap_gen = nm->nodes_gen;
+    snprintf(N.snap_local, sizeof N.snap_local, "%s", local);
+    N.snap_dev = sb.st_dev;
+    N.snap_ino = sb.st_ino;
+    N.snap_size = sb.st_size;
+    N.snap_mtime = sb.st_mtime;
+    N.snap_ctime = sb.st_ctime;
+}
+
 static void apply(const ts_netmap *nm, int64_t now)
 {
     size_t ne = 0, ns = 0;
     int n, r;
+    char local[64];
+    local_short(local);
+    if (snap_matches(nm, local)) {
+        N.dirty = 0;
+        return;
+    }
+    N.have_snap = 0;
     if (read_file(now + TS_NAMES_RETRY_MS) != 0) return;
-    n = ts_hosts_build(N.blk, TS_HOSTS_BLOCK_MAX, nm, N.file, N.filelen, &ne, &ns);
+    n = ts_hosts_build(N.blk, TS_HOSTS_BLOCK_MAX, nm, N.file, N.filelen, local[0] ? local : NULL, &ne, &ns);
     if (n < 0) {
         fail("block too large", now + TS_NAMES_RETRY_MS);
         return;
@@ -165,6 +226,7 @@ static void apply(const ts_netmap *nm, int64_t now)
     if (r < 0) return;
     N.dirty = 0;
     succeeded();
+    snap_take(nm, local);
     if (r > 0) {
         N.last_write = now;
         N.have_last_write = 1;
@@ -180,10 +242,10 @@ void ts_names_cleanup(void)
     (void)remove_block(0);
 }
 
-void ts_names_sync(const ts_netmap *nm, int running, int map_changed, int64_t now_ms)
+void ts_names_sync(const ts_netmap *nm, int running, int tun_open, int map_changed, int64_t now_ms)
 {
     int target;
-    if (!running) target = M_OFF;
+    if (!running || !(tun_open || N.no_tun)) target = M_OFF;
     else if (!nm || !nm->have_self) return;   /* a reconnect emptied the map: keep what is there */
     else if (nm->self.no_hosts_file) target = M_DISABLED;
     else target = M_ON;
@@ -193,6 +255,7 @@ void ts_names_sync(const ts_netmap *nm, int running, int map_changed, int64_t no
         N.dirty = target == M_ON;
         N.remove_wanted = target != M_ON;
         N.failed = 0;   /* a new state is tried at once */
+        N.have_snap = 0;
     }
     if (target == M_ON && map_changed) N.dirty = 1;
     if (N.failed && now_ms < N.retry_at) return;

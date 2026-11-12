@@ -98,7 +98,7 @@ static void setname(ts_node *n, const char *name, uint32_t ip)
 static void expect(char *want, size_t cap, const ts_netmap *nm, const char *orig)
 {
     static char block[TS_HOSTS_BLOCK_MAX];
-    int n = ts_hosts_build(block, sizeof block, nm, orig, strlen(orig), NULL, NULL);
+    int n = ts_hosts_build(block, sizeof block, nm, orig, strlen(orig), NULL, NULL, NULL);
     size_t ol = strlen(orig);
     want[0] = 0;
     if (n < 0 || ol + (size_t)n + 1 > cap) return;
@@ -234,11 +234,11 @@ static void test_sync(void)
     f0 = ts_names_test_flushes;
 
     /* not running: nothing to remove, no write */
-    ts_names_sync(&nm, 0, 1, t);
+    ts_names_sync(&nm, 0, 1, 1, t);
     t_true("sync: not running writes nothing", ts_names_test_writes == w0 && file_is(path, ORIG));
 
     /* running with a map: block appended, the rest kept, mode kept */
-    ts_names_sync(&nm, 1, 1, t);
+    ts_names_sync(&nm, 1, 1, 1, t);
     expect(want, sizeof want, &nm, ORIG);
     t_true("sync: block written", ts_names_test_writes == w0 + 1 && want[0] && file_is(path, want));
     t_true("sync: owner's name not shadowed", strstr(want, "nas.example.ts.net\n") != NULL &&
@@ -249,17 +249,18 @@ static void test_sync(void)
     t_true("sync: logged", strstr(logbuf, "hosts") != NULL);
 
     /* the same map again (a keep-alive): no rewrite */
-    ts_names_sync(&nm, 1, 1, t + 1000);
-    ts_names_sync(&nm, 1, 0, t + 1500);
+    ts_names_sync(&nm, 1, 1, 1, t + 1000);
+    ts_names_sync(&nm, 1, 1, 0, t + 1500);
     t_true("sync: unchanged map not rewritten", ts_names_test_writes == w0 + 1 && ts_names_test_flushes == f0 + 1);
 
     /* a change within 5 s waits for the gap, then is written */
     setname(&peers[2], "peer-c.example.ts.net.", IP(100, 64, 0, 4));
-    ts_names_sync(&nm, 1, 1, t + 2000);
+    nm.nodes_gen++;
+    ts_names_sync(&nm, 1, 1, 1, t + 2000);
     t_true("sync: change within the gap waits", ts_names_test_writes == w0 + 1 && file_is(path, want));
-    ts_names_sync(&nm, 1, 0, t + TS_NAMES_MIN_GAP_MS - 1);
+    ts_names_sync(&nm, 1, 1, 0, t + TS_NAMES_MIN_GAP_MS - 1);
     t_true("sync: still waiting just before the gap", ts_names_test_writes == w0 + 1);
-    ts_names_sync(&nm, 1, 0, t + TS_NAMES_MIN_GAP_MS);
+    ts_names_sync(&nm, 1, 1, 0, t + TS_NAMES_MIN_GAP_MS);
     expect(want2, sizeof want2, &nm, ORIG);
     t_true("sync: pending change written after the gap", ts_names_test_writes == w0 + 2 && file_is(path, want2));
     t_true("sync: status after change", status_is("4 names"));
@@ -267,10 +268,12 @@ static void test_sync(void)
 
     /* change and change back within the gap: nothing to write */
     setname(&peers[2], "peer-d.example.ts.net.", IP(100, 64, 0, 4));
-    ts_names_sync(&nm, 1, 1, t + 1000);
+    nm.nodes_gen++;
+    ts_names_sync(&nm, 1, 1, 1, t + 1000);
     setname(&peers[2], "peer-c.example.ts.net.", IP(100, 64, 0, 4));
-    ts_names_sync(&nm, 1, 1, t + 2000);
-    ts_names_sync(&nm, 1, 0, t + TS_NAMES_MIN_GAP_MS + 1);
+    nm.nodes_gen++;
+    ts_names_sync(&nm, 1, 1, 1, t + 2000);
+    ts_names_sync(&nm, 1, 1, 0, t + TS_NAMES_MIN_GAP_MS + 1);
     t_true("sync: change undone within the gap not written", ts_names_test_writes == w0 + 2 && file_is(path, want2));
 
     /* the owner edits the file: their lines survive the next write */
@@ -279,58 +282,61 @@ static void test_sync(void)
         snprintf(edited, sizeof edited, "%s10.0.0.2 printer\n", want2);
         put_file(path, edited, 0640);
         setname(&peers[2], "peer-e.example.ts.net.", IP(100, 64, 0, 4));
+        nm.nodes_gen++;
         t += 20000;
-        ts_names_sync(&nm, 1, 1, t);
+        ts_names_sync(&nm, 1, 1, 1, t);
         t_true("sync: owner's later line kept", ts_names_test_writes == w0 + 3 &&
                                                     strstr(get_file(path), "10.0.0.2 printer\n") != NULL &&
                                                     strstr(get_file(path), "peer-e.example.ts.net") != NULL);
         put_file(path, want2, 0640);   /* back to a known text; the block is stale now */
-        ts_names_sync(&nm, 0, 0, t + 100);
+        ts_names_sync(&nm, 0, 1, 0, t + 100);
         t_true("sync: down removes the block from the edited file", file_is(path, ORIG));
     }
 
     /* running with no self (a reconnect emptied the map): nothing changes */
     t += 20000;
-    ts_names_sync(&nm, 1, 1, t);
+    ts_names_sync(&nm, 1, 1, 1, t);
     expect(want, sizeof want, &nm, ORIG);
     t_true("sync: up again writes the block", file_is(path, want));
     w0 = ts_names_test_writes;
     nm.have_self = 0;
-    ts_names_sync(&nm, 1, 1, t + 20000);
-    ts_names_sync(NULL, 1, 1, t + 40000);
+    ts_names_sync(&nm, 1, 1, 1, t + 20000);
+    ts_names_sync(NULL, 1, 1, 1, t + 40000);
     t_true("sync: no self keeps the block", ts_names_test_writes == w0 && file_is(path, want));
     nm.have_self = 1;
-    ts_names_sync(&nm, 1, 1, t + 60000);
+    ts_names_sync(&nm, 1, 1, 1, t + 60000);
     t_true("sync: self back, same block, no write", ts_names_test_writes == w0);
     t += 60000;
 
     /* not running: the block goes at once (no gap), once */
     f0 = ts_names_test_flushes;
-    ts_names_sync(&nm, 0, 0, t + 1);
+    ts_names_sync(&nm, 0, 1, 0, t + 1);
     t_true("sync: not running removes the block", file_is(path, ORIG) && ts_names_test_writes == w0 + 1);
     t_true("sync: removal flushed", ts_names_test_flushes == f0 + 1);
     t_true("sync: status off", status_is("off"));
     {
         ino_t ino = inode_of(path);
-        ts_names_sync(&nm, 0, 1, t + 2);
-        ts_names_sync(&nm, 0, 0, t + 50000);
+        ts_names_sync(&nm, 0, 1, 1, t + 2);
+        ts_names_sync(&nm, 0, 1, 0, t + 50000);
         t_true("sync: removed once only", ts_names_test_writes == w0 + 1 && inode_of(path) == ino);
     }
     t += 50000;
 
     /* up again: the same block is written again */
-    ts_names_sync(&nm, 1, 0, t);
+    ts_names_sync(&nm, 1, 1, 0, t);
     t_true("sync: up writes the block again (no map change needed)", file_is(path, want) && ts_names_test_writes == w0 + 2);
 
     /* the capability: the block goes, status says why */
     nm.self.no_hosts_file = 1;
-    ts_names_sync(&nm, 1, 1, t + 100);
+    nm.nodes_gen++;
+    ts_names_sync(&nm, 1, 1, 1, t + 100);
     t_true("sync: capability removes the block", file_is(path, ORIG) && ts_names_test_writes == w0 + 3);
     t_true("sync: status disabled", status_is("disabled by tailnet"));
-    ts_names_sync(&nm, 1, 1, t + 30000);
+    ts_names_sync(&nm, 1, 1, 1, t + 30000);
     t_true("sync: capability, no more writes", ts_names_test_writes == w0 + 3);
     nm.self.no_hosts_file = 0;
-    ts_names_sync(&nm, 1, 1, t + 40000);
+    nm.nodes_gen++;
+    ts_names_sync(&nm, 1, 1, 1, t + 40000);
     t_true("sync: capability cleared writes again", file_is(path, want) && ts_names_test_writes == w0 + 4);
     t += 40000;
     ts_names_shutdown();
@@ -359,14 +365,14 @@ static void test_broken_and_refused(void)
     put_file(path, broken, 0644);
     ts_names_init(nlog);
     w0 = ts_names_test_writes;
-    ts_names_sync(&nm, 1, 1, t);
+    ts_names_sync(&nm, 1, 1, 1, t);
     t_true("broken: not written", ts_names_test_writes == w0 && file_is(path, broken));
     t_true("broken: status says so", status_starts("hosts file: ") && status_starts("hosts file: broken tsppc section"));
     /* fixed by the owner: not retried before TS_NAMES_RETRY_MS, then written */
     put_file(path, ORIG, 0644);
-    ts_names_sync(&nm, 1, 1, t + 1000);
+    ts_names_sync(&nm, 1, 1, 1, t + 1000);
     t_true("broken: no retry before the delay", ts_names_test_writes == w0 && file_is(path, ORIG));
-    ts_names_sync(&nm, 1, 0, t + TS_NAMES_RETRY_MS);
+    ts_names_sync(&nm, 1, 1, 0, t + TS_NAMES_RETRY_MS);
     expect(want, sizeof want, &nm, ORIG);
     t_true("broken: retried after the delay", ts_names_test_writes == w0 + 1 && file_is(path, want));
     t_true("broken: status recovered", status_is("2 names"));
@@ -374,7 +380,7 @@ static void test_broken_and_refused(void)
 
     /* broken while removing: removal refused too, file kept */
     put_file(path, broken, 0644);
-    ts_names_sync(&nm, 0, 0, t + 1);
+    ts_names_sync(&nm, 0, 1, 0, t + 1);
     t_true("broken: removal refused", file_is(path, broken) && status_starts("hosts file: broken tsppc section"));
     ts_names_cleanup();
     t_true("broken: cleanup refused", file_is(path, broken));
@@ -387,7 +393,7 @@ static void test_broken_and_refused(void)
     t_true("refused: symlink made", symlink(other, path) == 0);
     ts_names_init(nlog);
     w0 = ts_names_test_writes;
-    ts_names_sync(&nm, 1, 1, t + 100000);
+    ts_names_sync(&nm, 1, 1, 1, t + 100000);
     t_true("refused: symlink not written", ts_names_test_writes == w0 && file_is(other, ORIG) &&
                                                lstat(path, &sb) == 0 && S_ISLNK(sb.st_mode));
     t_true("refused: status not a regular file", status_is("hosts file: not a regular file"));
@@ -452,18 +458,18 @@ static void test_restore_and_limits(void)
     put_file(path, ORIG, 0644);
     ts_names_init(nlog);
     w0 = ts_names_test_writes;
-    ts_names_sync(&nm, 1, 1, t);
+    ts_names_sync(&nm, 1, 1, 1, t);
     expect(want, sizeof want, &nm, ORIG);
     t_true("restore: written", file_is(path, want) && ts_names_test_writes == w0 + 1);
 
     /* same map, file unchanged: no write, same inode */
     ino = inode_of(path);
-    ts_names_sync(&nm, 1, 1, t + TS_NAMES_MIN_GAP_MS + 1);
+    ts_names_sync(&nm, 1, 1, 1, t + TS_NAMES_MIN_GAP_MS + 1);
     t_true("restore: unchanged file not rewritten", ts_names_test_writes == w0 + 1 && inode_of(path) == ino);
 
     /* the owner deletes the block by hand: the same map brings it back */
     put_file(path, ORIG, 0644);
-    ts_names_sync(&nm, 1, 1, t + 2 * TS_NAMES_MIN_GAP_MS + 2);
+    ts_names_sync(&nm, 1, 1, 1, t + 2 * TS_NAMES_MIN_GAP_MS + 2);
     t_true("restore: deleted block restored", file_is(path, want) && ts_names_test_writes == w0 + 2);
     t += 4 * TS_NAMES_MIN_GAP_MS;
 
@@ -477,7 +483,7 @@ static void test_restore_and_limits(void)
         fclose(f);
     }
     ino = inode_of(path);
-    ts_names_sync(&nm, 1, 1, t);
+    ts_names_sync(&nm, 1, 1, 1, t);
     {
         struct stat sb;
         t_true("too large: status", status_is("hosts file: too large"));
@@ -548,6 +554,79 @@ static void test_cleanup_temps(void)
     unlink(path);
 }
 
+static unsigned long hook_flushes;
+
+static void count_flush(void)
+{
+    hook_flushes++;
+}
+
+/* Final review: names only while the tunnel is open (TSPPC_NO_TUN unset here,
+ * the flush replaced by a counter); an unchanged map and file are not even
+ * re-read, a hand edit is. */
+static void test_tun_and_skip(void)
+{
+    static ts_node peers[2];
+    static char want[16384], edited[16384];
+    ts_netmap nm;
+    unsigned long w0, r0;
+    int64_t t = 20000000;
+
+    memset(&nm, 0, sizeof nm);
+    nm.peers = peers;
+    nm.have_self = 1;
+    nm.nodes_gen = 7;
+    setname(&nm.self, "self.example.ts.net.", IP(100, 64, 0, 1));
+    setname(&peers[0], "peer-a.example.ts.net.", IP(100, 64, 0, 2));
+    nm.npeers = 1;
+    expect(want, sizeof want, &nm, ORIG);
+
+    unsetenv("TSPPC_NO_TUN");
+    ts_names_test_flush = count_flush;
+    put_file(path, ORIG, 0644);
+    ts_names_init(nlog);
+    w0 = ts_names_test_writes;
+    ts_names_sync(&nm, 1, 0, 1, t);
+    t_true("tun: running without the tunnel writes nothing", ts_names_test_writes == w0 && file_is(path, ORIG) &&
+                                                                status_is("off"));
+    ts_names_sync(&nm, 1, 1, 1, t + 1);
+    t_true("tun: tunnel open writes", ts_names_test_writes == w0 + 1 && file_is(path, want) && hook_flushes == 1);
+    ts_names_sync(&nm, 1, 0, 0, t + 2);
+    t_true("tun: tunnel closed removes", ts_names_test_writes == w0 + 2 && file_is(path, ORIG) && hook_flushes == 2);
+    ts_names_sync(&nm, 1, 1, 1, t + 3);
+    t_true("tun: open again waits for the gap after the last write", file_is(path, ORIG));
+    ts_names_sync(&nm, 1, 1, 0, t + 1 + TS_NAMES_MIN_GAP_MS);
+    t_true("tun: open again writes", file_is(path, want));
+    t += 10 + TS_NAMES_MIN_GAP_MS;
+
+    /* nothing changed: not even read */
+    r0 = ts_names_test_reads;
+    ts_names_sync(&nm, 1, 1, 1, t + TS_NAMES_MIN_GAP_MS);
+    ts_names_sync(&nm, 1, 1, 1, t + 2 * TS_NAMES_MIN_GAP_MS);
+    t_true("skip: keep-alive not re-read", ts_names_test_reads == r0 && file_is(path, want));
+    /* a hand edit (size and mtime change): re-applied after the gap */
+    snprintf(edited, sizeof edited, "%s10.0.0.9 added\n", ORIG);
+    put_file(path, edited, 0644);
+    ts_names_sync(&nm, 1, 1, 1, t + 3 * TS_NAMES_MIN_GAP_MS);
+    {
+        char want2[16384];
+        expect(want2, sizeof want2, &nm, edited);
+        t_true("skip: hand edit re-read and merged", ts_names_test_reads == r0 + 1 && file_is(path, want2));
+    }
+    t += 3 * TS_NAMES_MIN_GAP_MS;
+    /* a new nodes_gen: re-read even with the file unchanged */
+    r0 = ts_names_test_reads;
+    nm.nodes_gen++;
+    ts_names_sync(&nm, 1, 1, 1, t + TS_NAMES_MIN_GAP_MS);
+    t_true("skip: new nodes_gen re-read", ts_names_test_reads == r0 + 1);
+
+    ts_names_shutdown();
+    t_true("tun: shutdown removes", file_is(path, edited));
+    ts_names_test_flush = NULL;
+    setenv("TSPPC_NO_TUN", "1", 1);
+    unlink(path);
+}
+
 void test_names_io(void)
 {
     snprintf(dir, sizeof dir, "/tmp/tsppc-n.XXXXXX");
@@ -565,6 +644,7 @@ void test_names_io(void)
     test_cleanup();
     test_restore_and_limits();
     test_cleanup_temps();
+    test_tun_and_skip();
     /* Other tests read TSPPC_NO_TUN (dataplane_io.c). */
     unsetenv("TSPPC_HOSTS_FILE");
     unsetenv("TSPPC_NO_TUN");

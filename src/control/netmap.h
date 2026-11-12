@@ -60,7 +60,10 @@
  *   message with last_limit set. have_filter is set by the first non-null
  *   PacketFilter or PacketFilters and never cleared.
  * - derp_gen and filter_gen bump only when the stored content (or have_filter)
- *   actually changes, so the data plane can skip work otherwise.
+ *   actually changes, so the data plane can skip work otherwise. nodes_gen
+ *   bumps when an apply changes self (or have_self) or the peers' stored
+ *   bytes (any field, online included), and on ts_netmap_reset (kept, never
+ *   back to an old value); a KeepAlive never bumps it.
  * - ts_netmap_reset keeps the regions, scores and filters readable (the data
  *   plane keeps using the last ones), but a new session starts upstream's
  *   per-session state empty: the first non-null DERPMap after a reset applies
@@ -196,6 +199,7 @@ typedef struct {
     ts_derp_region *regions;
     size_t nregions;
     uint32_t derp_gen;          /* bumps on every change of the regions */
+    uint32_t nodes_gen;         /* bumps on every change of self or the peers (rules above) */
     /* Named packet filters, sorted by name (strcmp); texts are JSON arrays. */
     char *filter_name[TS_FILTER_NAMES_MAX];
     char *filter_json[TS_FILTER_NAMES_MAX];

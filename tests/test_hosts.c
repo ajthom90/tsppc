@@ -76,12 +76,12 @@ static void setname(ts_node *n, const char *name, uint32_t ip)
 
 static int build(ts_netmap *nm, char *out, size_t cap, size_t *ne, size_t *ns)
 {
-    return ts_hosts_build(out, cap, nm, NULL, 0, ne, ns);
+    return ts_hosts_build(out, cap, nm, NULL, 0, NULL, ne, ns);
 }
 
 static int buildold(ts_netmap *nm, char *out, size_t cap, const char *old)
 {
-    return ts_hosts_build(out, cap, nm, old, strlen(old), NULL, NULL);
+    return ts_hosts_build(out, cap, nm, old, strlen(old), NULL, NULL, NULL);
 }
 
 /* build output is not NUL-terminated: compare by length */
@@ -233,7 +233,7 @@ static void test_build(void)
     n = buildold(&nm, out, sizeof out, "printer 1.2.3.4\nnas\n");
     t_true("owner first token skipped", has(out, n, "printer.example.ts.net printer") &&
                                             has(out, n, "nas.example.ts.net nas"));
-    t_true("old NULL", ts_hosts_build(out, sizeof out, &nm, NULL, 0, NULL, NULL) > 0);
+    t_true("old NULL", ts_hosts_build(out, sizeof out, &nm, NULL, 0, NULL, NULL, NULL) > 0);
     /* no self, no peers: markers only */
     nm.have_self = 0;
     nm.npeers = 0;
@@ -308,9 +308,87 @@ static void test_merge(void)
     free(huge);
 }
 
+/* Final review: full names only in self's suffix or ts.net; the Mac's own
+ * host name is never a peer's short name. */
+static void test_gates(void)
+{
+    static ts_node peers[6];
+    ts_netmap nm;
+    char out[TS_HOSTS_BLOCK_MAX];
+    size_t ne = 99, ns = 99;
+    int n;
+
+    memset(&nm, 0, sizeof nm);
+    nm.peers = peers;
+    nm.have_self = 1;
+    setname(&nm.self, "me.example.ts.net.", IP(100, 64, 0, 1));
+    setname(&peers[0], "www.apple.com.", IP(100, 64, 0, 2));
+    setname(&peers[1], "box.other.ts.net.", IP(100, 64, 0, 3));
+    setname(&peers[2], "evilts.net.", IP(100, 64, 0, 4));
+    setname(&peers[3], "a.evilts.net.", IP(100, 64, 0, 5));
+    setname(&peers[4], "peer.example.ts.net.", IP(100, 64, 0, 6));
+    setname(&peers[5], "x.notexample.ts.net.", IP(100, 64, 0, 7));
+    nm.npeers = 6;
+    n = build(&nm, out, sizeof out, &ne, &ns);
+    t_true("gate: foreign names skipped", is(out, n,
+        B "\n"
+        "100.64.0.1\tme.example.ts.net me\n"
+        "100.64.0.3\tbox.other.ts.net\n"
+        "100.64.0.6\tpeer.example.ts.net peer\n"
+        "100.64.0.7\tx.notexample.ts.net\n"
+        E "\n") && ne == 4 && ns == 3);
+
+    /* a custom base domain: self's suffix passes, others still need ts.net */
+    setname(&nm.self, "me.corp.example.", IP(100, 64, 0, 1));
+    setname(&peers[0], "node.corp.example.", IP(100, 64, 0, 2));
+    setname(&peers[1], "node.xcorp.example.", IP(100, 64, 0, 3));
+    setname(&peers[2], "box.other.ts.net.", IP(100, 64, 0, 4));
+    setname(&peers[3], "corp.example.", IP(100, 64, 0, 5));
+    nm.npeers = 4;
+    n = build(&nm, out, sizeof out, &ne, &ns);
+    t_true("gate: custom suffix kept", is(out, n,
+        B "\n"
+        "100.64.0.1\tme.corp.example me\n"
+        "100.64.0.2\tnode.corp.example node\n"
+        "100.64.0.4\tbox.other.ts.net\n"
+        "100.64.0.5\tcorp.example\n"
+        E "\n") && ns == 1);
+    /* no valid self: only ts.net names */
+    nm.have_self = 0;
+    n = build(&nm, out, sizeof out, &ne, &ns);
+    t_true("gate: no self, ts.net only", is(out, n,
+        B "\n"
+        "100.64.0.4\tbox.other.ts.net\n"
+        E "\n") && ne == 1 && ns == 3);
+    nm.have_self = 1;
+
+    /* the local host name: a peer's short name equal to it is withheld, self's is not */
+    setname(&nm.self, "leopard.example.ts.net.", IP(100, 64, 0, 1));
+    setname(&peers[0], "tiger.example.ts.net.", IP(100, 64, 0, 2));
+    setname(&peers[1], "mac.example.ts.net.", IP(100, 64, 0, 3));
+    nm.npeers = 2;
+    n = ts_hosts_build(out, sizeof out, &nm, NULL, 0, "mac", NULL, NULL);
+    t_true("local name: peer short withheld", is(out, n,
+        B "\n"
+        "100.64.0.1\tleopard.example.ts.net leopard\n"
+        "100.64.0.2\ttiger.example.ts.net tiger\n"
+        "100.64.0.3\tmac.example.ts.net\n"
+        E "\n"));
+    n = ts_hosts_build(out, sizeof out, &nm, NULL, 0, "leopard", NULL, NULL);
+    t_true("local name: self keeps its short", is(out, n,
+        B "\n"
+        "100.64.0.1\tleopard.example.ts.net leopard\n"
+        "100.64.0.2\ttiger.example.ts.net tiger\n"
+        "100.64.0.3\tmac.example.ts.net mac\n"
+        E "\n"));
+    n = ts_hosts_build(out, sizeof out, &nm, NULL, 0, "", NULL, NULL);
+    t_true("local name: empty ignored", has(out, n, "mac.example.ts.net mac\n"));
+}
+
 void test_hosts(void)
 {
     test_name_ok();
     test_build();
+    test_gates();
     test_merge();
 }

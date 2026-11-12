@@ -88,6 +88,8 @@ typedef struct {
     uint32_t ip;
     char fqdn[FQDN_CAP];
     char sh[SHORT_CAP];
+    unsigned char shlen;
+    unsigned char is_self;
 } entry;
 
 static int entry_before(const entry *a, const entry *b)
@@ -101,6 +103,14 @@ static const char *suffix_of(const char *fqdn)
 {
     const char *d = strchr(fqdn, '.');
     return d ? d + 1 : NULL;
+}
+
+/* Does fqdn end in suffix at a label boundary (or equal it)? */
+static int ends_in(const char *fqdn, const char *suffix)
+{
+    size_t fl = strlen(fqdn), sl = strlen(suffix);
+    if (sl == 0 || fl < sl || strcmp(fqdn + fl - sl, suffix) != 0) return 0;
+    return fl == sl || fqdn[fl - sl - 1] == '.';
 }
 
 static int banned_short(const char *s)
@@ -142,7 +152,7 @@ static void hide_owner_names(const char *old, size_t oldlen, const entry *ents, 
             if (tok++ == 0 || i - st > 63) continue;
             for (k = 0; k < n; k++) {
                 size_t j;
-                if (hide[k] || strlen(ents[k].sh) != i - st) continue;
+                if (hide[k] || ents[k].shlen != i - st) continue;
                 for (j = 0; j < i - st; j++) {
                     char c = s[st + j];
                     if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
@@ -154,8 +164,8 @@ static void hide_owner_names(const char *old, size_t oldlen, const entry *ents, 
     }
 }
 
-int ts_hosts_build(char *out, size_t cap, const ts_netmap *nm, const char *old, size_t oldlen, size_t *nentries,
-                   size_t *nskipped)
+int ts_hosts_build(char *out, size_t cap, const ts_netmap *nm, const char *old, size_t oldlen,
+                   const char *local_short, size_t *nentries, size_t *nskipped)
 {
     entry ents[TS_MAX_PEERS + 1];
     int idx[TS_MAX_PEERS + 1];
@@ -185,17 +195,23 @@ int ts_hosts_build(char *out, size_t cap, const ts_netmap *nm, const char *old, 
             nd = &nm->peers[i - 1];
         }
         if (!nd->have_ipv4) continue;
+        /* Only names of this tailnet (self's suffix) or of ts.net: control
+         * cannot point www.example.com at a tailnet address. */
         if (ts_hosts_name_ok(nd->name, ents[n].fqdn, FQDN_CAP, ents[n].sh, SHORT_CAP) != 0 ||
-            suffix_of(ents[n].fqdn) == NULL) {
+            suffix_of(ents[n].fqdn) == NULL ||
+            !((have_suf && ends_in(ents[n].fqdn, selfsuf)) || ends_in(ents[n].fqdn, "ts.net"))) {
             skipped++;
             continue;
         }
         ents[n].ip = nd->ipv4;
+        ents[n].shlen = (unsigned char)strlen(ents[n].sh);
+        ents[n].is_self = i == 0;
         n++;
     }
     /* short names: only for our own tailnet's suffix, never the reserved ones */
     for (i = 0; i < n; i++) {
-        hide[i] = !have_suf || strcmp(suffix_of(ents[i].fqdn), selfsuf) != 0 || banned_short(ents[i].sh);
+        hide[i] = !have_suf || strcmp(suffix_of(ents[i].fqdn), selfsuf) != 0 || banned_short(ents[i].sh) ||
+                  (!ents[i].is_self && local_short && strcmp(ents[i].sh, local_short) == 0);
     }
     {
         /* a short name held by more than one eligible node is withheld from all of them */

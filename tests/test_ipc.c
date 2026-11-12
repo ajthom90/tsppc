@@ -902,6 +902,13 @@ static void test_daemon_relay(void)
     t_true("relay: a second relay connection", wait_file_has(evpath, "eu", 5000));
     t_true("relay: up again writes the names again",
            wait_file_has(hostspath, "\n100.64.0.2\tpeer.example.test peer\n", 10000));
+    rc = run_cli("logout", out, sizeof out);
+    t_true("relay: logout accepted", rc == 0);
+    t_true("relay: logout removes the names, keeps the rest",
+           wait_status(sock, "\nlogin no\n", out2, sizeof out2, 60000) &&
+               wait_status(sock, "\nnames off\n", out2, sizeof out2, 10000) &&
+               file_has(hostspath, "10.0.0.1 nas\n") && !file_has(hostspath, "tsppc"));
+    if (rc != 0) printf("  logout said: %s\n", out);
 
     kill(pid, SIGTERM);
     t_true("relay: daemon exits", wait_exit(pid, 60000) == 0);

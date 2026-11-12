@@ -99,7 +99,7 @@ static void target(const uint8_t *data, size_t len)
     strncpy(peers[1].name, name, sizeof peers[1].name - 1);
     peers[1].ipv4 = 0x64400003u;
     peers[1].have_ipv4 = 1;
-    bn = ts_hosts_build(blkout, sizeof blkout, &nm, (const char *)oldp, ol, NULL, NULL);
+    bn = ts_hosts_build(blkout, sizeof blkout, &nm, (const char *)oldp, ol, NULL, NULL, NULL);
     TS_FUZZ_ASSERT(bn > 0 && (size_t)bn <= sizeof blkout);
     TS_FUZZ_ASSERT(count_markers(blkout, (size_t)bn) == 2);
     {
@@ -119,8 +119,8 @@ static void target(const uint8_t *data, size_t len)
     {
         char *twice = (char *)malloc((size_t)bn);
         TS_FUZZ_ASSERT(twice != NULL);
-        TS_FUZZ_ASSERT(ts_hosts_build(twice, (size_t)bn, &nm, (const char *)oldp, ol, NULL, NULL) == bn && memcmp(twice, blkout, (size_t)bn) == 0);
-        TS_FUZZ_ASSERT(ts_hosts_build(twice, (size_t)bn - 1, &nm, (const char *)oldp, ol, NULL, NULL) == -1);
+        TS_FUZZ_ASSERT(ts_hosts_build(twice, (size_t)bn, &nm, (const char *)oldp, ol, NULL, NULL, NULL) == bn && memcmp(twice, blkout, (size_t)bn) == 0);
+        TS_FUZZ_ASSERT(ts_hosts_build(twice, (size_t)bn - 1, &nm, (const char *)oldp, ol, NULL, NULL, NULL) == -1);
         free(twice);
     }
 

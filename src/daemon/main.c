@@ -1059,7 +1059,7 @@ int main(int argc, char **argv)
         {
             ts_dpio_view dv;
             ts_dpio_get_view(&dv);
-            ts_names_sync(D.sess ? ts_sess_netmap(D.sess) : NULL, dv.running, D.fed, now_ms());
+            ts_names_sync(D.sess ? ts_sess_netmap(D.sess) : NULL, dv.running, dv.tun_open, D.fed, now_ms());
         }
         D.fed = 0;
         log_state();
