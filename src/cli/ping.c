@@ -160,7 +160,7 @@ int ts_ping_parse_args(int argc, char **argv, ts_ping_opts *o, char *err, size_t
         }
     }
     if (argc - i != 1 || !argv[i][0]) {
-        snprintf(err, errcap, "usage: tsppc ping [-c N] [--timeout DUR] [--until-direct=BOOL] <name|IP>");
+        snprintf(err, errcap, "usage: tsppc ping [-c N] [--timeout DUR (100ms to 10s)] [--until-direct=BOOL] <name|IP>");
         return -1;
     }
     o->target = argv[i];
@@ -218,7 +218,8 @@ void ts_ping_pong_line(char *out, size_t cap, const char *label, uint32_t ip, co
     char ips[16], d[32];
     fmt_ip(ips, sizeof ips, ip);
     ts_ping_duration(d, sizeof d, latency_us);
-    snprintf(out, cap, "pong from %s (%s) via DERP(%s) in %s", label, ips, strcmp(code, "-") == 0 ? "" : code, d);
+    snprintf(out, cap, "pong from %s (%s) via DERP(%s) in %s", label[0] ? label : ips, ips,
+             strcmp(code, "-") == 0 ? "" : code, d);
 }
 
 /* ---- Status ------------------------------------------------------------- */

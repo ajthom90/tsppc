@@ -35,7 +35,8 @@
  * plane reports the ping (pong, timeout, or stopped: down, logout, a restart
  * of the data plane); its deadline is then the ping timeout plus
  * TS_IPC_PING_MARGIN_MS. A client that closes or sends more cancels its
- * ping. */
+ * ping. At most TS_IPC_MAX_PINGS clients wait at once, so status and the
+ * menu bar always have a slot. Only refused pings are logged. */
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -759,13 +760,16 @@ static void client_error(client *c, const char *text)
     c->outlen = n > 0 ? (size_t)n : 0;
 }
 
-/* Upstream's texts where it has one (magicsock, ipnlocal), else a short one. */
+/* Upstream's texts where it has one: no node with that IP is the engine's
+ * "no matching peer"; a peer with no disco key has no magicsock endpoint
+ * upstream, so "unknown peer"; an expired one is ipnlocal's text. "peer has
+ * no home relay" is ours (upstream would just time out). */
 static const char *ping_error_text(int rc)
 {
     switch (rc) {
-    case TS_DP_PING_UNKNOWN: return "unknown peer";
+    case TS_DP_PING_UNKNOWN: return "no matching peer";
     case TS_DP_PING_EXPIRED: return "peer's node key has expired";
-    case TS_DP_PING_NO_DISCO: return "peer has no disco key";
+    case TS_DP_PING_NO_DISCO: return "unknown peer";
     case TS_DP_PING_NO_HOME: return "peer has no home relay";
     case TS_DP_PING_BUSY: return "too many pings in flight";
     case TS_DP_PING_DOWN: return "not connected";
@@ -776,20 +780,28 @@ static const char *ping_error_text(int rc)
 /* Start a ping for c: on success no reply yet (finish_pings builds it). */
 static void start_ping(client *c, const ts_ipc_args *a)
 {
-    int rc;
+    int rc, i, pending = 0;
     uint64_t cookie = ++D.ping_seq;
     char ip[16];
     if (!D.sess || !D.want_up) {
         client_error(c, ping_error_text(TS_DP_PING_DOWN));
         return;
     }
+    for (i = 0; i < TS_IPC_MAX_CLIENTS; i++)
+        if (D.cl[i].fd >= 0 && D.cl[i].ping) pending++;
+    if (pending >= TS_IPC_MAX_PINGS) {
+        client_error(c, "too many pings in progress");
+        return;
+    }
     rc = ts_dpio_ping(a->ip, a->timeout_ms, cookie, now_ms());
     if (rc != 0) {
+        /* Only failures are logged: a ping loop (tsppc ping -c 0) would
+         * otherwise add a line a second. */
+        fmt_ip(ip, sizeof ip, a->ip);
+        logline("ping %s refused: %s", ip, ping_error_text(rc));
         client_error(c, ping_error_text(rc));
         return;
     }
-    fmt_ip(ip, sizeof ip, a->ip);
-    logline("ping %s sent", ip);
     c->ping = 1;
     c->cookie = cookie;
     c->ping_done = 0;

@@ -16,8 +16,13 @@
  * "ping <a.b.c.d> <timeout_ms>" (a disco ping over the peer's home relay;
  * timeout TS_IPC_PING_MIN_MS..TS_IPC_PING_MAX_MS in decimal, no leading
  * zeros). A ping's reply waits for the result: "ok" and a ping line, or
- * "error <text>" ("unknown peer", "peer's node key has expired", "not
- * connected", ...). While a ping is pending the client's deadline is the
+ * "error <text>": upstream's "no matching peer" (no peer has that address),
+ * "unknown peer" (the peer has no disco key: upstream has no endpoint for
+ * it) and "peer's node key has expired"; tsppc's own "peer has no home
+ * relay" (upstream would just time out), "not connected", "too many pings
+ * in progress" (TS_IPC_MAX_PINGS clients already wait, answered at once)
+ * and "too many pings in flight" / "ping failed" (the data plane's limits).
+ * While a ping is pending the client's deadline is the
  * ping timeout plus TS_IPC_PING_MARGIN_MS (not TS_IPC_CLIENT_TIMEOUT_MS), so
  * the daemon's own timeout answers first; a client should wait longer still
  * (the CLI waits the ping timeout plus 3 s). A client that closes, or sends
@@ -82,6 +87,7 @@
 #define TS_IPC_PING_MIN_MS 100        /* a ping request's timeout range */
 #define TS_IPC_PING_MAX_MS 10000
 #define TS_IPC_PING_MARGIN_MS 2000     /* a pending ping's client deadline: its timeout plus this */
+#define TS_IPC_MAX_PINGS 4             /* clients that may wait for a ping at once */
 #define TS_IPC_GROUP "admin"
 #define TS_IPC_GROUP_GID 80            /* admin's gid if the lookup fails */
 

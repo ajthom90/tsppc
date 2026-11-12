@@ -1072,6 +1072,7 @@ static int send_only(const char *sock, const char *req)
 #define PEER2_KEY "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 #define PEER3_KEY "2222222222222222333333333333333344444444444444445555555555555555"
 #define PEER4_KEY "6666666666666666777777777777777788888888888888889999999999999999"
+#define PEER5_KEY "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbccccccccccccccccdddddddddddddddd"
 
 /* tsppcd answers ping requests, through the fake relay playing peer 2: a
  * pong; a silent peer 3: a timeout, also at 10 s; errors for an unknown
@@ -1144,11 +1145,13 @@ static void test_daemon_ping(void)
              "\"DiscoKey\":\"discokey:%s\","
              "\"Addresses\":[\"100.64.0.3/32\"],\"HomeDERP\":%d,\"Online\":true,\"MachineAuthorized\":true},"
              "{\"ID\":4,\"Name\":\"nodisco.example.test.\",\"Key\":\"nodekey:" PEER4_KEY "\","
-             "\"Addresses\":[\"100.64.0.4/32\"],\"HomeDERP\":%d,\"Online\":true,\"MachineAuthorized\":true}],"
+             "\"Addresses\":[\"100.64.0.4/32\"],\"HomeDERP\":%d,\"Online\":true,\"MachineAuthorized\":true},"
+             "{\"ID\":5,\"Name\":\"old.example.test.\",\"Key\":\"nodekey:" PEER5_KEY "\",\"Expired\":true,"
+             "\"Addresses\":[\"100.64.0.5/32\"],\"HomeDERP\":%d,\"Online\":true,\"MachineAuthorized\":true}],"
              "\"DERPMap\":{\"Regions\":{"
              "\"%d\":{\"RegionID\":%d,\"RegionCode\":\"tst\",\"Nodes\":[{\"Name\":\"%da\",\"RegionID\":%d,"
              "\"HostName\":\"derp.example.test\",\"IPv4\":\"127.0.0.1\",\"DERPPort\":%u}]}}}}",
-             d2hex, RELAY_REGION, d3hex, RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION,
+             d2hex, RELAY_REGION, d3hex, RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION,
              RELAY_REGION, (unsigned)rport);
 
     fk_init(&f, NULL, "");
@@ -1183,9 +1186,11 @@ static void test_daemon_ping(void)
     dt = mono_ms() - t0;
     t_true("dping: a silent peer times out on time", strcmp(out, "ok\nping timeout\n") == 0 && dt >= 900 && dt < 3000);
     raw_request(sock, "ping 100.64.0.99 1000\n", 22, out, sizeof out);
-    t_true("dping: an unknown address", strcmp(out, "error unknown peer\n") == 0);
+    t_true("dping: an unknown address", strcmp(out, "error no matching peer\n") == 0);
     raw_request(sock, "ping 100.64.0.4 1000\n", 21, out, sizeof out);
-    t_true("dping: a peer with no disco key", strcmp(out, "error peer has no disco key\n") == 0);
+    t_true("dping: a peer with no disco key", strcmp(out, "error unknown peer\n") == 0);
+    raw_request(sock, "ping 100.64.0.5 1000\n", 21, out, sizeof out);
+    t_true("dping: an expired peer", strcmp(out, "error peer's node key has expired\n") == 0);
     raw_request(sock, "ping 100.64.0.2 99\n", 19, out, sizeof out);
     t_true("dping: a bad request", strcmp(out, "error unknown request\n") == 0);
 
@@ -1206,6 +1211,25 @@ static void test_daemon_ping(void)
     nap_ms(300);
     raw_request(sock, "ping 100.64.0.2 5000\n", 21, out, sizeof out);
     t_true("dping: early closes cancelled their pings", strncmp(out, "ok\nping pong ", 13) == 0);
+
+    /* At most TS_IPC_MAX_PINGS clients wait for a ping; status still works. */
+    {
+        int held[TS_IPC_MAX_PINGS];
+        for (i = 0; i < TS_IPC_MAX_PINGS; i++) held[i] = send_only(sock, "ping 100.64.0.3 5000\n");
+        nap_ms(300);
+        t0 = mono_ms();
+        raw_request(sock, "ping 100.64.0.2 5000\n", 21, out, sizeof out);
+        dt = mono_ms() - t0;
+        t_true("dping: one ping over the limit is refused at once",
+               strcmp(out, "error too many pings in progress\n") == 0 && dt < 2000);
+        raw_request(sock, "status\n", 7, out, sizeof out);
+        t_true("dping: status works with the pings pending", strncmp(out, "ok\nstate RUNNING\n", 17) == 0);
+        for (i = 0; i < TS_IPC_MAX_PINGS; i++)
+            if (held[i] >= 0) close(held[i]);
+        nap_ms(300);
+        raw_request(sock, "ping 100.64.0.2 5000\n", 21, out, sizeof out);
+        t_true("dping: room again once they close", strncmp(out, "ok\nping pong ", 13) == 0);
+    }
 
     /* tsppc ping. */
     {
@@ -1240,11 +1264,11 @@ static void test_daemon_ping(void)
         rc = run_cli_v(a5, out, sizeof out);
         t_true("cli ping: our own IP", rc == 0 && strcmp(out, "100.64.0.1 is local Tailscale IP\n") == 0);
         rc = run_cli_v(a6, out, sizeof out);
-        t_true("cli ping: an unknown IP", rc == 1 && strcmp(out, "unknown peer\n") == 0);
+        t_true("cli ping: an unknown IP", rc == 1 && strcmp(out, "no matching peer\n") == 0);
         rc = run_cli_v(a7, out, sizeof out);
         t_true("cli ping: an unknown name", rc == 1 && strcmp(out, "no peer named \"nobody\"\n") == 0);
         rc = run_cli_v(a11, out, sizeof out);
-        t_true("cli ping: a peer with no disco key", rc == 1 && strcmp(out, "peer has no disco key\n") == 0);
+        t_true("cli ping: a peer with no disco key", rc == 1 && strcmp(out, "unknown peer\n") == 0);
         rc = run_cli_v(a8, out, sizeof out);
         t_true("cli ping: no target is usage", rc == 2);
         rc = run_cli_v(a10, out, sizeof out);
@@ -1267,9 +1291,24 @@ static void test_daemon_ping(void)
         t_true("cli ping: down is stopped", rc == 1 && strcmp(out, "Tailscale is stopped.\n") == 0);
     }
 
+    /* logout answers a pending ping too. */
+    raw_request(sock, "up\n", 3, out, sizeof out);
+    t_true("dping: up for logout", wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 120000));
+    fd = send_only(sock, "ping 100.64.0.3 10000\n");
+    nap_ms(300);
+    raw_request(sock, "logout\n", 7, out, sizeof out);
+    t_true("dping: logout accepted", strncmp(out, "ok\n", 3) == 0);
+    if (fd >= 0) {
+        dt = read_until_close(fd, out, sizeof out, 8000);
+        t_true("dping: logout answers the pending ping", strcmp(out, "error not connected\n") == 0 && dt < 5000);
+        close(fd);
+    }
+
     /* SIGTERM with a ping pending: an error or EOF, at once. */
     raw_request(sock, "up\n", 3, out, sizeof out);
     t_true("dping: up again", wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 120000));
+    /* The log names no ping that went out fine. */
+    t_true("dping: pings sent are not logged", !file_has(logpath, "ping 100.64.0.2"));
     fd = send_only(sock, "ping 100.64.0.3 10000\n");
     nap_ms(300);
     kill(pid, SIGTERM);

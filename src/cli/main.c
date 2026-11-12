@@ -52,7 +52,8 @@ static long mono_s(void)
 static void usage(void)
 {
     fprintf(stderr, "usage: tsppc <up|down|status|ip|logout>\n"
-                    "       tsppc ping [-c N] [--timeout DUR] [--until-direct=BOOL] <name|IP>\n");
+                    "       tsppc ping [-c N] [--timeout DUR] [--until-direct=BOOL] <name|IP>\n"
+                    "                  (-c 0: no limit; --timeout from 100ms to 10s, default 5s)\n");
 }
 
 static void sleep_ms(int ms)

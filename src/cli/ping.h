@@ -40,7 +40,8 @@ void ts_ping_duration(char *out, size_t cap, uint64_t latency_us);
 /* The first label of a DNS name ("peer" of "peer.example.ts.net."). */
 void ts_ping_first_label(char *out, size_t cap, const char *name);
 
-/* `pong from <label> (<ip>) via DERP(<code>) in <latency>` (no newline). A
+/* `pong from <label> (<ip>) via DERP(<code>) in <latency>` (no newline). An
+ * empty label prints the IP instead (upstream falls back to the hostname). A
  * code of "-" (the daemon knows none) prints as "" (upstream's empty code). */
 void ts_ping_pong_line(char *out, size_t cap, const char *label, uint32_t ip, const char *code,
                        uint32_t latency_us);

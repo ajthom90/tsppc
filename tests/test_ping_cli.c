@@ -140,6 +140,8 @@ static void test_lines(void)
     t_true("pong line", strcmp(b, "pong from peer (100.64.0.2) via DERP(nyc) in 23ms") == 0);
     ts_ping_pong_line(b, sizeof b, "peer", 0x64400002u, "-", 1500000);
     t_true("pong line: unknown code, seconds", strcmp(b, "pong from peer (100.64.0.2) via DERP() in 1.5s") == 0);
+    ts_ping_pong_line(b, sizeof b, "", 0x64400002u, "nyc", 23456);
+    t_true("pong line: no label, the IP", strcmp(b, "pong from 100.64.0.2 (100.64.0.2) via DERP(nyc) in 23ms") == 0);
     ts_ping_pong_line(b, sizeof b, "p", 0x64400002u, "nyc", 200);
     t_true("pong line: 0s", strcmp(b, "pong from p (100.64.0.2) via DERP(nyc) in 0s") == 0);
 }
