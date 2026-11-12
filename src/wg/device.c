@@ -696,6 +696,27 @@ void ts_wg_tick(ts_wg_dev *d, int64_t now_ms)
     }
 }
 
+void ts_wg_reset_sessions(ts_wg_dev *d)
+{
+    size_t i;
+    for (i = 0; i < TS_MAX_PEERS; i++) {
+        peer *p = d->peers[i];
+        if (!p) continue;
+        zero_and_flush(p);   /* keypairs, handshake, cookie, staged packets */
+        ts_wipe(p->last_mac1, sizeof p->last_mac1);
+        p->last_mac1_index = 0;
+        p->have_mac1 = 0;
+        p->cookie_at = 0;
+        p->last_sent_hs = NEVER;
+        p->t_retransmit = p->t_keepalive = p->t_new_hs = p->t_zero = OFF;
+        p->need_another_keepalive = 0;
+        p->attempts = 0;
+        p->sent_last_minute = 0;
+        /* Kept: key, ipv4, ss, stats, and last_ts / last_init_ok, so an old
+         * initiation replayed after the reset is still refused. */
+    }
+}
+
 int ts_wg_peer_stats(const ts_wg_dev *d, const uint8_t key[32], ts_wg_stats *out)
 {
     const peer *p = find(d, key);

@@ -36,6 +36,7 @@ typedef struct {
     const char *dead_why;
     int sending_packet;  /* inside ts_derp_send_packet: a frame with no room is dropped */
     int ever_ready;      /* reached ready since the last dial */
+    int rebind;          /* dial at the next redial time even if not home and nothing queued */
     size_t node;         /* which of the region's nodes the next dial uses */
     int64_t last_write;  /* last WireGuard message queued or sent (or created) */
     int64_t redial_at;
@@ -222,6 +223,7 @@ static void slot_free(slot *s)
     s->dead = 0;
     s->dead_why = NULL;
     s->ever_ready = 0;
+    s->rebind = 0;
     s->node = 0;
     s->backoff = TS_DP_REDIAL_MIN_MS;
 }
@@ -291,6 +293,7 @@ static void dial(slot *s)
     ts_derp_init(s->d, host, dp->priv, s->region == dp->home, &DERP_IO, s);
     s->state = S_DIALING;
     s->ever_ready = 0;
+    s->rebind = 0;
     s->dead = 0;
     if (s->d->err || dp->io.dial(dp->user, s->idx, node) != 0) {
         s->state = S_BACKOFF;   /* no stream to close */
@@ -935,11 +938,31 @@ void ts_dp_tick(ts_dp *dp, int64_t now_ms)
         if (s->state == S_UP && s->dead) {
             slot_down(s, 1, s->dead_why);
         } else if (s->state == S_BACKOFF && now_ms >= s->redial_at) {
-            if (s->region == dp->home || s->qn > 0) dial(s);
+            if (s->region == dp->home || s->qn > 0 || s->rebind) dial(s);
             else slot_free(s);
         }
     }
     ensure_home(dp);
+}
+
+void ts_dp_rebind(ts_dp *dp, int64_t now_ms)
+{
+    int i;
+    if (!dp->running) return;
+    for (i = 0; i < TS_DP_MAX_CONNS; i++) {
+        slot *s = dp->slots[i];
+        if (s->state == S_FREE) continue;
+        if (s->state == S_DIALING || s->state == S_UP) dp->io.conn_close(dp->user, s->idx);
+        ts_derp_free(s->d);
+        s->state = S_BACKOFF;   /* the queue is kept */
+        s->dead = 0;
+        s->dead_why = NULL;
+        s->ever_ready = 0;
+        s->backoff = TS_DP_REDIAL_MIN_MS;
+        s->redial_at = now_ms;
+        s->rebind = 1;
+    }
+    ts_wg_reset_sessions(dp->wg);
 }
 
 int ts_dp_pick_home(const ts_derp_region *r, size_t n, const int *lat_ms, int current,

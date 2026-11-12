@@ -60,6 +60,7 @@ static struct {
     int home;                  /* the home chosen by the last probe round (kept across restarts) */
     int cur;                   /* the home the data plane has now (ts_dp_set_home), 0 none */
     int stopping;
+    int rebinding;             /* inside ts_dpio_rebind: closes are not failures */
     int home_fails;            /* home connection failures with the home never up in between */
     int64_t start_retry_at;
 
@@ -119,7 +120,7 @@ static void slot_close(rslot *s)
 /* A home connection failed (never counted while stopping). */
 static void note_home_fail(int region)
 {
-    if (G.running && !G.stopping && region > 0 && region == G.cur) G.home_fails++;
+    if (G.running && !G.stopping && !G.rebinding && region > 0 && region == G.cur) G.home_fails++;
 }
 
 /* The region holding this node in the netmap the data plane was last given.
@@ -907,6 +908,32 @@ void ts_dpio_get_view(ts_dpio_view *v)
     snprintf(v->problem, sizeof v->problem, "%s%s%s", G.tun_problem, G.tun_problem[0] && ds.problem[0] ? "; " : "",
              ds.problem);
 }
+
+void ts_dpio_rebind(const char *why, int probe_again)
+{
+    int i;
+    if (!G.dp || !G.running || G.stopping || G.rebinding) return;
+    /* G.now, never later than the next sync's time: that tick redials. */
+    G.log("rebinding relays (%s)", why ? why : "");
+    G.rebinding = 1;
+    ts_dp_rebind(G.dp, G.now);
+    G.rebinding = 0;
+    for (i = 0; i < TS_DP_MAX_CONNS; i++)
+        if (G.s[i].phase != R_NONE || G.s[i].fd >= 0) slot_close(&G.s[i]);
+    G.home_fails = 0;
+    G.up_logged = 0;   /* "connected (home)" is logged again */
+    if (probe_again) {
+        probes_cancel();
+        G.probe_want = 1;
+    }
+}
+
+#ifdef TS_TEST_HOOKS
+int ts_dpio_test_probe_wanted(void)
+{
+    return G.probe_want && !G.probing;
+}
+#endif
 
 void ts_dpio_set_ping_cb(ts_dpio_ping_fn fn, void *user)
 {

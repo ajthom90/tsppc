@@ -39,6 +39,7 @@ void test_dp_disco_pong(void);
 void test_dp_disco_limits(void);
 void test_dp_disco_ping(void);
 void test_dp_disco_keys(void);
+void test_dp_rebind(void);
 void test_tun_cmds(void);
 void test_dpio(void);
 void test_names_io(void);
@@ -85,6 +86,7 @@ int main(void)
     test_dp_disco_limits();
     test_dp_disco_ping();
     test_dp_disco_keys();
+    test_dp_rebind();
     test_tun_cmds();
     test_dpio();
     test_names_io();

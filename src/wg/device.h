@@ -68,6 +68,13 @@ void ts_wg_tick(ts_wg_dev *d, int64_t now_ms);  /* call at least every 250 ms */
  * (priority packets included; keepalives and handshakes not) and their IP
  * bytes. */
 int ts_wg_peer_stats(const ts_wg_dev *d, const uint8_t key[32], ts_wg_stats *out);
+/* After a network change or a wake: wipe every peer's keypairs and any
+ * handshake in progress (with its cookie and staged packets), and forget
+ * queued handshake retries and timers. Peers, their addresses, statistics
+ * and the replay protection for received initiations (newest TAI64N) stay.
+ * The next packet to a peer starts a new handshake at once (the 5 s limit
+ * between initiations starts over). */
+void ts_wg_reset_sessions(ts_wg_dev *d);
 /* Take one Diffie-Hellman operation from the handshake budget (at most
  * TS_WG_HS_PER_SEC in any second, shared with received handshakes) for work
  * outside the device (disco box keys). 1 taken, 0 over budget. */

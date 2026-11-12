@@ -84,6 +84,13 @@ void ts_dpio_fds(fd_set *r, fd_set *w, int *maxfd, int64_t *timeout_ms);
 /* After select. While a ping is outstanding it ticks the data plane first
  * (pong latency, timeouts on time); otherwise the tick waits for sync. */
 void ts_dpio_events(fd_set *r, fd_set *w, int64_t now_ms);
+/* After a wake or a network change: logs "rebinding relays (<why>)", calls
+ * ts_dp_rebind and closes every relay socket; the relays are dialed again at
+ * the next sync. With probe_again, a running home probe round is cancelled
+ * and a new one starts at the next sync. The tun device, its address and the
+ * route are untouched, so connections over the tailnet address survive.
+ * Nothing unless the data plane is running. Not from inside a callback. */
+void ts_dpio_rebind(const char *why, int probe_again);
 /* Stop everything (signals, exit) and free. */
 void ts_dpio_shutdown(void);
 
@@ -127,6 +134,8 @@ extern int (*ts_dpio_test_tun_open)(char ifname[16]);
 extern int (*ts_dpio_test_run)(const char *const *argv);
 /* Data-plane ticks ts_dpio_events made (only while a ping is outstanding). */
 extern unsigned long ts_dpio_test_event_ticks;
+/* 1 if a home probe round is wanted and has not started yet. */
+int ts_dpio_test_probe_wanted(void);
 #endif
 
 #endif

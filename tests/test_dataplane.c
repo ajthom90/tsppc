@@ -2047,3 +2047,89 @@ void test_dp_disco_keys(void)
     t_true("keys: stop wipes", !ts_dp_test_has_disco_priv(N[0].dp) && ts_dp_test_disco_keys(N[0].dp) == 0);
     nodes_free();
 }
+
+/* Rebind: every open relay connection is closed and dialed again at the next
+ * tick, WireGuard sessions are dropped, pending pings are kept; nothing while
+ * stopped. */
+void test_dp_rebind(void)
+{
+    tnode *a = &N[0];
+    int nclose, ndial, nres, s1, s2, r1 = 0, r2 = 0, i;
+    ts_dp_status st;
+
+    mk_key(s_priv, s_pub, 99);
+    setup(2, ALLOW_ALL_ICMP);
+    t_true("rebind: ping", ping(0, 1, 1));
+    ts_dp_set_home(a->dp, 2);   /* region 1 stays open for B, region 2 is home */
+    advance(300);
+    s1 = slot_of(a, 1);
+    s2 = slot_of(a, 2);
+    t_true("rebind: both up", s1 >= 0 && s2 >= 0 && a->c[s1].up && a->c[s2].up && ST(0).home_up);
+    t_true("rebind: keys for B", ts_dp_test_has_keys(a->dp, N[1].pub) == 1);
+    t_true("rebind: a ping outstanding", ts_dp_ping(a->dp, N[1].ip, 2000, 55, g_now) == 0);
+    nres = a->nres;
+    nclose = a->nclose;
+    ndial = a->ndial;
+    ts_dp_rebind(a->dp, g_now);
+    t_true("rebind: both closed", a->nclose == nclose + 2);
+    for (i = nclose; i < a->nclose && i < 32; i++) {
+        r1 |= a->closed_region[i] == 1;
+        r2 |= a->closed_region[i] == 2;
+    }
+    t_true("rebind: regions 1 and 2 closed", r1 && r2);
+    t_true("rebind: nothing dialed yet", a->ndial == ndial);
+    t_true("rebind: B's keys gone", ts_dp_test_has_keys(a->dp, N[1].pub) == 0);
+    t_true("rebind: the ping is not ended", a->nres == nres);
+    ts_dp_get_status(a->dp, &st);
+    t_true("rebind: home down meanwhile", st.home == 2 && !st.home_up);
+    ts_dp_tick(a->dp, g_now);
+    t_true("rebind: both dialed again at the same time", a->ndial == ndial + 2 && slot_of(a, 1) >= 0 &&
+                                                            slot_of(a, 2) >= 0);
+    pump();
+    t_true("rebind: home up again", ST(0).home_up);
+    t_true("rebind: traffic flows after a new handshake", ping(0, 1, 2) && ping(1, 0, 3));
+    t_true("rebind: keys again", ts_dp_test_has_keys(a->dp, N[1].pub) == 1);
+    advance(2500);
+    t_true("rebind: the old ping times out", a->nres == nres + 1 && a->res_cookie[nres] == 55 &&
+                                                 a->res_status[nres] == TS_DP_PING_TIMEOUT);
+    t_true("rebind: no bad callbacks", a->bad_tun == 0 && N[1].bad_tun == 0);
+
+    /* The backoff starts over: a home that failed while dialing waits 4 s,
+     * 8 s, ...; after a rebind its next failure waits at most 1 s. */
+    a->auto_up = 0;
+    for (i = 0; i < 4; i++) {
+        s2 = slot_of(a, 2);
+        if (s2 >= 0) down(a, s2);
+        advance(TS_DP_REDIAL_MAX_MS);
+    }
+    s2 = slot_of(a, 2);
+    t_true("rebind: home dialing after failures", s2 >= 0 && !a->c[s2].up);
+    ndial = a->ndial;
+    ts_dp_rebind(a->dp, g_now);
+    ts_dp_tick(a->dp, g_now);
+    s2 = slot_of(a, 2);
+    t_true("rebind: a dialing slot is dialed again", a->ndial == ndial + 1 && s2 >= 0);
+    if (s2 >= 0) down(a, s2);
+    ndial = a->ndial;
+    advance(TS_DP_REDIAL_MIN_MS);
+    t_true("rebind: backoff reset to the minimum", a->ndial == ndial + 1 && slot_of(a, 2) >= 0);
+    /* A slot waiting in backoff is dialed at once too. */
+    s2 = slot_of(a, 2);
+    if (s2 >= 0) down(a, s2);
+    ndial = a->ndial;
+    ts_dp_rebind(a->dp, g_now);
+    ts_dp_tick(a->dp, g_now);
+    t_true("rebind: a slot in backoff is dialed at once", a->ndial == ndial + 1 && slot_of(a, 2) >= 0);
+    a->auto_up = 1;
+    pump();
+    t_true("rebind: home up at the end", ST(0).home_up);
+
+    /* Stopped: nothing. */
+    ts_dp_stop(a->dp);
+    nclose = a->nclose;
+    ndial = a->ndial;
+    ts_dp_rebind(a->dp, g_now);
+    ts_dp_tick(a->dp, g_now);
+    t_true("rebind: stopped, no calls", a->nclose == nclose && a->ndial == ndial);
+    nodes_free();
+}
