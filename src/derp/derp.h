@@ -19,7 +19,9 @@
  *   - We send ClientInfo: our public key, a random 24-byte nonce and a NaCl
  *     box (node key to relay key) of {"version":2,"CanAckPings":true}.
  *   - ServerInfo (nonce, box from the relay key to the node key, JSON) must
- *     open and hold valid JSON; then the connection is ready. TokenBucket
+ *     be the next frame (any other is fatal: nothing is acted on before the
+ *     relay is verified), open and hold valid JSON; then the connection is
+ *     ready. TokenBucket
  *     fields are ignored. Any later ServerInfo is checked the same way.
  *   - Ready and preferred: NotePreferred(1).
  *   - Ping (at least 8 bytes) is answered with a Pong of its first 8 bytes.

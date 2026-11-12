@@ -293,6 +293,32 @@ void test_derp_handshake(void)
     put(s, &at, RESP101, sizeof RESP101 - 1);
     frame(s, &at, TS_DERP_KEEP_ALIVE, NULL, 0);
     t_true("derp: first frame not server key", ts_derp_feed(D, s, at, 1000) == -1);
+    /* Before ServerInfo only ServerInfo is accepted: RecvPacket, Ping, Health
+     * and PeerGone are fatal, with no callback and nothing sent. */
+    {
+        static const int types[4] = { TS_DERP_RECV_PACKET, TS_DERP_PING, TS_DERP_HEALTH,
+                                      TS_DERP_PEER_GONE };
+        static const char *const names[4] = { "derp: recv packet before server info",
+                                               "derp: ping before server info",
+                                               "derp: health before server info",
+                                               "derp: peer gone before server info" };
+        uint8_t body[40], g2[512];
+        size_t k, before;
+        int i;
+        memcpy(body, peer, 32);
+        memcpy(body + 32, "abcdefgh", 8);
+        for (i = 0; i < 4; i++) {
+            k = 0;
+            put(g2, &k, RESP101, sizeof RESP101 - 1);
+            server_key_frame(g2, &k);
+            frame(g2, &k, types[i], body, 40);
+            server_info_frame(g2, &k, s_priv, INFO_JSON);
+            client_new(0);
+            before = sizeof REQUEST - 1 + 5 + 104;   /* request and ClientInfo */
+            t_true(names[i], ts_derp_feed(D, g2, k, 1000) == -1 && !ts_derp_ready(D) &&
+                             log_n == 0 && sent_n == before && D->err != NULL);
+        }
+    }
     /* A longer ServerKey (future use) is fine. */
     client_new(0);
     at = 0;

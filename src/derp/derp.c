@@ -124,6 +124,9 @@ static int frame_keep(ts_derp *d, int type, uint32_t len, uint32_t *keep)
         *keep = 40;
         return 0;
     }
+    /* Nothing is acted on until the relay has proved its key. */
+    if (d->state == DS_INFO && type != TS_DERP_SERVER_INFO)
+        return fail(d, "relay sent a frame before its server info");
     switch (type) {
     case TS_DERP_SERVER_INFO:
         if (len > sizeof d->rbuf) return fail(d, "relay server info too long");
