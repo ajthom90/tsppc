@@ -175,3 +175,9 @@ check.
 - `--timeout` accepts 100ms to 10s. Names resolve only to tailnet peers (full name, or its first label); there is no fallback to the system resolver.
 - "peer has no home relay" is tsppc's own message; upstream would time out instead.
 - Jailed and WireGuard-only peers are not configured in tsppc's data plane, so `tsppc ping` to them says `no matching peer` although `tsppc status` lists them; upstream would ping them.
+
+## File sharing over the relay (milestones 5 and 6)
+
+- Until direct paths (milestone 8), every byte goes through a relay round trip, about 45 ms on the test setup. Bulk copies are fine: 20 MB took 38 s each way over AFP, and 38 s for a write over SMB.
+- Reads by Tiger's SMB client (`mount_smbfs`) from Mac OS X's Samba ran at about 22 KB/s (20 MB in 924 s). The client asked for 1 KB per request, so each kilobyte cost a full round trip. That's the old SMB client, not tsppc. Prefer AFP between old Macs.
+- Tiger's AFP client did not mount from an SSH-only session; it needs a logged-in user. See `docs/services-check.md`.

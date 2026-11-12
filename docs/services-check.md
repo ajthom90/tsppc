@@ -38,7 +38,7 @@ Copy new binaries to a temporary name and `mv` them into place: `cp` over the fi
 | SIGTERM | block removed |
 | Owner's part of `/etc/hosts` across all of the above | identical (same MD5 outside the block) |
 
-**Test environment caveat.** On these VMs a tailnet name resolves even without the block: the guests' DNS (UTM's resolver, which forwards to the host Mac, and on Leopard also a DNS server on the host's LAN) answers tailnet names through the host's own Tailscale. So "the name still resolves after `down`" is expected here, and resolving is not proof that the hosts file is used. On Leopard the flat-file query above is that proof. Tiger's `lookupd` has no equivalent query that runs without a terminal; on Tiger the check covers the block's contents and its removal, and milestone 6 repeats it.
+**Test environment caveat.** On these VMs a tailnet name resolves even without the block: the guests' DNS (UTM's resolver, which forwards to the host Mac, and on Leopard also a DNS server on the host's LAN) answers tailnet names through the host's own Tailscale. So "the name still resolves after `down`" is expected here, and resolving is not proof that the hosts file is used. On Leopard the flat-file query above is that proof. Tiger's `lookupd` has no equivalent query that runs without a terminal; on Tiger the check covers the block's contents and its removal. Milestone 6 found a Tiger query that does work from SSH: see `docs/tiger-check.md`.
 
 ## SSH
 
