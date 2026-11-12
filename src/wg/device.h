@@ -84,6 +84,10 @@ long ts_wg_transport_open(uint8_t *out, const uint8_t key[32], const uint8_t *ms
 extern unsigned long ts_wg_test_dh_count;
 /* 1 if the peer holds any key material (keypair or handshake state). */
 int ts_wg_test_has_keys(const ts_wg_dev *d, const uint8_t key[32]);
+/* The peer's keypairs in order current, previous, next: live[i] is 1 for a
+ * keypair in use and idx[i] its local (receiver) index, 0 otherwise. 0, or -1
+ * for an unknown peer. */
+int ts_wg_test_keypairs(const ts_wg_dev *d, const uint8_t key[32], uint32_t idx[3], int live[3]);
 #endif
 
 #endif

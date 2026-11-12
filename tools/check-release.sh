@@ -14,7 +14,7 @@ if [ "${1:-}" = --cli ]; then
     SYMS="getenv"
     STRS="TSPPC_SOCKET"
 else
-    SYMS="ts_noise_init_eph ts_resolve_test_delay ts_wg_test_dh_count ts_wg_test_has_keys ts_dp_test_counters ts_dp_test_on_deliver ts_dp_test_has_keys getenv"
+    SYMS="ts_noise_init_eph ts_resolve_test_delay ts_wg_test_dh_count ts_wg_test_has_keys ts_wg_test_keypairs ts_dp_test_counters ts_dp_test_on_deliver ts_dp_test_has_keys getenv"
     STRS="TSPPC_STATE_DIR TSPPC_SOCKET TSPPC_CONTROL TSPPC_CONTROL_KEY TSPPC_NO_TUN TSPPC_DERP_PLAIN"
 fi
 REL=${1:?usage: $0 [--cli] <release program> [<hooked program>]}

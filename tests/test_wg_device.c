@@ -425,22 +425,6 @@ static void test_wgdev_timers(void)
     uint8_t held[MSGMAX];
     size_t heldn;
 
-    /* Rekey at 120 s, initiator side, triggered by sending. */
-    setup();
-    establish();
-    run_until(119000);
-    node_reset_counts(&N[0]);
-    send_ip(0, 1, 1, 28);
-    pump();
-    t_true("rekey: no initiation before 120 s", N[0].nsent[1] == 0 && N[0].nsent[4] >= 1);
-    run_until(120250);
-    node_reset_counts(&N[0]);
-    send_ip(0, 1, 2, 28);
-    t_true("rekey: data still sent, then an initiation", N[0].nsent[4] >= 1 && N[0].nsent[1] == 1);
-    pump();
-    t_true("rekey: new handshake complete", N[1].ndeliv >= 2);
-    teardown();
-
     /* A session is dead at 180 s with no traffic. */
     setup();
     establish();
@@ -512,6 +496,295 @@ static void test_wgdev_timers(void)
     send_ip(0, 1, 10, 28);
     pump();
     t_true("wipe: new session works", N[1].ndeliv == 1);
+    teardown();
+}
+
+/* ---- Rekeying ------------------------------------------------------------ */
+
+static void keypairs(int n, int of, uint32_t idx[3], int live[3])
+{
+    if (ts_wg_test_keypairs(N[n].d, N[of].pub, idx, live) != 0) {
+        memset(idx, 0, 3 * sizeof idx[0]);
+        memset(live, 0, 3 * sizeof live[0]);
+    }
+}
+
+static int has_index(int n, int of, uint32_t v)
+{
+    uint32_t idx[3];
+    int live[3], i;
+    keypairs(n, of, idx, live);
+    for (i = 0; i < 3; i++)
+        if (live[i] && idx[i] == v) return 1;
+    return 0;
+}
+
+typedef struct {
+    int rot;                  /* rotations of node 0's (the initiator's) current keypair */
+    int64_t at[8];            /* when each was seen */
+    int deliv_ok;             /* every packet both ways was delivered */
+    int prev_ok;              /* after each rotation, previous == the old current */
+    int retired_ok;           /* the keypair before that is gone on both sides */
+    int peer_ok;              /* the responder's current changed with it */
+    int new_key_ok;           /* the first packet after each rotation went under the new keypair */
+    int checked_new;          /* how many such packets were checked */
+} rekey_log;
+
+/* Every second until `until`: `sender` sends one packet to the other node
+ * (and the other replies if echo). Node 0 holds the initiator's keypair. */
+static void rekey_traffic(rekey_log *r, int sender, int echo, int64_t until)
+{
+    uint32_t a[3], b[3], a_cur, a_prev, b_cur, b_prev;
+    int al[3], bl[3], check_new = 0;
+    int64_t t;
+    int other = 1 - sender;
+
+    memset(r, 0, sizeof *r);
+    r->deliv_ok = r->prev_ok = r->retired_ok = r->peer_ok = r->new_key_ok = 1;
+    keypairs(0, 1, a, al);
+    keypairs(1, 0, b, bl);
+    a_cur = a[0];
+    a_prev = al[1] ? a[1] : 0;
+    b_cur = b[0];
+    b_prev = bl[1] ? b[1] : 0;
+    for (t = now_ms - now_ms % 1000 + 1000; t <= until; t += 1000) {
+        int before;
+        run_until(t);
+        before = N[other].ndeliv;
+        send_ip(sender, other, (uint8_t)(t / 1000), 28);
+        if (check_new) {
+            /* The data message just sent names the receiver's current
+             * keypair (the new one) and is delivered under it. */
+            uint32_t idx[3];
+            int live[3];
+            keypairs(other, sender, idx, live);
+            if (!live[0] || ts_get_le32(N[sender].last_sent[4] + 4) != idx[0]) r->new_key_ok = 0;
+            r->checked_new++;
+            check_new = 0;
+        }
+        pump();
+        if (N[other].ndeliv != before + 1) r->deliv_ok = 0;
+        if (echo) {
+            before = N[sender].ndeliv;
+            send_ip(other, sender, (uint8_t)(t / 1000), 28);
+            pump();
+            if (N[sender].ndeliv != before + 1) r->deliv_ok = 0;
+        }
+        keypairs(0, 1, a, al);
+        keypairs(1, 0, b, bl);
+        if (al[0] && a[0] != a_cur) {
+            if (r->rot < 8) r->at[r->rot] = t;
+            r->rot++;
+            if (!al[1] || a[1] != a_cur) r->prev_ok = 0;
+            if (!bl[0] || b[0] == b_cur || !bl[1] || b[1] != b_cur) r->peer_ok = 0;
+            /* The keypairs before the old current are wiped on both sides. */
+            if (a_prev && has_index(0, 1, a_prev)) r->retired_ok = 0;
+            if (b_prev && has_index(1, 0, b_prev)) r->retired_ok = 0;
+            check_new = 1;
+            a_prev = a_cur;
+            a_cur = a[0];
+            b_prev = b_cur;
+            b_cur = b[0];
+        }
+    }
+}
+
+/* tsppc as initiator: node 0 sends every second and node 1 replies. The
+ * initiator rekeys after 120 s (on sending), so three rotations by 400 s. */
+static void test_wgdev_rekey_initiator(void)
+{
+    rekey_log r;
+    setup();
+    establish();
+    rekey_traffic(&r, 0, 1, 400000);
+    t_true("rekey init: three rotations by 400 s", r.rot == 3);
+    t_true("rekey init: first just after 120 s", r.at[0] > 120000 && r.at[0] <= 122000);
+    t_true("rekey init: then every ~120 s",
+           r.at[1] - r.at[0] > 120000 && r.at[1] - r.at[0] <= 122000 && r.at[2] - r.at[1] > 120000 &&
+               r.at[2] - r.at[1] <= 122000);
+    t_true("rekey init: delivery never stopped", r.deliv_ok);
+    t_true("rekey init: previous is the old current", r.prev_ok);
+    t_true("rekey init: the responder rotated too", r.peer_ok);
+    t_true("rekey init: older keypairs retired on both sides", r.retired_ok);
+    t_true("rekey init: packets after each rekey use the new keypair", r.new_key_ok && r.checked_new == 3);
+    t_true("rekey init: one initiation per rotation", N[0].nsent[1] == 3 && N[1].nsent[1] == 0);
+    teardown();
+}
+
+/* tsppc as responder: node 1 (the responder) is the only one sending data;
+ * node 0 answers with keepalives only, which rekey it after 120 s. */
+static void test_wgdev_rekey_responder(void)
+{
+    rekey_log r;
+    setup();
+    establish();
+    rekey_traffic(&r, 1, 0, 410000);
+    t_true("rekey resp: rotations by 410 s", r.rot >= 2 && r.rot <= 3);
+    t_true("rekey resp: first after 120 s, before the session dies",
+           r.at[0] > 120000 && r.at[0] < 180000 - 10000);
+    t_true("rekey resp: second before the first dies",
+           r.at[1] - r.at[0] > 120000 && r.at[1] - r.at[0] < 180000 - 10000);
+    t_true("rekey resp: delivery never stopped", r.deliv_ok);
+    t_true("rekey resp: previous is the old current", r.prev_ok);
+    t_true("rekey resp: the responder rotated too", r.peer_ok);
+    t_true("rekey resp: older keypairs retired on both sides", r.retired_ok);
+    t_true("rekey resp: the responder's packets after each rekey use the new keypair",
+           r.new_key_ok && r.checked_new == r.rot);
+    t_true("rekey resp: the responder never initiated", N[1].nsent[1] == 0);
+    teardown();
+}
+
+/* A hand-driven initiator X (node 0's key, wireguard-go's order: on the
+ * response, current -> previous, new -> current, then a keepalive) against
+ * the device of node 1 as responder. */
+typedef struct {
+    ts_wg_static me;
+    uint8_t ss[32];
+    uint8_t send[32], recv[32];      /* current */
+    uint8_t psend[32], precv[32];    /* previous */
+    uint32_t local, remote, plocal;
+    uint64_t ctr, pctr;
+    int64_t ts;
+} xinit;
+
+static xinit X;
+
+/* Pop everything node 1 sent to node 0. A response is returned in resp; the
+ * receiver index of the last transport message in *rx_idx, and whether X
+ * could open every transport message in *open_ok. */
+static int x_drain(uint8_t resp[TS_WG_RESP_LEN], uint32_t *rx_idx, int *open_ok)
+{
+    int got = 0;
+    *open_ok = 1;
+    while (q_len) {
+        qmsg *q = &Q[q_head];
+        q_head = (q_head + 1) % QCAP;
+        q_len--;
+        if (q->dst != 0) continue;
+        if (ts_get_le32(q->m) == 2 && q->n == TS_WG_RESP_LEN) {
+            memcpy(resp, q->m, TS_WG_RESP_LEN);
+            got = 1;
+        } else if (ts_get_le32(q->m) == 4) {
+            uint8_t out[MSGMAX];
+            uint32_t r = ts_get_le32(q->m + 4);
+            const uint8_t *k = r == X.local ? X.recv : r == X.plocal ? X.precv : NULL;
+            *rx_idx = r;
+            if (!k || ts_wg_transport_open(out, k, q->m, q->n) < 0) *open_ok = 0;
+        }
+    }
+    return got;
+}
+
+/* X's handshake: initiation to node 1, its response consumed, rotation. */
+static int x_handshake(uint32_t idx)
+{
+    ts_wg_hs hs;
+    uint8_t m[TS_WG_INIT_LEN], resp[TS_WG_RESP_LEN], eph[32], ts[12];
+    uint32_t sender, rx = 0;
+    int ok;
+    memset(eph, 0x30 + (int)idx, 32);
+    ts_wg_tai64n(ts, X.ts++, 0);
+    if (ts_wg_create_init(&hs, &X.me, N[1].pub, X.ss, idx, eph, ts, NULL, m) != 0) return -1;
+    ts_wg_receive(N[1].d, N[0].pub, m, sizeof m);
+    if (!x_drain(resp, &rx, &ok) || ts_wg_consume_resp(&hs, &X.me, resp, &sender) != 0) return -1;
+    memcpy(X.psend, X.send, 32);
+    memcpy(X.precv, X.recv, 32);
+    X.plocal = X.local;
+    X.pctr = X.ctr;
+    X.local = idx;
+    X.remote = hs.remote_index;
+    X.ctr = 0;
+    ts_wg_derive(&hs, 1, X.send, X.recv);
+    return 0;
+}
+
+/* A transport message from X under its current keypair (n = 0: keepalive). */
+static size_t x_seal(uint8_t *out, uint8_t id, size_t n)
+{
+    uint8_t b[64];
+    if (n) mk_ip(b, n, N[0].ip, N[1].ip, id);
+    return ts_wg_transport_seal(out, X.send, X.remote, X.ctr++, b, n);
+}
+
+static int x_send(uint8_t id, size_t n)
+{
+    uint8_t m[128];
+    size_t len = x_seal(m, id, n);
+    int before = N[1].ndeliv;
+    ts_wg_receive(N[1].d, N[0].pub, m, len);
+    return N[1].ndeliv - before;
+}
+
+static void test_wgdev_rekey_hand_initiator(void)
+{
+    uint8_t held1[128], held1b[128], held2[128], resp[TS_WG_RESP_LEN];
+    size_t n1, n1b, n2;
+    uint32_t idx[3], b1, b2, b3, rx = 0;
+    int live[3], ok, before;
+
+    setup();
+    memset(&X, 0, sizeof X);
+    ts_wg_static_init(&X.me, N[0].priv);
+    ts_x25519(X.ss, N[0].priv, N[1].pub);
+    X.ts = 1750000000;
+    now_ms = 1000;
+    ts_wg_tick(N[1].d, now_ms);
+
+    /* First handshake: the responder holds it as next until X speaks. */
+    t_true("hand: first handshake", x_handshake(0x1001) == 0);
+    keypairs(1, 0, idx, live);
+    b1 = idx[2];
+    t_true("hand: response leaves next only", !live[0] && !live[1] && live[2] && b1 == X.remote);
+    t_true("hand: keepalive confirms it", x_send(0, 0) == 0);
+    keypairs(1, 0, idx, live);
+    t_true("hand: next became current", live[0] && idx[0] == b1 && !live[1] && !live[2]);
+    t_true("hand: data delivered", x_send(1, 28) == 1);
+    send_ip(1, 0, 2, 28);
+    x_drain(resp, &rx, &ok);
+    t_true("hand: responder sends to X's index and X opens it", rx == 0x1001 && ok);
+    n1 = x_seal(held1, 3, 28);    /* withheld, old keypair */
+    n1b = x_seal(held1b, 4, 28);
+
+    /* Second handshake at 10 s. */
+    now_ms = 10000;
+    ts_wg_tick(N[1].d, now_ms);
+    t_true("hand: second handshake", x_handshake(0x2002) == 0);
+    keypairs(1, 0, idx, live);
+    b2 = idx[2];
+    t_true("hand: new keypair is next, current kept", live[0] && idx[0] == b1 && live[2] && b2 == X.remote && b2 != b1);
+    send_ip(1, 0, 5, 28);
+    x_drain(resp, &rx, &ok);
+    t_true("hand: responder still sends under the old keypair until it hears the new one",
+           rx == 0x1001 && ok);
+    t_true("hand: X's keepalive under the new keypair rotates", x_send(0, 0) == 0);
+    keypairs(1, 0, idx, live);
+    t_true("hand: previous = old, current = new", live[0] && idx[0] == b2 && live[1] && idx[1] == b1 && !live[2]);
+    send_ip(1, 0, 6, 28);
+    x_drain(resp, &rx, &ok);
+    t_true("hand: responder now sends under the new keypair", rx == 0x2002 && ok);
+    before = N[1].ndeliv;
+    ts_wg_receive(N[1].d, N[0].pub, held1, n1);
+    t_true("hand: a late packet under the previous keypair is accepted", N[1].ndeliv == before + 1);
+    n2 = x_seal(held2, 7, 28);
+
+    /* Third handshake at 20 s: the first keypair is retired. */
+    now_ms = 20000;
+    ts_wg_tick(N[1].d, now_ms);
+    t_true("hand: third handshake", x_handshake(0x3003) == 0);
+    keypairs(1, 0, idx, live);
+    b3 = idx[2];
+    t_true("hand: previous dropped when the response is sent", live[0] && idx[0] == b2 && !live[1] && live[2] && idx[2] == b3);
+    t_true("hand: keepalive rotates again", x_send(0, 0) == 0);
+    keypairs(1, 0, idx, live);
+    t_true("hand: previous = second, current = third", live[0] && idx[0] == b3 && live[1] && idx[1] == b2);
+    t_true("hand: the first keypair is gone", !has_index(1, 0, b1));
+    before = N[1].ndeliv;
+    ts_wg_receive(N[1].d, N[0].pub, held1b, n1b);
+    t_true("hand: a packet under the retired keypair is rejected (age 19 s)", N[1].ndeliv == before);
+    ts_wg_receive(N[1].d, N[0].pub, held2, n2);
+    t_true("hand: a packet under the previous keypair is still accepted", N[1].ndeliv == before + 1);
+    t_true("hand: and new data flows", x_send(8, 28) == 1);
+    t_true("hand: the responder never initiated", N[1].nsent[1] == 0);
     teardown();
 }
 
@@ -839,6 +1112,9 @@ void test_wg_device(void)
     test_wgdev_ping();
     test_wgdev_allowedips();
     test_wgdev_timers();
+    test_wgdev_rekey_initiator();
+    test_wgdev_rekey_responder();
+    test_wgdev_rekey_hand_initiator();
     test_wgdev_replay();
     test_wgdev_flood();
     test_wgdev_remove();

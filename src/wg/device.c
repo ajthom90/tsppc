@@ -716,4 +716,20 @@ int ts_wg_test_has_keys(const ts_wg_dev *d, const uint8_t key[32])
         for (j = 0; j < lens[i]; j++) acc |= parts[i][j];
     return acc != 0;
 }
+
+int ts_wg_test_keypairs(const ts_wg_dev *d, const uint8_t key[32], uint32_t idx[3], int live[3])
+{
+    const peer *p = find(d, key);
+    const keypair *k[3];
+    int i;
+    if (!p) return -1;
+    k[0] = &p->cur;
+    k[1] = &p->prev;
+    k[2] = &p->next;
+    for (i = 0; i < 3; i++) {
+        live[i] = k[i]->live;
+        idx[i] = k[i]->live ? k[i]->local_index : 0;
+    }
+    return 0;
+}
 #endif
