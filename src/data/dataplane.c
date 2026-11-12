@@ -945,7 +945,27 @@ void ts_dp_tick(ts_dp *dp, int64_t now_ms)
     ensure_home(dp);
 }
 
-void ts_dp_rebind(ts_dp *dp, int64_t now_ms)
+/* Drop the queued WireGuard messages, keeping disco frames in order. */
+static void queue_drop_wg(slot *s)
+{
+    size_t i, kept = 0;
+    for (i = 0; i < s->qn; i++) {
+        qent *e = &s->q[(s->qhead + i) % TS_DP_QUEUE_PER_CONN];
+        if (e->n >= DISCO_HDR_LEN && memcmp(e->b, DISCO_MAGIC, sizeof DISCO_MAGIC) == 0) {
+            qent *d = &s->q[(s->qhead + kept) % TS_DP_QUEUE_PER_CONN];
+            if (d != e) {
+                memcpy(d, e, sizeof *d);
+                ts_wipe(e, sizeof *e);
+            }
+            kept++;
+        } else {
+            ts_wipe(e, sizeof *e);
+        }
+    }
+    s->qn = kept;
+}
+
+void ts_dp_rebind(ts_dp *dp, int64_t now_ms, int reset_sessions)
 {
     int i;
     if (!dp->running) return;
@@ -954,7 +974,8 @@ void ts_dp_rebind(ts_dp *dp, int64_t now_ms)
         if (s->state == S_FREE) continue;
         if (s->state == S_DIALING || s->state == S_UP) dp->io.conn_close(dp->user, s->idx);
         ts_derp_free(s->d);
-        s->state = S_BACKOFF;   /* the queue is kept */
+        if (reset_sessions) queue_drop_wg(s);
+        s->state = S_BACKOFF;
         s->dead = 0;
         s->dead_why = NULL;
         s->ever_ready = 0;
@@ -962,7 +983,7 @@ void ts_dp_rebind(ts_dp *dp, int64_t now_ms)
         s->redial_at = now_ms;
         s->rebind = 1;
     }
-    ts_wg_reset_sessions(dp->wg);
+    if (reset_sessions) ts_wg_reset_sessions(dp->wg);
 }
 
 int ts_dp_pick_home(const ts_derp_region *r, size_t n, const int *lat_ms, int current,

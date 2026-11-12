@@ -28,6 +28,7 @@
 #include "../src/state/store.h"
 
 #include "fake_control.inc"
+#include "fake_relay.inc"
 
 /* Where the Makefile put tsppcd and tsppc for this target. */
 #ifndef TS_BIN_DIR
@@ -696,48 +697,15 @@ static void note(const char *path, const char *what)
     }
 }
 
-static int read_all(int fd, uint8_t *p, size_t n)
-{
-    while (n) {
-        ssize_t k = read(fd, p, n);
-        if (k <= 0) return -1;
-        p += k;
-        n -= (size_t)k;
-    }
-    return 0;
-}
-
-static void write_all(int fd, const uint8_t *p, size_t n)
-{
-    while (n) {
-        ssize_t k = write(fd, p, n);
-        if (k <= 0) return;
-        p += k;
-        n -= (size_t)k;
-    }
-}
-
-static void relay_frame(int fd, int type, const uint8_t *body, size_t n)
-{
-    uint8_t h[5];
-    h[0] = (uint8_t)type;
-    ts_put_be32(h + 1, (uint32_t)n);
-    write_all(fd, h, 5);
-    write_all(fd, body, n);
-}
-
-/* One connection to the fake relay (plain TCP, as TSPPC_DERP_PLAIN makes the
- * daemon talk): the DERP upgrade, ServerKey, ServerInfo after a valid
- * ClientInfo, then frames until the daemon closes. A connection that closes
- * before sending anything is a home probe. Events go to evpath: 'u' upgraded,
- * 'r' ServerInfo sent, 'P'/'p' NotePreferred 1/0, 'e' closed after the
- * upgrade, 'b' a broken ClientInfo. */
+/* The fake relay (fake_relay.inc) in a child process; events are appended
+ * to evpath: 'u' upgraded, 'r' ServerInfo sent, 'P'/'p' NotePreferred 1/0,
+ * 'e' closed after the upgrade, 'b' a broken ClientInfo. */
 /* The peer the fake relay plays (test_daemon_ping): SendPackets to its node
  * key that hold a disco ping sealed to its disco key get a pong back from it. */
 static int g_relay_answers;
 static uint8_t g_ans_node[32], g_ans_disco_priv[32], g_ans_disco_pub[32];
 
-static void relay_answer(int fd, const uint8_t *body, size_t len)
+static void relay_answer(void *ctx, int fd, const uint8_t *body, size_t len)
 {
     ts_disco_shared sh;
     ts_disco_msg m;
@@ -746,88 +714,31 @@ static void relay_answer(int fd, const uint8_t *body, size_t len)
     const uint8_t *pkt = body + 32;
     size_t n = len - 32;
     int k;
-    if (len < 32 || memcmp(body, g_ans_node, 32) != 0 || !ts_disco_looks_like(pkt, n)) return;
+    (void)ctx;
+    if (!g_relay_answers || len < 32 || memcmp(body, g_ans_node, 32) != 0 || !ts_disco_looks_like(pkt, n)) return;
     ts_disco_shared_init(&sh, g_ans_disco_priv, ts_disco_sender(pkt));
     if (ts_disco_open(&m, pkt, n, &sh) != 0 || m.type != TS_DISCO_PING) return;
     memset(nonce, 0x77, sizeof nonce);
     memcpy(out, g_ans_node, 32);
     k = ts_disco_seal_pong(out + 32, sizeof out - 32, g_ans_disco_pub, &sh, nonce, m.txid, src, RELAY_REGION);
-    if (k > 0) relay_frame(fd, TS_DERP_RECV_PACKET, out, 32 + (size_t)k);
+    if (k > 0) fr_frame(fd, TS_DERP_RECV_PACKET, out, 32 + (size_t)k);
 }
 
-static void relay_serve(int fd, const char *evpath, const uint8_t s_priv[32], const uint8_t s_pub[32])
+static void relay_note(void *ctx, char e)
 {
-    static const char resp[] = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\n"
-                               "Connection: Upgrade\r\nDerp-Version: 2\r\n\r\n";
-    static uint8_t body[70000];
-    char hdr[2048];
-    size_t hl = 0;
-    uint8_t sk[40], h[5];
-
-    while (hl < sizeof hdr - 1) {
-        ssize_t k = read(fd, hdr + hl, 1);
-        if (k <= 0) return;   /* a probe: connected, closed */
-        hl += (size_t)k;
-        if (hl >= 4 && memcmp(hdr + hl - 4, "\r\n\r\n", 4) == 0) break;
-    }
-    hdr[hl] = 0;
-    if (strncmp(hdr, "GET /derp HTTP/1.1\r\n", 20) != 0) return;
-    write_all(fd, (const uint8_t *)resp, sizeof resp - 1);
-    memcpy(sk, "DERP\xf0\x9f\x94\x91", 8);
-    memcpy(sk + 8, s_pub, 32);
-    relay_frame(fd, TS_DERP_SERVER_KEY, sk, 40);
-    note(evpath, "u");
-    for (;;) {
-        uint32_t len;
-        if (read_all(fd, h, 5) != 0) break;
-        len = ts_get_be32(h + 1);
-        if (len > sizeof body || read_all(fd, body, len) != 0) break;
-        if (h[0] == TS_DERP_CLIENT_INFO) {
-            uint8_t json[256], info[24 + 16 + 64], cpub[32];
-            static const char sj[] = "{\"version\":2}";
-            size_t i;
-            if (len < 72 || len - 72 >= sizeof json ||
-                ts_box_open(json, body + 32, body, s_priv, body + 56, len - 56) != 0) {
-                note(evpath, "b");
-                break;
-            }
-            memcpy(cpub, body, 32);
-            for (i = 0; i < 24; i++) info[i] = (uint8_t)(0x40 + i);
-            ts_box_seal(info + 24, info, cpub, s_priv, (const uint8_t *)sj, sizeof sj - 1);
-            relay_frame(fd, TS_DERP_SERVER_INFO, info, 24 + 16 + sizeof sj - 1);
-            note(evpath, "r");
-        } else if (h[0] == TS_DERP_NOTE_PREFERRED && len == 1) {
-            note(evpath, body[0] ? "P" : "p");
-        } else if (h[0] == TS_DERP_SEND_PACKET && g_relay_answers) {
-            relay_answer(fd, body, len);
-        }
-    }
-    note(evpath, "e");
+    char s[2];
+    s[0] = e;
+    s[1] = 0;
+    note((const char *)ctx, s);
 }
 
 static void relay_server(int lfd, const char *evpath)
 {
-    uint8_t s_priv[32], s_pub[32];
-    int i, nul = open("/dev/null", O_RDWR);
-    if (nul >= 0) {
-        dup2(nul, 1);
-        dup2(nul, 2);
-        if (nul > 2) close(nul);
-    }
-    alarm(600);
-    for (i = 0; i < 32; i++) s_priv[i] = (uint8_t)(0x31 + 7 * i);   /* made up */
-    ts_state_clamp_key(s_priv);
-    ts_x25519_public(s_pub, s_priv);
-    for (;;) {
-        int fd = accept(lfd, NULL, NULL);
-        if (fd < 0) {
-            if (errno == EINTR) continue;
-            return;
-        }
-        if (getppid() == 1) return;
-        relay_serve(fd, evpath, s_priv, s_pub);
-        close(fd);
-    }
+    fr_sink sink;
+    sink.event = relay_note;
+    sink.on_send = relay_answer;
+    sink.ctx = (void *)evpath;
+    fr_server(lfd, &sink);
 }
 
 static int listen_local(uint16_t *port)

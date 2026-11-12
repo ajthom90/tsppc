@@ -909,18 +909,17 @@ void ts_dpio_get_view(ts_dpio_view *v)
              ds.problem);
 }
 
-void ts_dpio_rebind(const char *why, int probe_again)
+void ts_dpio_rebind(const char *why, int probe_again, int reset_sessions)
 {
     int i;
     if (!G.dp || !G.running || G.stopping || G.rebinding) return;
     /* G.now, never later than the next sync's time: that tick redials. */
     G.log("rebinding relays (%s)", why ? why : "");
     G.rebinding = 1;
-    ts_dp_rebind(G.dp, G.now);
+    ts_dp_rebind(G.dp, G.now, reset_sessions);
     G.rebinding = 0;
     for (i = 0; i < TS_DP_MAX_CONNS; i++)
         if (G.s[i].phase != R_NONE || G.s[i].fd >= 0) slot_close(&G.s[i]);
-    G.home_fails = 0;
     G.up_logged = 0;   /* "connected (home)" is logged again */
     if (probe_again) {
         probes_cancel();
@@ -931,7 +930,7 @@ void ts_dpio_rebind(const char *why, int probe_again)
 #ifdef TS_TEST_HOOKS
 int ts_dpio_test_probe_wanted(void)
 {
-    return G.probe_want && !G.probing;
+    return G.probe_want || G.probing;
 }
 #endif
 

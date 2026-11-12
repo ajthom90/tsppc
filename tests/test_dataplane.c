@@ -12,6 +12,7 @@
 #include "../src/data/dataplane.h"
 #include "../src/disco/disco.h"
 #include "../src/filter/packet.h"
+#include "../src/wg/handshake.h"
 
 /* Data planes joined by an in-test fake relay built from the DERP frame layout
  * (type byte, BE32 length): it answers the upgrade request with 101 and a
@@ -36,6 +37,7 @@ typedef struct {
     int http_done, have_key, preferred, npref;
     uint8_t key[32];
     unsigned long nsend;            /* SendPacket frames from this client */
+    unsigned long ninit;            /* of those, WireGuard handshake initiations */
     int full;                       /* conn_send says there is no room */
     uint8_t first_dst[32], last_dst[32];
     uint8_t last_pkt[256];          /* body of the last SendPacket (if it fit) */
@@ -292,6 +294,7 @@ static void relay_conn(tconn *c)
                     c->last_pkt_n = len - 32;
                 }
                 c->nsend++;
+                if (len - 32 == TS_WG_INIT_LEN && body[32] == 1) c->ninit++;
                 route(c, body, body + 32, len - 32);
             }
             break;
@@ -2070,7 +2073,7 @@ void test_dp_rebind(void)
     nres = a->nres;
     nclose = a->nclose;
     ndial = a->ndial;
-    ts_dp_rebind(a->dp, g_now);
+    ts_dp_rebind(a->dp, g_now, 1);
     t_true("rebind: both closed", a->nclose == nclose + 2);
     for (i = nclose; i < a->nclose && i < 32; i++) {
         r1 |= a->closed_region[i] == 1;
@@ -2105,7 +2108,7 @@ void test_dp_rebind(void)
     s2 = slot_of(a, 2);
     t_true("rebind: home dialing after failures", s2 >= 0 && !a->c[s2].up);
     ndial = a->ndial;
-    ts_dp_rebind(a->dp, g_now);
+    ts_dp_rebind(a->dp, g_now, 1);
     ts_dp_tick(a->dp, g_now);
     s2 = slot_of(a, 2);
     t_true("rebind: a dialing slot is dialed again", a->ndial == ndial + 1 && s2 >= 0);
@@ -2117,7 +2120,7 @@ void test_dp_rebind(void)
     s2 = slot_of(a, 2);
     if (s2 >= 0) down(a, s2);
     ndial = a->ndial;
-    ts_dp_rebind(a->dp, g_now);
+    ts_dp_rebind(a->dp, g_now, 1);
     ts_dp_tick(a->dp, g_now);
     t_true("rebind: a slot in backoff is dialed at once", a->ndial == ndial + 1 && slot_of(a, 2) >= 0);
     a->auto_up = 1;
@@ -2128,8 +2131,96 @@ void test_dp_rebind(void)
     ts_dp_stop(a->dp);
     nclose = a->nclose;
     ndial = a->ndial;
-    ts_dp_rebind(a->dp, g_now);
+    ts_dp_rebind(a->dp, g_now, 1);
     ts_dp_tick(a->dp, g_now);
     t_true("rebind: stopped, no calls", a->nclose == nclose && a->ndial == ndial);
+    nodes_free();
+}
+
+/* With reset_sessions, queued WireGuard messages are dropped (only the new
+ * handshake reaches the peer) and queued disco pings kept; without it,
+ * sessions and the queue survive. A non-home idle slot still closes after
+ * TS_DP_IDLE_CLOSE_MS however often it is rebound. */
+void test_dp_rebind_queue(void)
+{
+    tnode *a = &N[0], *b = &N[1];
+    uint8_t p1[64], p2[64];
+    size_t n1, n2;
+    int s1, before, i, alive_50s;
+    int64_t t0;
+
+    mk_key(s_priv, s_pub, 99);
+    setup(2, ALLOW_ALL_ICMP);
+    s1 = slot_of(a, 1);
+    a->auto_up = 0;
+    down(a, s1);
+    advance(TS_DP_REDIAL_MIN_MS);
+    s1 = slot_of(a, 1);
+    t_true("queue: home dialing, not up", s1 >= 0 && !a->c[s1].up);
+    n1 = icmp_pkt(p1, a->ip, b->ip, 8, 1);
+    ts_dp_from_tun(a->dp, p1, n1);   /* an initiation, queued */
+    t_true("queue: a disco ping queued too", ts_dp_ping(a->dp, b->ip, 3000, 9, g_now) == 0);
+    before = b->tun_n;
+    ts_dp_rebind(a->dp, g_now, 1);
+    ts_dp_tick(a->dp, g_now);
+    n2 = icmp_pkt(p2, a->ip, b->ip, 8, 2);
+    ts_dp_from_tun(a->dp, p2, n2);   /* the new initiation */
+    a->auto_up = 1;
+    pump();
+    advance(100);
+    t_true("queue: only the new initiation reached the relay", conn_of(a, 1)->ninit == 1);
+    t_true("queue: the packet after the rebind arrives at once",
+           b->tun_n == before + 1 && b->tun_last_n == n2 && memcmp(b->tun_last, p2, n2) == 0);
+    t_true("queue: the queued disco ping survived", a->nres == 1 && a->res_cookie[0] == 9 &&
+                                                       a->res_status[0] == TS_DP_PONG);
+    t_true("queue: no bad callbacks", a->bad_tun == 0 && b->bad_tun == 0);
+    nodes_free();
+
+    /* Without a session reset the queue is kept: the queued packet goes out. */
+    setup(2, ALLOW_ALL_ICMP);
+    s1 = slot_of(a, 1);
+    a->auto_up = 0;
+    down(a, s1);
+    advance(TS_DP_REDIAL_MIN_MS);
+    n1 = icmp_pkt(p1, a->ip, b->ip, 8, 3);
+    ts_dp_from_tun(a->dp, p1, n1);
+    before = b->tun_n;
+    ts_dp_rebind(a->dp, g_now, 0);
+    t_true("keep: the pending handshake is kept", ts_dp_test_has_keys(a->dp, b->pub) == 1);
+    ts_dp_tick(a->dp, g_now);
+    a->auto_up = 1;
+    pump();
+    advance(100);
+    t_true("keep: the queued packet is delivered after the redial",
+           b->tun_n == before + 1 && b->tun_last_n == n1 && memcmp(b->tun_last, p1, n1) == 0 &&
+           conn_of(a, 1)->ninit == 1);
+    /* An established session survives a rebind without reset. */
+    ts_dp_rebind(a->dp, g_now, 0);
+    t_true("keep: keys kept", ts_dp_test_has_keys(a->dp, b->pub) == 1);
+    ts_dp_tick(a->dp, g_now);
+    pump();
+    t_true("keep: traffic flows on the old session", ping(0, 1, 4) && ping(1, 0, 5));
+    t_true("keep: no new handshake", conn_of(a, 1)->ninit == 0);
+    t_true("keep: no bad callbacks", a->bad_tun == 0 && b->bad_tun == 0);
+    nodes_free();
+
+    /* Idle close: region 1 is not home and nothing is written to it. */
+    setup(2, ALLOW_ALL_ICMP);
+    t_true("idle: ping", ping(0, 1, 1));
+    ts_dp_set_home(a->dp, 2);
+    t_true("idle: B gone", apply_json(a, strdup("{\"PeersRemoved\":[2]}")) == 0);
+    advance(100);
+    t0 = g_now;   /* the last write to region 1 was before this */
+    alive_50s = 0;
+    for (i = 1; i <= 7; i++) {
+        advance(10000);
+        ts_dp_rebind(a->dp, g_now, i & 1);
+        ts_dp_tick(a->dp, g_now);
+        pump();
+        if (g_now - t0 <= 50000 && slot_of(a, 1) >= 0) alive_50s = i;
+    }
+    t_true("idle: kept up through rebinds while not idle", alive_50s == 5);
+    t_true("idle: closed by 70 s", slot_of(a, 1) < 0);
+    t_true("idle: home kept", slot_of(a, 2) >= 0);
     nodes_free();
 }

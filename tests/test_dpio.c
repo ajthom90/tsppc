@@ -19,10 +19,12 @@
 #include "../src/crypto/nacl.h"
 #include "../src/crypto/x25519.h"
 #include "../src/derp/derp.h"
+#include "../src/state/store.h"
 #include "../src/daemon/dataplane_io.h"
 #include "../src/data/dataplane.h"
 
 #include "fake_control.inc"
+#include "fake_relay.inc"
 
 /* The daemon's data-plane I/O with a fake tun device (one end of a socket
  * pair) and fake commands: never the real /dev/tun, ifconfig or route. A
@@ -503,101 +505,11 @@ static void test_dpio_ping(void)
 
 /* ---- Rebind, against a relay ----------------------------------------------- */
 
-/* A relay in a child process on the regions' listening socket (plain TCP, as
- * TSPPC_DERP_PLAIN makes the daemon talk): the DERP upgrade, ServerKey, and
- * ServerInfo after a valid ClientInfo, one connection at a time. A
- * connection that closes before sending anything is a home probe. Writes 'r'
- * to evfd for each ServerInfo sent. */
-static int rd_all(int fd, uint8_t *p, size_t n)
+/* The fake relay (fake_relay.inc) in a child process on the regions'
+ * listening socket; each ServerInfo it sends writes 'r' to a pipe. */
+static void relay_ev(void *ctx, char e)
 {
-    while (n) {
-        ssize_t k = read(fd, p, n);
-        if (k <= 0) return -1;
-        p += k;
-        n -= (size_t)k;
-    }
-    return 0;
-}
-
-static void wr_all(int fd, const uint8_t *p, size_t n)
-{
-    while (n) {
-        ssize_t k = write(fd, p, n);
-        if (k <= 0) return;
-        p += k;
-        n -= (size_t)k;
-    }
-}
-
-static void rframe(int fd, int type, const uint8_t *body, size_t n)
-{
-    uint8_t h[5];
-    h[0] = (uint8_t)type;
-    ts_put_be32(h + 1, (uint32_t)n);
-    wr_all(fd, h, 5);
-    wr_all(fd, body, n);
-}
-
-static void relay_one(int fd, int evfd, const uint8_t s_priv[32], const uint8_t s_pub[32])
-{
-    static const char resp[] = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\n"
-                               "Connection: Upgrade\r\nDerp-Version: 2\r\n\r\n";
-    static uint8_t body[70000];
-    char hdr[2048];
-    size_t hl = 0;
-    uint8_t sk[40], h[5];
-
-    while (hl < sizeof hdr - 1) {
-        ssize_t k = read(fd, hdr + hl, 1);
-        if (k <= 0) return;   /* a probe */
-        hl += (size_t)k;
-        if (hl >= 4 && memcmp(hdr + hl - 4, "\r\n\r\n", 4) == 0) break;
-    }
-    if (hl < 20 || strncmp(hdr, "GET /derp HTTP/1.1\r\n", 20) != 0) return;
-    wr_all(fd, (const uint8_t *)resp, sizeof resp - 1);
-    memcpy(sk, "DERP\xf0\x9f\x94\x91", 8);
-    memcpy(sk + 8, s_pub, 32);
-    rframe(fd, TS_DERP_SERVER_KEY, sk, 40);
-    for (;;) {
-        uint32_t len;
-        if (rd_all(fd, h, 5) != 0) break;
-        len = ts_get_be32(h + 1);
-        if (len > sizeof body || rd_all(fd, body, len) != 0) break;
-        if (h[0] == TS_DERP_CLIENT_INFO) {
-            uint8_t json[256], info[24 + 16 + 64], cpub[32];
-            static const char sj[] = "{\"version\":2}";
-            size_t i;
-            if (len < 72 || len - 72 >= sizeof json ||
-                ts_box_open(json, body + 32, body, s_priv, body + 56, len - 56) != 0)
-                break;
-            memcpy(cpub, body, 32);
-            for (i = 0; i < 24; i++) info[i] = (uint8_t)(0x40 + i);
-            ts_box_seal(info + 24, info, cpub, s_priv, (const uint8_t *)sj, sizeof sj - 1);
-            rframe(fd, TS_DERP_SERVER_INFO, info, 24 + 16 + sizeof sj - 1);
-            wr_all(evfd, (const uint8_t *)"r", 1);
-        }
-    }
-}
-
-static void relay_child(int fd, int evfd)
-{
-    uint8_t s_priv[32], s_pub[32];
-    int i;
-    alarm(120);
-    for (i = 0; i < 32; i++) s_priv[i] = (uint8_t)(0x31 + 7 * i);   /* made up */
-    s_priv[0] &= 248;
-    s_priv[31] = (uint8_t)((s_priv[31] & 127) | 64);
-    ts_x25519_public(s_pub, s_priv);
-    for (;;) {
-        int c = accept(fd, NULL, NULL);
-        if (c < 0) {
-            if (errno == EINTR) continue;
-            _exit(0);
-        }
-        if (getppid() == 1) _exit(0);
-        relay_one(c, evfd, s_priv, s_pub);
-        close(c);
-    }
+    if (e == 'r') (void)write(*(int *)ctx, "r", 1);
 }
 
 /* ServerInfos the relay has sent so far, waiting up to 1 s (real time) for
@@ -649,14 +561,18 @@ static void test_dpio_rebind(void)
     fcntl(ev[0], F_SETFL, fl | O_NONBLOCK);
     pid = fork();
     if (pid == 0) {
+        fr_sink sink;
         close(ev[0]);
-        relay_child(lfd, ev[1]);
+        sink.event = relay_ev;
+        sink.on_send = NULL;
+        sink.ctx = &ev[1];
+        fr_server(lfd, &sink);
         _exit(0);
     }
     close(ev[1]);
     t_true("rebind: relay started", pid > 0);
 
-    ts_dpio_rebind("test", 1);
+    ts_dpio_rebind("test", 1, 1);
     t_true("rebind: not running, nothing logged", logbuf[0] == 0 && !has(logbuf, "rebinding"));
 
     turn(1);
@@ -668,12 +584,11 @@ static void test_dpio_rebind(void)
     runs = n_run;
     logbuf[0] = 0;
 
-    ts_dpio_rebind("test", 1);
+    ts_dpio_rebind("test", 1, 1);
     t_true("rebind: logged", has(logbuf, "rebinding relays (test)"));
     ts_dpio_get_view(&v);
     t_true("rebind: home down at once", v.running && !v.home_up);
     t_true("rebind: a probe round wanted", ts_dpio_test_probe_wanted() == 1);
-    t_true("rebind: not counted as home failures", !has(logbuf, "failed 3 times"));
     t_true("rebind: home up again within 2 s", home_up_within(2000));
     t_true("rebind: over a new relay connection", relay_infos(ev[0], &infos, 2) == 2);
     ts_dpio_get_view(&v);
@@ -682,6 +597,25 @@ static void test_dpio_rebind(void)
     t_true("rebind: no interface or route command", n_run == runs);
     t_true("rebind: data plane kept running", !has(logbuf, "data plane stopped") && !has(logbuf, "tunnel tun9 up"));
 
+    /* Rebinds close the home connection each time, but are not home relay
+     * failures: no "failed N times" and no probe round for it. */
+    {
+        int i, k, probing = 0;
+        for (k = 0; k < 50 && ts_dpio_test_probe_wanted(); k++) turn(0);   /* let the round end */
+        t_true("rebind: probe round over", !ts_dpio_test_probe_wanted());
+        logbuf[0] = 0;
+        for (i = 0; i < 2 * TS_DPIO_HOME_FAILS; i++) {
+            ts_dpio_rebind("network changed", 0, 0);
+            for (k = 0; k < 3; k++) {
+                turn(0);
+                probing |= ts_dpio_test_probe_wanted();
+            }
+        }
+        t_true("rebind: rebinds logged", has(logbuf, "rebinding relays (network changed)"));
+        t_true("rebind: no home failure count", !has(logbuf, "failed") && !probing);
+        t_true("rebind: home up after the last rebind", home_up_within(2000));
+    }
+
     if (pid > 0) {
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
@@ -689,7 +623,7 @@ static void test_dpio_rebind(void)
     close(ev[0]);
     end();
     logbuf[0] = 0;
-    ts_dpio_rebind("test", 1);   /* after shutdown: nothing */
+    ts_dpio_rebind("test", 1, 1);   /* after shutdown: nothing */
     t_true("rebind: after shutdown, nothing logged", logbuf[0] == 0);
 }
 
