@@ -17,6 +17,7 @@ void test_ipc(void);
 void test_ipc_reply(void);
 void test_menu_model(void);
 void test_filter(void);
+void test_hosts(void);
 void test_wg(void);
 void test_wg_device(void);
 void test_derp_handshake(void);
@@ -54,6 +55,7 @@ int main(void)
     test_ipc_reply();
     test_menu_model();
     test_filter();
+    test_hosts();
     test_wg();
     test_wg_device();
     test_derp_handshake();
