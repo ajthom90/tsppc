@@ -1,0 +1,30 @@
+name: host
+
+# The portable core on a GitHub-hosted Mac: unit tests, sanitizers, a short
+# fuzz run. Safe for pull requests from forks (no self-hosted machine).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        run: make test
+      - name: AddressSanitizer and UBSan
+        run: make asan
+      - name: Fuzz (short)
+        run: TS_FUZZ_ITERS=20000 make fuzz

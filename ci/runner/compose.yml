@@ -1,0 +1,19 @@
+# docker compose -f ci/runner/compose.yml up -d --build   (see docs/ci.md)
+services:
+  runner:
+    build: .
+    image: tsppc-vm-runner
+    restart: unless-stopped
+    environment:
+      REPO_URL: ${REPO_URL:-}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      RUNNER_NAME: ${RUNNER_NAME:-tsppc-vm-runner}
+    volumes:
+      - state:/home/runner/state
+      - ${TSPPC_RUNNER_SSH:?set TSPPC_RUNNER_SSH to the folder holding config and id_vm}:/run/tsppc-ssh:ro
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    mem_limit: 1g
+    cpus: 2
+volumes:
+  state:
