@@ -137,3 +137,16 @@ check.
   `TokenBucketBytesPerSecond` and `TokenBucketBytesBurst`. tsppc checks
   ServerInfo but ignores those fields and does not pace its sends to them.
   Decision: accepted. A G4's traffic through one relay is small.
+- **Peer expiry follows control's clock, which can lag after sleep.** As
+  upstream (`ipnlocal/expiry.go`), a peer whose `KeyExpiry` has passed is
+  dropped locally even before control marks it `Expired`. tsppc never uses the
+  Mac's own clock for this (an old Mac's clock is often wrong): it takes
+  `ControlTime` from map responses and adds the monotonic time since it
+  arrived (`src/data/dataplane.h`). Hosted control does send `ControlTime`
+  (seen live, `docs/tunnel-check.md`). Limits: until the first `ControlTime`
+  arrives, or if a control server never sends one, only control's `Expired`
+  flag counts; and `mach_absolute_time` may not advance while the Mac sleeps,
+  so after a sleep control's time can run behind until the next message that
+  carries `ControlTime`, and an expired peer can be kept that much longer.
+  Decision: accepted. Control's `Expired` flag still removes the peer, and the
+  error only ever keeps a peer longer, never drops a valid one early.

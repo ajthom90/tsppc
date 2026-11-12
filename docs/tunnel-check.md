@@ -2,7 +2,9 @@
 
 **Date:** 2026-11-12.
 
-**Verdict: PASS.** IPv4 traffic between the two tsppc nodes, and between each of them and a peer running the official Tailscale client, goes through tsppc's WireGuard over a DERP relay. Nothing in the code had to change for this check. The filter's denial path could not be checked live, because the tailnet's policy allows every port from the test peers (see "Filter").
+**Verdict: PASS.** IPv4 traffic between the two tsppc nodes, and between each of them and a peer running the official Tailscale client, goes through tsppc's WireGuard over a DERP relay. Nothing in the code had to change for the first check. A second run after the final review's fixes (see "Final fixes") showed sessions surviving rekeys for more than 6 minutes with no loss, and the packet filter dropping a protocol the tailnet's policy does not allow, with no policy change.
+
+**Milestone numbers** follow the roadmap in `docs/superpowers/specs/2026-11-10-tailscale-ppc-design.md`, not the order of the work: the menu bar app (milestone 12) was built before this tunnel (milestone 4), so "the milestone 12 build" below is the build that ran before this one.
 
 **Build:** commit `eed8091`, built on the Leopard VM by `tools/vm-test.sh leopard`. That run passed 2943 checks, check-release (both programs), check-ct and check-app. The kext was rebuilt with `tools/driver.sh build` on Leopard. Tiger ran the same files, copied from Leopard through the host. SHA-1 hashes:
 
@@ -63,7 +65,7 @@ Proof that traffic went through tsppc, and not through UTM's NAT to the host's o
 | TCP from `<host>` to sshd | full handshake and the SSH banner over `tun0`, MSS 1240 | not repeated |
 | Resident memory while pinging both ways | 1664 to 1668 KB, flat | 2188 KB at start, 2232 KB while pinging |
 
-The counters count IP packets, including the 33-byte TSMP disco advertisement each side sends as the first packet on a new keypair. That is why 5 pings between the VMs show 6 each way. The host's client did not send one to us (`rx 5`), and tsppc did send one to it (`tx 6`).
+The counters count IP packets, including the TSMP disco advertisement (a 53-byte IPv4 packet with a 33-byte payload) each side sends as the first packet on a new keypair. That is why 5 pings between the VMs show 6 each way. The host's client did not send one to us (`rx 5`), and tsppc did send one to it (`tx 6`).
 
 `tailscale ping <VM>` from the host timed out, as expected: it uses disco, which tsppc does not run until milestone 8. Plain ICMP `ping` works.
 
@@ -71,7 +73,7 @@ The counters count IP packets, including the 33-byte TSMP disco advertisement ea
 
 `tsppc status` reports `filter: ok` on both VMs. The daemon does not log or report the number of rules. The host's client was used to read the shape of the tailnet's policy, without recording its contents. Its packet filter has 2 rules: one allows every port (0 to 65535) for TCP, UDP, ICMP and ICMPv6, and its sources include all three test nodes; the other grants only capabilities and matches no packets. The VMs receive filters compiled from the same policy, and both accept every connection tried above.
 
-Nothing from the test peers to the VMs is denied, so the live denial check could not run. The owner was not asked to add a temporary rule. The denial path is covered by the host tests for the filter (Task 1: `tests/test_filter.c`) and for the data plane (Task 7: `tests/test_dataplane.c`).
+Nothing from the test peers to the VMs is denied by port, so the first run could not check a denial live. The policy only allows TCP, UDP, ICMP and ICMPv6, though, so the final-fixes run sent packets of IP protocol 253 instead, with no change to the policy: Leopard's filter dropped them all (see "Final fixes"). The denial path is also covered by the host tests for the filter (Task 1: `tests/test_filter.c`) and for the data plane (Task 7: `tests/test_dataplane.c`).
 
 ## Stop and crash (Leopard)
 
@@ -87,6 +89,34 @@ Both daemons were left running with the tunnel up and the kext loaded.
 
 ## Notes
 
-- **Relay only.** Every packet went through one relay region, the home region of all three nodes. Pings took 34 to 50 ms after the first, all of it relay round trips. Direct paths come in milestone 8.
+- **Relay only.** Every packet went through one relay region, the home region of all three nodes. Between the VMs, pings took 35 to 48 ms after the first; from the host, 34 to 86 ms with the first included. All of it is relay round trips. Direct paths come in milestone 8.
 - **First packet.** The first ping of a new session takes about 100 ms, for the handshake through the relay.
-- **Tiger's old daemon.** When it was replaced, the milestone 12 daemon took more than 10 s to exit after `SIGTERM`. The new daemon on Leopard exited in about 2 s each time.
+- **Tiger's old daemon.** When it was replaced, the milestone 12 daemon took more than 10 s to exit after `SIGTERM`. The new daemon on Leopard exited in about 2 s on the SIGTERM test.
+- **Tiger's menu bar app** is still the milestone 12 build, talking to the new daemon. Its UI was not checked in this milestone.
+
+## Final fixes (second run)
+
+**Build:** commit `f79afad` plus the docs, built on Leopard by `tools/vm-test.sh leopard` (3061 checks, check-release, check-ct and check-app passed). Both VMs ran the same release files (SHA-1 `tsppcd` `d569548c9eb46ecb5ce0b477de3b8aeb99d0a7e7`, `tsppc` `37c737389fb21b5357b34185c9b1115e26b6d86d`); the kext was not changed. The old binaries were kept in `~/tsppc-run/prev-1b87fb0/`.
+
+**Control's clock.** Hosted control sends `ControlTime`: both daemons logged `control time received` before the data plane started (the value is not logged). Peer key expiry is therefore checked against control's clock (`docs/known-limits.md`).
+
+**Rekeying (B1).** Three 400-packet pings at once, one a second (6 min 40 s): `<leopard>` to `<tiger>`, `<tiger>` to `<leopard>`, and `<host>` (official client) to `<leopard>`. The handshake age in the raw `path` lines was sampled every 12 s.
+
+| Path | Loss | Handshake age reset (rekeys) | Counters at the end |
+|---|---|---|---|
+| `<leopard>` to `<tiger>` and back | 0 of 400 | at about 120 s, 240 s and 360 s, the same on both sides | `rx 804 tx 804` on both: 800 pings plus 4 TSMP adverts, one per keypair |
+| `<tiger>` to `<leopard>` | 0 of 400 | (the same session) | |
+| `<host>` to `<leopard>` | 0 of 400 | at about 120 s, 240 s and 360 s | `rx 401 tx 405` on `<leopard>` |
+
+`<leopard>` initiated the session with `<tiger>`, so tsppc rekeyed as initiator there and `<tiger>` as responder; the host's client initiated its session, so `<leopard>` was the responder to the official client's rekeys. A session that is never rekeyed is refused after 180 s, so traffic without loss past 6 minutes needs the rekeys. `en0` on `<leopard>` saw no ICMP for `<tiger>` during the run. An SSH session from `<host>` to `<leopard>`'s tailnet address stayed open for 7.5 minutes, printing `date` every 30 s (read-only commands).
+
+**Filter denial (B4).** The policy allows TCP, UDP and ICMP only. As root on `<tiger>`, a throwaway Python script (not in the repository) sent 10 raw IPv4 packets of protocol 253 to `<leopard>`'s tailnet address; then 3 ICMP pings as a positive control. One `tcpdump -i tun0 'icmp or ip proto 253'` ran on `<leopard>`, and `tcpdump -i tun0 'ip proto 253'` on `<tiger>`.
+
+| Check | Result |
+|---|---|
+| `<tiger>`'s `tun0` | the 10 protocol-253 packets left with `<tiger>`'s tailnet source |
+| `path` counters | `<tiger>` tx +14, `<leopard>` rx +14 (10 + 3 pings + 1 TSMP advert after a rekey) |
+| `<leopard>`'s `filter` line | `ok dropped 0` before, `ok dropped 10` after |
+| `<leopard>`'s `tun0` | the 3 echo requests and 3 replies only; no protocol-253 packet |
+
+So the packets reached `<leopard>`'s data plane, WireGuard accepted them, and the filter dropped every one before the tun device. Both daemons were left running with the tunnel up.
