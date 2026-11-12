@@ -19,7 +19,9 @@
  * rest are sealed and delivered in two reads, so the map request opened after
  * the first can be answered by the second. With bit 15 of split clear the fake
  * has already sent its SETTINGS (HTTP/2 is decided); with it set the input is
- * the very first plaintext, so the early payload is fuzzed too. Then the clock
+ * the very first plaintext, so the early payload is fuzzed too. Between the
+ * reads the home relay region changes, so a live stream also opens a lite map
+ * update for the second read to answer. Then the clock
  * runs for a while. Each iteration is a full handshake, so this target runs
  * fewer iterations.
  *
@@ -91,6 +93,9 @@ static ts_sess_state stream_run(const uint8_t *d, size_t len)
         fk_send_plain(&g_f, d, split);
         fk_pump(&g_f);
         g_f.no_preface = 0;   /* the fake may answer PINGs from here on */
+        /* A home region change: a live stream sends a lite map update, whose
+         * answer the second read can carry (stream 3 or later). */
+        (void)ts_sess_set_preferred_derp(g_s, 3);
         if (g_f.up && len > split) {
             fk_send_plain(&g_f, d + split, len - split);
             fk_pump(&g_f);

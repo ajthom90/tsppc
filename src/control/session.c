@@ -46,6 +46,7 @@ enum {
 #define HS80_TEXT "handshake on port 80 failed; trying port 443"
 
 static void settle(ts_sess *s);
+static ts_sess_state derive_state(const ts_sess *s);
 static int forget_login(ts_sess *s);
 static int save_st(ts_sess *s);
 
@@ -178,6 +179,41 @@ static void jstr(jbuf *b, const char *s)
     }
 }
 
+static void jputn(jbuf *b, const char *s, size_t n)
+{
+    if (b->err || n >= b->cap - b->len) {
+        b->err = 1;
+        return;
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = 0;
+}
+
+/* The stored Hostinfo object, with "NetInfo":{"PreferredDERP":N} spliced in
+ * before its closing brace when a home region is set. The text is not
+ * re-parsed: one without a closing brace goes out unchanged. */
+#define NETINFO_EXTRA 64   /* bytes the splice can add */
+static void jhostinfo(jbuf *b, const ts_sess *s)
+{
+    const char *h = s->hostinfo;
+    size_t end = strlen(h), k;
+    char ni[NETINFO_EXTRA];
+    while (end > 0 && h[end - 1] != '}') end--;
+    if (s->derp_want <= 0 || end == 0) {
+        jput(b, h);
+        return;
+    }
+    end--;   /* the closing brace */
+    k = end;
+    while (k > 0 && (h[k - 1] == ' ' || h[k - 1] == '\t' || h[k - 1] == '\r' || h[k - 1] == '\n')) k--;
+    snprintf(ni, sizeof ni, "%s\"NetInfo\":{\"PreferredDERP\":%d}",
+             (k > 0 && h[k - 1] == '{') ? "" : ",", s->derp_want);
+    jputn(b, h, end);
+    jput(b, ni);
+    jput(b, h + end);
+}
+
 /* ---- Connection ------------------------------------------------------- */
 
 /* Close the connection and forget everything tied to it. */
@@ -197,6 +233,9 @@ static void close_conn(ts_sess *s, int tell_io)
     resp_open(&s->reg, 0);
     resp_open(&s->map, 0);
     resp_open(&s->hp, 0);
+    resp_open(&s->lite, 0);
+    s->lite_at = 0;
+    s->lite_delay = 0;
     s->map_live = 0;
     s->ping_out = 0;
     s->hlen = s->hslen = 0;
@@ -313,7 +352,7 @@ static void send_register(ts_sess *s, int kind)
         regen = 1;
     }
 
-    b.cap = strlen(s->hostinfo) + 6 * TS_SESS_URL_MAX + 512;
+    b.cap = strlen(s->hostinfo) + NETINFO_EXTRA + 6 * TS_SESS_URL_MAX + 512;
     b.p = (char *)malloc(b.cap);
     b.len = 0;
     b.err = b.p == NULL;
@@ -335,7 +374,7 @@ static void send_register(ts_sess *s, int kind)
         jput(&b, "\"");
     }
     jput(&b, ",\"Hostinfo\":");
-    jput(&b, s->hostinfo);
+    jhostinfo(&b, s);
     jput(&b, ",\"Ephemeral\":false}");
 
     hdrs[nh++] = "Content-Type";
@@ -369,19 +408,17 @@ static void send_register(ts_sess *s, int kind)
 
 static void on_map_msg(void *user, const char *json, size_t len);
 
-static void send_map(ts_sess *s)
+/* POST /machine/map: the stream (stream = 1) or a lite update (OmitPeers,
+ * not streamed; upstream's SendUpdate). Both carry the current Hostinfo.
+ * Returns 0 with *sid set, or -1. */
+static int map_post(ts_sess *s, int stream, uint32_t *sid)
 {
     jbuf b;
     const char *hdrs[4];
     char lb[80], hex[65], v[16];
-    uint32_t sid;
+    int rc = -1;
 
-    ts_netmap_reset(&s->nm);
-    ts_map_stream_free(&s->ms);
-    ts_map_stream_init(&s->ms, on_map_msg, s);
-    s->map_live = 0;
-
-    b.cap = strlen(s->hostinfo) + 512;
+    b.cap = strlen(s->hostinfo) + NETINFO_EXTRA + 512;
     b.p = (char *)malloc(b.cap);
     b.len = 0;
     b.err = b.p == NULL;
@@ -392,8 +429,8 @@ static void send_map(ts_sess *s)
     jput(&b, ",\"KeepAlive\":true");
     jkey(&b, ",\"NodeKey\":\"nodekey:", s->st.node_priv);
     jkey(&b, ",\"DiscoKey\":\"discokey:", s->st.disco_priv);
-    jput(&b, ",\"Stream\":true,\"Hostinfo\":");
-    jput(&b, s->hostinfo);
+    jput(&b, stream ? ",\"Stream\":true,\"Hostinfo\":" : ",\"Stream\":false,\"OmitPeers\":true,\"Hostinfo\":");
+    jhostinfo(&b, s);
     jput(&b, "}");
 
     pub_hex(hex, s->st.node_priv);
@@ -402,14 +439,70 @@ static void send_map(ts_sess *s)
     hdrs[1] = "application/json";
     hdrs[2] = "Ts-Lb";
     hdrs[3] = lb;
-    if (b.err || ts_h2_request(&s->h2, &sid, "POST", "/machine/map", s->host, hdrs, 2,
-                               (const uint8_t *)b.p, b.len) != 0) {
-        fail(s, FAIL_RETRY_HERE, "cannot send the map request");
-    } else {
-        resp_open(&s->map, sid);
-        s->rate_limited = 0;
-    }
+    if (!b.err && ts_h2_request(&s->h2, sid, "POST", "/machine/map", s->host, hdrs, 2,
+                                (const uint8_t *)b.p, b.len) == 0)
+        rc = 0;
     free(b.p);
+    return rc;
+}
+
+static void send_map(ts_sess *s)
+{
+    uint32_t sid;
+
+    ts_netmap_reset(&s->nm);
+    ts_map_stream_free(&s->ms);
+    ts_map_stream_init(&s->ms, on_map_msg, s);
+    s->map_live = 0;
+
+    if (map_post(s, 1, &sid) != 0) {
+        fail(s, FAIL_RETRY_HERE, "cannot send the map request");
+        return;
+    }
+    resp_open(&s->map, sid);
+    s->rate_limited = 0;
+    /* The new stream tells control the home region: an open update is moot. */
+    s->derp_told = s->derp_want;
+    if (s->lite.sid) {
+        (void)ts_h2_cancel(&s->h2, s->lite.sid);
+        s->lite.sid = 0;
+    }
+    s->lite_at = 0;
+    s->lite_delay = 0;
+}
+
+/* A lite update failed: control may or may not have the value. Retry after
+ * 1 s doubling to 30 s, on this connection only. */
+static void lite_failed(ts_sess *s)
+{
+    int64_t d = s->lite_delay ? s->lite_delay : TS_SESS_LITE_RETRY_MIN_MS;
+    s->derp_told = -1;
+    s->lite_at = s->now + d;
+    s->lite_delay = d * 2 > TS_SESS_LITE_RETRY_MAX_MS ? TS_SESS_LITE_RETRY_MAX_MS : d * 2;
+}
+
+static void send_lite(ts_sess *s)
+{
+    uint32_t sid;
+    if (map_post(s, 0, &sid) != 0) {
+        lite_failed(s);
+        return;
+    }
+    resp_open(&s->lite, sid);
+    s->derp_sent = s->derp_want;
+}
+
+/* Only the status matters (D2): a 404 is not a removal here, the stream
+ * reports that. Nothing here ends the session. */
+static void lite_end(ts_sess *s, int error)
+{
+    s->lite.sid = 0;
+    if (error == TS_H2_END_OK && s->lite.status == 200) {
+        s->derp_told = s->derp_sent;
+        s->lite_delay = 0;
+    } else {
+        lite_failed(s);
+    }
 }
 
 /* A plain liveness PingRequest: HEAD the URL over this connection (D1). */
@@ -660,6 +753,7 @@ static ts_sess_resp *resp_for(ts_sess *s, uint32_t sid)
     if (sid == s->reg.sid) return &s->reg;
     if (sid == s->map.sid) return &s->map;
     if (sid == s->hp.sid) return &s->hp;
+    if (sid == s->lite.sid) return &s->lite;
     return NULL;
 }
 
@@ -731,6 +825,7 @@ static void cb_end(void *u, uint32_t sid, int error)
     if (sid == s->reg.sid) reg_end(s, error);
     else if (sid == s->map.sid) map_end(s, error);
     else if (sid == s->hp.sid) s->hp.sid = 0;   /* the HEAD's answer is not needed */
+    else if (sid == s->lite.sid) lite_end(s, error);
 }
 
 static void cb_goaway(void *u, uint32_t last_sid, uint32_t code)
@@ -920,6 +1015,10 @@ static void drive(ts_sess *s)
             (void)ts_h2_cancel(&s->h2, s->reg.sid);
             s->reg.sid = 0;
         }
+        if (s->lite.sid) {
+            (void)ts_h2_cancel(&s->h2, s->lite.sid);
+            s->lite.sid = 0;
+        }
         if (!s->reg.sid && s->now >= s->reg_at) send_register(s, REG_LOGOUT);
         return;
     }
@@ -932,8 +1031,13 @@ static void drive(ts_sess *s)
          * as upstream's "try refreshing the current key" login. It brings
          * Hostinfo up to date and lets control answer NodeKeyExpired. */
         if (!s->reg.sid && s->now >= s->reg_at) send_register(s, REG_LOGIN);
-    } else if (!s->map.sid && s->now >= s->map_at && s->now >= s->sleep_until) {
-        send_map(s);
+    } else if (!s->map.sid) {
+        if (s->now >= s->map_at && s->now >= s->sleep_until) send_map(s);
+    } else if (s->derp_told != s->derp_want && !s->lite.sid && s->now >= s->lite_at) {
+        /* Only once the stream is live: before its first message control
+         * has the value from the stream request, or will hear it after. */
+        ts_sess_state st = derive_state(s);
+        if (st == TS_SESS_RUNNING || st == TS_SESS_AWAIT_APPROVAL) send_lite(s);
     }
 }
 
@@ -993,6 +1097,7 @@ void ts_sess_init(ts_sess *s, const ts_state *st, const ts_sess_io *io, void *us
     resp_open(&s->reg, 0);
     resp_open(&s->map, 0);
     resp_open(&s->hp, 0);
+    resp_open(&s->lite, 0);
     ts_map_stream_init(&s->ms, NULL, NULL);
     s->nm_ok = ts_netmap_init(&s->nm) == 0;
     if (!s->nm_ok || !s->hostinfo) {
@@ -1009,6 +1114,14 @@ int ts_sess_set_host(ts_sess *s, const char *host)
     for (i = 0; i < n; i++)
         if (host[i] < '!' || host[i] > '~') return -1;
     memcpy(s->host, host, n + 1);
+    return 0;
+}
+
+int ts_sess_set_preferred_derp(ts_sess *s, int region)
+{
+    if (region < 0) return -1;
+    s->derp_want = region;
+    settle(s);   /* a live stream sends the update now */
     return 0;
 }
 

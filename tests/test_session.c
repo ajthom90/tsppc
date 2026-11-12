@@ -1710,6 +1710,279 @@ static void test_parsers(void)
     t_true("url: too long", ts_url_split("https://h/0123456789", a, sizeof a, p, 8) == -1);
 }
 
+/* ---- Home relay reporting (NetInfo, lite map updates) ------------------- */
+
+#define NI(n) ",\"NetInfo\":{\"PreferredDERP\":" n "}}"
+#define HOSTINFO_NI(n) "{\"IPNVersion\":\"0.1.0-ppc\",\"OS\":\"macOS\",\"Hostname\":\"testhost\"" NI(n)
+
+static int is_lite(const fk_req *r)
+{
+    return strcmp(r->path, "/machine/map") == 0 && has(r->body, "\"Stream\":false");
+}
+
+static int lites(void) { return fk_count(&F, "/machine/map", "\"Stream\":false"); }
+
+/* Register at once; the stream gets map_first; lite updates are left for the
+ * test to answer. */
+static void h_netinfo(fake *f, fk_req *r)
+{
+    if (strcmp(r->path, "/machine/register") == 0) fk_reply(f, r, 200, "{\"MachineAuthorized\":true}");
+    else if (strcmp(r->path, "/machine/map") == 0 && !is_lite(r)) {
+        fk_headers(f, r, 200, NULL, 0, 0);
+        if (f->map_first) fk_map_msg(f, r, f->map_first);
+    }
+}
+
+/* The last lite update, or a stand-in on a stream never opened (so that a
+ * failing test reports instead of crashing). */
+static fk_req *last_lite(void)
+{
+    static fk_req none;
+    int i;
+    for (i = F.nreq - 1; i >= 0; i--)
+        if (is_lite(&F.req[i])) return &F.req[i];
+    memset(&none, 0, sizeof none);
+    none.sid = 0x7ffffff1u;
+    return &none;
+}
+
+/* The stream request (the last map request that is not a lite one). */
+static fk_req *last_stream(void)
+{
+    int i;
+    for (i = F.nreq - 1; i >= 0; i--)
+        if (strcmp(F.req[i].path, "/machine/map") == 0 && !is_lite(&F.req[i])) return &F.req[i];
+    return NULL;
+}
+
+static void test_sess_netinfo(void)
+{
+    char nk[65], dk[65], want[1024];
+    fk_req *m, *l;
+    char *big;
+    int64_t t;
+    int i, n;
+
+    /* Region 0 (never set): no NetInfo anywhere. */
+    begin_running();
+    t_true("netinfo: none by default in register", has(fk_last(&F, "/machine/register")->body,
+           "\"Hostinfo\":" HOSTINFO ",") && !has(fk_last(&F, "/machine/register")->body, "NetInfo"));
+    t_true("netinfo: none by default in the stream", has(last_stream()->body, "\"Hostinfo\":" HOSTINFO "}") &&
+           !has(last_stream()->body, "NetInfo"));
+    t_true("netinfo: negative region refused", ts_sess_set_preferred_derp(S, -1) == -1);
+    fk_pump(&F);
+    t_true("netinfo: refused value sends nothing", maps() == 1);
+    end();
+
+    /* Set before the stream: register and stream carry it, no lite update. */
+    begin(h_netinfo);
+    F.map_first = MAP_OK;
+    t_true("netinfo: set 7", ts_sess_set_preferred_derp(S, 7) == 0);
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("netinfo: RUNNING", ts_sess_get_state(S) == TS_SESS_RUNNING);
+    t_true("netinfo: register carries it", has(fk_last(&F, "/machine/register")->body,
+           "\"Hostinfo\":" HOSTINFO_NI("7") ",\"Ephemeral\":false}"));
+    m = last_stream();
+    t_true("netinfo: stream carries it", m && has(m->body, "\"Stream\":true,\"Hostinfo\":" HOSTINFO_NI("7") "}"));
+    t_true("netinfo: no lite update for a value the stream carried", maps() == 1 && lites() == 0);
+
+    /* A change while RUNNING: exactly one lite update. */
+    t_true("netinfo: set 9", ts_sess_set_preferred_derp(S, 9) == 0);
+    fk_pump(&F);
+    t_true("netinfo: one lite update", lites() == 1 && maps() == 2);
+    l = last_lite();
+    if (l) {
+        key_hex(nk, F.st.node_priv);
+        key_hex(dk, F.st.disco_priv);
+        snprintf(want, sizeof want, "{\"Version\":150,\"KeepAlive\":true,\"NodeKey\":\"nodekey:%s\","
+                 "\"DiscoKey\":\"discokey:%s\",\"Stream\":false,\"OmitPeers\":true,\"Hostinfo\":%s}",
+                 nk, dk, HOSTINFO_NI("9"));
+        t_true("lite: exact body", l->body && strcmp(l->body, want) == 0);
+        t_true("lite: POST, JSON", strcmp(l->method, "POST") == 0 && strcmp(l->ctype, "application/json") == 0);
+        snprintf(want, sizeof want, "nodekey:%s", nk);
+        t_true("lite: Ts-Lb", l->nlb == 1 && strcmp(l->lb[0], want) == 0);
+        t_true("lite: own stream, same connection", l->sid != m->sid && l->conn == m->conn && F.nconnect == 1);
+    }
+    t_true("lite: same value again sends nothing", ts_sess_set_preferred_derp(S, 9) == 0);
+    fk_pump(&F);
+    t_true("lite: still one", lites() == 1);
+
+    /* A 500 retries after 1 s, then 2 s; the session is unaffected. */
+    fk_reply(&F, l, 500, "server trouble");
+    fk_pump(&F);
+    t_true("lite 500: not at once", lites() == 1);
+    fk_advance(&F, 900, 100);
+    t_true("lite 500: not before 1 s", lites() == 1);
+    fk_advance(&F, 100, 100);
+    t_true("lite 500: retried at 1 s", lites() == 2);
+    t_true("lite 500: retry has the value", has(last_lite()->body, HOSTINFO_NI("9")));
+    fk_reply(&F, last_lite(), 500, NULL);
+    fk_pump(&F);
+    fk_advance(&F, 1900, 100);
+    t_true("lite 500: not before 2 s", lites() == 2);
+    fk_advance(&F, 100, 100);
+    t_true("lite 500: retried at 2 s", lites() == 3);
+    t_true("lite 500: session untouched", ts_sess_get_state(S) == TS_SESS_RUNNING && F.nconnect == 1 &&
+           !m->closed && F.ndisconnect == 0);
+
+    /* A 200 with a body larger than the window: consumed, no more retries. */
+    n = 100000;
+    big = (char *)malloc((size_t)n + 1);
+    if (!big) abort();
+    memset(big, 'x', (size_t)n);
+    big[n] = 0;
+    fk_reply(&F, last_lite(), 200, big);
+    free(big);
+    fk_pump(&F);
+    t_true("lite 200: body all delivered", last_lite()->closed && F.data_sent >= (uint64_t)n);
+    fk_advance(&F, 70000, 1000);
+    t_true("lite 200: no more retries", lites() == 3);
+    fk_map_msg(&F, m, "{\"Node\":" SELF("true", "") ",\"Peers\":[" PEER("10", "100.64.0.10") "]}");
+    fk_pump(&F);
+    t_true("lite 200: stream still works", ts_sess_get_state(S) == TS_SESS_RUNNING && ts_sess_netmap(S)->npeers == 1 &&
+           !m->closed);
+
+    /* A change during an update is sent after it. */
+    ts_sess_set_preferred_derp(S, 11);
+    fk_pump(&F);
+    l = last_lite();
+    t_true("lite: update for 11", lites() == 4 && has(l->body, NI("11")));
+    ts_sess_set_preferred_derp(S, 12);
+    fk_pump(&F);
+    t_true("lite: one at a time", lites() == 4);
+    fk_reply(&F, l, 200, "{}");
+    fk_pump(&F);
+    t_true("lite: second sent after the first", lites() == 5 && has(last_lite()->body, NI("12")));
+    fk_reply(&F, last_lite(), 200, NULL);
+    fk_pump(&F);
+    fk_advance(&F, 5000, 1000);
+    t_true("lite: then quiet", lites() == 5);
+
+    /* A change during a failing update: the retry carries the latest value. */
+    ts_sess_set_preferred_derp(S, 13);
+    fk_pump(&F);
+    ts_sess_set_preferred_derp(S, 14);
+    fk_pump(&F);
+    fk_rst(&F, last_lite(), 2);
+    fk_pump(&F);
+    t_true("lite reset: not at once", lites() == 6);
+    fk_advance(&F, 1000, 100);
+    t_true("lite reset: retried with the latest value", lites() == 7 && has(last_lite()->body, NI("14")));
+    t_true("lite reset: session untouched", ts_sess_get_state(S) == TS_SESS_RUNNING && F.nconnect == 1);
+
+    /* A 404 is not a removal: the stream says that. Retried. */
+    fk_reply(&F, last_lite(), 404, "not found");
+    fk_pump(&F);
+    t_true("lite 404: RUNNING", ts_sess_get_state(S) == TS_SESS_RUNNING && F.nconnect == 1 &&
+           !status_has("removed"));
+    fk_advance(&F, 1900, 100);
+    t_true("lite 404: the delay keeps doubling", lites() == 7);
+    fk_advance(&F, 100, 100);
+    t_true("lite 404: retried at 2 s", lites() == 8);
+    fk_reply(&F, last_lite(), 200, NULL);
+    fk_pump(&F);
+
+    /* Region 0 sends one update without NetInfo. */
+    ts_sess_set_preferred_derp(S, 0);
+    fk_pump(&F);
+    l = last_lite();
+    t_true("lite 0: sent", lites() == 9);
+    t_true("lite 0: no NetInfo", has(l->body, "\"Hostinfo\":" HOSTINFO "}") && !has(l->body, "NetInfo"));
+    fk_reply(&F, l, 200, NULL);
+    fk_pump(&F);
+
+    /* A pending update is dropped on a reconnect: the new stream carries it. */
+    ts_sess_set_preferred_derp(S, 5);
+    fk_pump(&F);
+    t_true("reconnect: update in flight", lites() == 10);
+    fk_close(&F, "reset");
+    t = F.now;
+    while (ts_sess_get_state(S) != TS_SESS_RUNNING && F.now - t < 5000) fk_advance(&F, 100, 100);
+    m = last_stream();
+    t_true("reconnect: RUNNING again", ts_sess_get_state(S) == TS_SESS_RUNNING && F.nconnect == 2);
+    t_true("reconnect: stream carries 5", m && m->conn == F.conn && has(m->body, HOSTINFO_NI("5") "}"));
+    fk_advance(&F, 40000, 1000);
+    n = 0;
+    for (i = 0; i < F.nreq; i++)
+        if (is_lite(&F.req[i]) && F.req[i].conn == F.conn) n++;
+    t_true("reconnect: no lite update on the new connection", n == 0);
+    end();
+
+    /* A change while not streaming is only remembered. */
+    begin(h_std);
+    F.hold_followup = 1;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("not streaming: NEED_LOGIN", ts_sess_get_state(S) == TS_SESS_NEED_LOGIN);
+    ts_sess_set_preferred_derp(S, 3);
+    fk_pump(&F);
+    t_true("not streaming: no map request", maps() == 0);
+    end();
+
+    /* AWAIT_APPROVAL with the stream open also sends it. */
+    begin(h_netinfo);
+    F.map_first = MAP_UNAUTH;
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("approval: AWAIT_APPROVAL", ts_sess_get_state(S) == TS_SESS_AWAIT_APPROVAL);
+    ts_sess_set_preferred_derp(S, 4);
+    fk_pump(&F);
+    t_true("approval: one lite update", lites() == 1 && has(last_lite()->body, NI("4")));
+    end();
+
+    /* A change after the stream request but before its first message is sent
+     * once the stream is live. */
+    begin(h_netinfo);
+    ts_sess_up(S);
+    fk_pump(&F);
+    m = last_stream();
+    t_true("early change: stream open, not live", m && !m->closed && ts_sess_get_state(S) == TS_SESS_CONNECTING);
+    ts_sess_set_preferred_derp(S, 6);
+    fk_pump(&F);
+    t_true("early change: nothing yet", lites() == 0);
+    if (m) fk_map_msg(&F, m, MAP_OK);
+    fk_pump(&F);
+    t_true("early change: sent once live", ts_sess_get_state(S) == TS_SESS_RUNNING && lites() == 1 &&
+           has(last_lite()->body, NI("6")));
+    end();
+
+    /* The retry delay doubles to 30 s and stays there. */
+    begin(h_netinfo);
+    F.map_first = MAP_OK;
+    ts_sess_up(S);
+    fk_pump(&F);
+    ts_sess_set_preferred_derp(S, 8);
+    fk_pump(&F);
+    {
+        static const int64_t gaps[] = { 1000, 2000, 4000, 8000, 16000, 30000, 30000 };
+        int ok = 1;
+        for (i = 0; i < (int)(sizeof gaps / sizeof gaps[0]); i++) {
+            n = lites();
+            fk_reply(&F, last_lite(), 500, NULL);
+            fk_pump(&F);
+            t = F.now;
+            while (lites() == n && F.now - t < 40000) fk_advance(&F, 100, 100);
+            if (F.now - t != gaps[i]) ok = 0;
+        }
+        t_true("lite: 1, 2, 4, 8, 16, 30, 30 s", ok);
+    }
+    t_true("lite: never the reconnect backoff", F.nconnect == 1 && ts_sess_get_state(S) == TS_SESS_RUNNING);
+    end();
+
+    /* An empty Hostinfo object gets NetInfo without a leading comma. */
+    fk_init(&F, S, "{}");
+    F.handler = h_netinfo;
+    F.map_first = MAP_OK;
+    fk_start(&F, "{}");
+    ts_sess_set_preferred_derp(S, 7);
+    ts_sess_up(S);
+    fk_pump(&F);
+    t_true("empty hostinfo: spliced", last_stream() &&
+           has(last_stream()->body, "\"Hostinfo\":{\"NetInfo\":{\"PreferredDERP\":7}}}"));
+    end();
+}
+
 static void test_set_host(void)
 {
     fk_init(&F, S, HOSTINFO);
@@ -1780,5 +2053,6 @@ void test_session(void)
     test_save_failure();
     test_login_save_failure();
     test_set_host();
+    test_sess_netinfo();
     free(S);
 }

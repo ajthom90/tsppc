@@ -55,6 +55,18 @@
  * '?'), and a login URL is accepted only if it is "https://" followed by bytes
  * 0x21..0x7e; anything else fails the register like a bad response.
  *
+ * Home relay: ts_sess_set_preferred_derp sets the region every request's
+ * Hostinfo reports as "NetInfo":{"PreferredDERP":N}, spliced into the stored
+ * Hostinfo text before its closing brace (the text is not re-parsed). While
+ * the map stream is live (RUNNING or AWAIT_APPROVAL), a value control has not
+ * heard on this connection goes out as one "lite" map request on its own
+ * stream (Stream false, OmitPeers true; upstream's SendUpdate). Only one is
+ * open at a time; a change meanwhile is sent after it. 200 ends it (the body
+ * is read and dropped). Any other status (404 included: the stream reports a
+ * removal) or a reset stream retries after 1 s doubling to 30 s on the
+ * session clock, never ending the session or touching the reconnect backoff.
+ * A new map stream carries the value itself, so an open update is dropped.
+ *
  * Tailnet Lock (a map with TKAInfo, or a register response carrying a
  * NodeKeySignature) and Debug.Exit move to FAILED, which is never retried;
  * only ts_sess_up leaves it.
@@ -83,6 +95,8 @@
 #define TS_SESS_RETRY_DEFAULT_MS 5000      /* else wait this plus up to as much again */
 #define TS_SESS_HEAD_PING_MS 15000       /* a PingRequest HEAD is cancelled after this */
 #define TS_SESS_REGEN_MIN_MS 60000       /* at most one new node key per minute */
+#define TS_SESS_LITE_RETRY_MIN_MS 1000   /* a failed lite map update: first retry delay */
+#define TS_SESS_LITE_RETRY_MAX_MS 30000  /* ... doubling to this */
 
 typedef enum {
     TS_SESS_IDLE,            /* not started, or logged out */
@@ -201,6 +215,12 @@ typedef struct {
     ts_sess_resp map;
     int map_live;                        /* a map message arrived on this stream */
     ts_sess_resp hp;                     /* PingRequest HEAD */
+    ts_sess_resp lite;                   /* lite map update (NetInfo) */
+    int derp_want;                       /* home DERP region to report, 0 none */
+    int derp_told;                       /* what control has on this connection, -1 unknown */
+    int derp_sent;                       /* the value in the open lite update */
+    int64_t lite_at;                     /* earliest next lite update */
+    int64_t lite_delay;                  /* next retry delay, 0 = minimum */
     int64_t hp_sent;
     char last_ping_url[TS_PING_URL_MAX + 1];
 
@@ -218,6 +238,12 @@ void ts_sess_init(ts_sess *s, const ts_state *st, const ts_sess_io *io, void *us
 /* Use another control host (a DNS name, at most TS_SESS_HOST_MAX bytes, bytes
  * '!'..'~' only). Call before ts_sess_up. Returns 0, or -1 (unchanged). */
 int ts_sess_set_host(ts_sess *s, const char *host);
+
+/* Our home DERP region (0 = none). Every register and map request from now on
+ * carries Hostinfo with "NetInfo":{"PreferredDERP":region} (omitted when 0).
+ * When it changes while the streaming map is live, the session sends one lite
+ * map update on the same connection. 0, or -1 (region < 0). */
+int ts_sess_set_preferred_derp(ts_sess *s, int region);
 
 /* Release memory. The caller has closed or will close the connection. */
 void ts_sess_free(ts_sess *s);
