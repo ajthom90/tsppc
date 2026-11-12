@@ -40,6 +40,11 @@
  * - Order: ts_dp_start, then ts_dp_set_netmap. ts_dp_start wipes everything
  *   of an earlier run (sessions, peers, filter, flows, connections);
  *   ts_dp_set_netmap and the traffic calls do nothing while stopped.
+ * - Call ts_dp_tick once right after ts_dp_start (before any other call), so
+ *   new connections and timers are stamped with the current time.
+ * - ts_dp_set_netmap compares derp_gen and filter_gen with the last map it
+ *   saw, so it must keep getting the same ts_netmap; after re-initialising
+ *   the netmap, call ts_dp_start again.
  * - io callbacks must not call back into the data plane (report conn_up,
  *   conn_recv and conn_down later, from the event loop). ts_dp_new copies io.
  * - dial: the caller connects TCP to node->ipv4:port (0 means 443) and runs

@@ -493,6 +493,17 @@ static size_t tcp_syn(uint8_t *b, uint32_t src, uint32_t dst, int dport)
     return 40;
 }
 
+static size_t udp_pkt(uint8_t *b, uint32_t src, uint32_t dst, int sport, int dport)
+{
+    ip_hdr(b, 36, TS_IPPROTO_UDP, src, dst);
+    memset(b + 20, 0, 16);
+    ts_put_be16(b + 20, (uint16_t)sport);
+    ts_put_be16(b + 22, (uint16_t)dport);
+    ts_put_be16(b + 24, 16);
+    memcpy(b + 28, "udp-flow", 8);
+    return 36;
+}
+
 static size_t tsmp_pkt(uint8_t *b, uint32_t src, uint32_t dst)
 {
     ip_hdr(b, 28, TS_IPPROTO_TSMP, src, dst);
@@ -687,6 +698,10 @@ void test_dp_filter(void)
 {
     static const char TCP22[] =
         "[{\"SrcIPs\":[\"100.64.0.1\"],\"DstPorts\":[{\"IP\":\"100.64.0.2\",\"Ports\":{\"First\":22,\"Last\":22}}]}]";
+    static const char TCP2223[] =
+        "[{\"SrcIPs\":[\"100.64.0.1\"],\"DstPorts\":[{\"IP\":\"100.64.0.2\",\"Ports\":{\"First\":22,\"Last\":23}}]}]";
+    static const char UDP_ALL[] =
+        "[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":0,\"Last\":65535}}],\"IPProto\":[17]}]";
     uint8_t b[64];
     size_t len;
     int before;
@@ -767,6 +782,47 @@ void test_dp_filter(void)
     ts_dp_get_status(N[1].dp, &st);
     t_true("filter: restart forgets", strcmp(st.filter, "none") == 0);
     t_true("filter: no bad tun", N[0].bad_tun == 0 && N[1].bad_tun == 0);
+    nodes_free();
+
+    /* UDP flows: B's outbound UDP lets the reversed tuple back in, under a
+     * filter that allows no UDP from A; the flow table survives a
+     * recompile and is forgotten by a restart. */
+    setup(2, NULL);
+    t_true("flow: A map", map_of(0, 3, UDP_ALL) == 0);
+    t_true("flow: B map", map_of(1, 3, TCP22) == 0);
+    len = udp_pkt(b, N[1].ip, N[0].ip, 5000, 53);
+    before = N[0].tun_n;
+    ts_dp_from_tun(N[1].dp, b, len);
+    pump();
+    advance(100);
+    t_true("flow: B to A", N[0].tun_n == before + 1);
+    before = N[1].tun_n;
+    f0 = CNT(1)->filtered;
+    len = udp_pkt(b, N[0].ip, N[1].ip, 53, 5000);
+    ts_dp_from_tun(N[0].dp, b, len);
+    pump();
+    t_true("flow: reply allowed", N[1].tun_n == before + 1 && CNT(1)->filtered == f0);
+    len = udp_pkt(b, N[0].ip, N[1].ip, 54, 5000);
+    ts_dp_from_tun(N[0].dp, b, len);
+    pump();
+    t_true("flow: other port dropped", N[1].tun_n == before + 1 && CNT(1)->filtered == f0 + 1);
+    t_true("flow: recompile", map_of(1, 3, TCP2223) == 0);
+    len = udp_pkt(b, N[0].ip, N[1].ip, 53, 5000);
+    ts_dp_from_tun(N[0].dp, b, len);
+    pump();
+    t_true("flow: kept across recompile", N[1].tun_n == before + 2);
+    advance(100);
+    node_start(&N[1]);
+    t_true("flow: B map again", map_of(1, 3, TCP2223) == 0);
+    ts_dp_set_home(N[1].dp, 1);
+    pump();
+    advance(100);
+    ping(1, 0, 9);   /* a fresh handshake started by B */
+    f0 = CNT(1)->filtered;
+    before = N[1].tun_n;
+    ts_dp_from_tun(N[0].dp, b, len);
+    pump();
+    t_true("flow: forgotten by a restart", N[1].tun_n == before && CNT(1)->filtered == f0 + 1);
     nodes_free();
 }
 
