@@ -1,0 +1,22 @@
+# Copy to <TSPPC_RUNNER_SSH>/config and set User. The VMs' SSH ports are
+# forwarded by UTM on the host; the container reaches them through
+# host.docker.internal. The key (<TSPPC_RUNNER_SSH>/id_vm) is used only by CI.
+Host leopard
+  HostName host.docker.internal
+  Port 2222
+
+Host tiger
+  HostName host.docker.internal
+  Port 2223
+  Ciphers +aes128-cbc
+
+Host *
+  User <vm-login>
+  IdentityFile ~/.ssh/id_vm
+  IdentitiesOnly yes
+  HostKeyAlgorithms +ssh-rsa
+  PubkeyAcceptedAlgorithms +ssh-rsa
+  KexAlgorithms +diffie-hellman-group14-sha1,diffie-hellman-group1-sha1
+  StrictHostKeyChecking accept-new
+  BatchMode yes
+  ConnectTimeout 20

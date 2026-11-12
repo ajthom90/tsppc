@@ -1,0 +1,37 @@
+name: powerpc
+
+# The PowerPC build and suite on the maintainer's emulated Leopard and Tiger
+# VMs, through the self-hosted runner described in docs/ci.md.
+#
+# Never runs for pull requests: a self-hosted runner must not run code from
+# forks. Only pushes to this repository (which need write access), release
+# tags and manual runs reach it.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: powerpc-vms
+  cancel-in-progress: false
+
+jobs:
+  powerpc:
+    if: github.repository_owner == 'ajthom90'
+    runs-on: [self-hosted, tsppc-vm]
+    timeout-minutes: 90
+    env:
+      TSPPC_SSH_CONFIG: /home/runner/.ssh/config
+      TSPPC_VM_DIR: tsppc-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Leopard (build, suite, release, constant-time and app checks)
+        run: tools/vm-test.sh leopard
+      - name: Tiger (suite built on Leopard)
+        run: tools/vm-test.sh tiger
