@@ -351,8 +351,12 @@ static void test_gates(void)
         "100.64.0.1\tme.corp.example me\n"
         "100.64.0.2\tnode.corp.example node\n"
         "100.64.0.4\tbox.other.ts.net\n"
-        "100.64.0.5\tcorp.example\n"
-        E "\n") && ns == 1);
+        E "\n") && ns == 2);
+    /* the suffix itself is never a node name we write */
+    setname(&peers[3], "ts.net.", IP(100, 64, 0, 5));
+    n = build(&nm, out, sizeof out, &ne, &ns);
+    t_true("gate: ts.net apex skipped", n > 0 && ns == 2 && !has(out, n, "100.64.0.5"));
+    setname(&peers[3], "corp.example.", IP(100, 64, 0, 5));
     /* no valid self: only ts.net names */
     nm.have_self = 0;
     n = build(&nm, out, sizeof out, &ne, &ns);

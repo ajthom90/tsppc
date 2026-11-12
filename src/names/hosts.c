@@ -109,8 +109,10 @@ static const char *suffix_of(const char *fqdn)
 static int ends_in(const char *fqdn, const char *suffix)
 {
     size_t fl = strlen(fqdn), sl = strlen(suffix);
-    if (sl == 0 || fl < sl || strcmp(fqdn + fl - sl, suffix) != 0) return 0;
-    return fl == sl || fqdn[fl - sl - 1] == '.';
+    /* At least one label before the suffix: the suffix itself (ts.net, or
+     * the tailnet's own domain) is never a node name we write. */
+    if (sl == 0 || fl <= sl + 1 || strcmp(fqdn + fl - sl, suffix) != 0) return 0;
+    return fqdn[fl - sl - 1] == '.';
 }
 
 static int banned_short(const char *s)
