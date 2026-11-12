@@ -29,10 +29,11 @@
  *
  * Inbound (pre() and runIn4), in order:
  * - a packet ts_pkt_parse refused never gets here (the caller drops it);
+ * - no filter (f NULL): drop every packet, later fragments included
+ *   ("no filter"), as upstream's tstun does with a nil filter;
  * - multicast destination (224/4): drop;
  * - link-local destination (169.254/16, except 169.254.169.254): drop;
- * - a later fragment (TS_PKT_LATER_FRAG): accept, filter or not;
- * - no filter (f NULL): drop ("no filter");
+ * - a later fragment (TS_PKT_LATER_FRAG): accept;
  * - a destination that isn't local_ip (or local_ip 0): drop;
  * - ICMP: echo reply (type 0 code 0) or error (types 3, 11 and 18, as
  *   upstream's ICMP4ParamProblem = 0x12) accepts; else any rule whose source
@@ -81,7 +82,7 @@ int ts_filter_compile(ts_filter **out, const char *const *json, const size_t *le
                       uint32_t local_ip, char *err, size_t errcap);
 void ts_filter_free(ts_filter *f);
 void ts_flows_init(ts_flows *fl);
-/* f NULL means "no filter yet": drop everything that reaches the rules.
+/* f NULL means "no filter yet": drop every packet (later fragments too).
  * fl may be NULL (no flow cache). why, if not NULL, gets a static reason. */
 int ts_filter_in(const ts_filter *f, ts_flows *fl, const ts_pkt *p, const char **why); /* 1 accept, 0 drop */
 void ts_filter_out(ts_flows *fl, const ts_pkt *p);   /* records UDP flows; never blocks */

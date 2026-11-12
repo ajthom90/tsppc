@@ -627,10 +627,12 @@ int ts_filter_in(const ts_filter *f, ts_flows *fl, const ts_pkt *p, const char *
 {
     ts_flow *e;
 
+    /* No filter yet: drop every packet, before pre() (upstream's tstun drops
+     * when its filter is nil, before the filter runs). */
+    if (!f) return verdict(0, "no filter", why);
     if (is_multicast(p->dst)) return verdict(0, "multicast", why);
     if (is_link_local(p->dst)) return verdict(0, "link-local-unicast", why);
     if (p->frag == TS_PKT_LATER_FRAG) return verdict(1, "fragment", why);
-    if (!f) return verdict(0, "no filter", why);
     if (f->local == 0 || p->dst != f->local) return verdict(0, "destination not allowed", why);
 
     switch (p->proto) {

@@ -15,7 +15,7 @@
  *   err is NUL-terminated within errcap (a small cap, so truncation runs);
  * - compiled twice, with local_ip the packet's dst (so the rules are reached)
  *   and a fixed address, it gives the same verdicts as itself (deterministic);
- * - a NULL filter accepts only later fragments;
+ * - a NULL filter drops every packet;
  * - whatever "[]" accepts, the compiled filter accepts (rules only add);
  * - after ts_filter_out of the packet, its reverse (UDP or SCTP, not a later
  *   fragment, not multicast or link-local) is accepted, even under "[]";
@@ -89,8 +89,7 @@ static void target(const uint8_t *data, size_t len)
     ts_flows_init(&FL);
     vn = ts_filter_in(NULL, &FL, &p, &why);
     TS_FUZZ_ASSERT(why != NULL);
-    TS_FUZZ_ASSERT(vn == (p.frag == TS_PKT_LATER_FRAG && !((p.dst >> 28) == 0xe) &&
-                          !((p.dst >> 16) == 0xa9fe && p.dst != 0xa9fea9feu)));
+    TS_FUZZ_ASSERT(vn == 0 && strcmp(why, "no filter") == 0);
     ve = ts_filter_in(e, &FL, &p, NULL);
     if (f) {
         vf = ts_filter_in(f, &FL, &p, &why);

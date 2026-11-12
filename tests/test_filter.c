@@ -384,11 +384,17 @@ static void test_filter_pre(void)
                                       strcmp(why, "destination not allowed") == 0);
     t_true("pre local 0 drops all", build(&p, 1, PEER, LOCAL, 0, 0, 0, 0) == 0 &&
                                     ts_filter_in(z, NULL, &p, NULL) == 0);
-    /* later fragments: accepted before the local check, even with no filter */
+    /* later fragments: accepted before the local check; no filter drops them */
     n = mkpkt(b, 5, 6, PEER, OTHER, 10, l4, 8);
     t_true("pre later frag", ts_pkt_parse(&p, b, n) == 0);
     t_true("pre later frag accepted", ts_filter_in(e, NULL, &p, NULL) == 1);
-    t_true("pre later frag accepted, no filter", ts_filter_in(NULL, NULL, &p, NULL) == 1);
+    t_true("pre later frag dropped, no filter", ts_filter_in(NULL, NULL, &p, &why) == 0 &&
+                                                strcmp(why, "no filter") == 0);
+    {
+        ts_pkt q = p;
+        q.dst = LOCAL;
+        t_true("pre later frag to local dropped, no filter", ts_filter_in(NULL, NULL, &q, NULL) == 0);
+    }
     n = mkpkt(b, 5, 6, PEER, IP(224, 1, 1, 1), 10, l4, 8);
     t_true("pre later frag multicast", ts_pkt_parse(&p, b, n) == 0 && ts_filter_in(NULL, NULL, &p, NULL) == 0);
     /* first fragments go through the rules */
