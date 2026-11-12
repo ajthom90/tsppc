@@ -20,11 +20,16 @@
  * with a port every control connection goes there, with TLS if it is 443),
  * TSPPC_CONTROL_KEY (control's public key in hex: no key fetch),
  * TSPPC_STATE_DIR and TSPPC_SOCKET override the defaults; TSPPC_NO_TUN and
- * TSPPC_DERP_PLAIN are the data plane's (dataplane_io.h).
+ * TSPPC_DERP_PLAIN are the data plane's (dataplane_io.h), TSPPC_HOSTS_FILE
+ * the hosts file's (names_io.h).
  *
  * The data plane (tun device, relays, home selection) runs from
  * dataplane_io.c, synced with the session once per loop turn; while it runs
- * the loop wakes at least every TS_DPIO_TICK_MS. */
+ * the loop wakes at least every TS_DPIO_TICK_MS.
+ *
+ * Peer names go into a tsppc block of /etc/hosts (names_io.c) while the data
+ * plane runs; the block is removed when it stops, at exit, and at the next
+ * start after a crash. */
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -42,6 +47,7 @@
 
 #include "dataplane_io.h"
 #include "ipc.h"
+#include "names_io.h"
 #include "src/control/noise.h"
 #include "src/control/session.h"
 #include "src/core/bytes.h"
@@ -666,8 +672,10 @@ static void build_status(rbuild *b)
     view v;
     char line[TS_NODE_NAME_MAX + 64], ip[16];
     const char *url;
+    char names[160];
     ts_dpio_view dv;
     get_view(&v);
+    ts_names_status(names, sizeof names);
     put(b, "ok", NULL);
     put(b, "state", v.name);
     put(b, "status", v.status);
@@ -675,6 +683,7 @@ static void build_status(rbuild *b)
     put(b, "wanted", D.want_up ? "up" : "down");
     if (D.sess && (url = ts_sess_login_url(D.sess)) != NULL) put(b, "url", url);
     if (v.problem[0]) put(b, "problem", v.problem);
+    put(b, "names", names);
     /* Wanted down: the session keeps its last map, which is stale. */
     if (D.sess && D.want_up) {
         const ts_netmap *nm = ts_sess_netmap(D.sess);
@@ -904,6 +913,7 @@ static void shutdown_all(void)
 {
     int i;
     ts_dpio_shutdown();
+    ts_names_shutdown();
     for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) client_close(&D.cl[i]);
     if (D.lfd >= 0) {
         close(D.lfd);
@@ -1008,9 +1018,12 @@ int main(int argc, char **argv)
         return 1;
     }
     ts_dpio_cleanup_route();
+    ts_names_init(logline);
+    ts_names_cleanup();
     if (ts_state_load_or_create(&D.st, D.state_dir, err, sizeof err) != 0) {
         fprintf(stderr, "tsppcd: node state: %s\n", err);
         ts_dpio_shutdown();
+        ts_names_shutdown();
         close(D.lfd);
         ts_ipc_unlink(D.sock_path, D.ldev, D.lino);
         return 1;
@@ -1043,6 +1056,11 @@ int main(int argc, char **argv)
         kf_tick();
         conn_flush();
         ts_dpio_sync(D.sess, D.want_up, D.fed, now_ms());
+        {
+            ts_dpio_view dv;
+            ts_dpio_get_view(&dv);
+            ts_names_sync(D.sess ? ts_sess_netmap(D.sess) : NULL, dv.running, D.fed, now_ms());
+        }
         D.fed = 0;
         log_state();
 

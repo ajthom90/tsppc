@@ -90,6 +90,15 @@ static int is(const char *out, int n, const char *want)
     return n > 0 && (size_t)n == strlen(want) && memcmp(out, want, (size_t)n) == 0;
 }
 
+/* out[0..n) holds want (memmem is not in the 10.4 SDK) */
+static int has(const char *out, int n, const char *want)
+{
+    size_t wl = strlen(want), i;
+    for (i = 0; n > 0 && i + wl <= (size_t)n; i++)
+        if (memcmp(out + i, want, wl) == 0) return 1;
+    return 0;
+}
+
 static void test_build(void)
 {
     static ts_node peers[6];
@@ -222,8 +231,8 @@ static void test_build(void)
         E "\n"));
     /* the address token is skipped; a name as first token is not a host name */
     n = buildold(&nm, out, sizeof out, "printer 1.2.3.4\nnas\n");
-    t_true("owner first token skipped", n > 0 && memmem(out, (size_t)n, "printer.example.ts.net printer", 30) != NULL &&
-                                            memmem(out, (size_t)n, "nas.example.ts.net nas", 22) != NULL);
+    t_true("owner first token skipped", has(out, n, "printer.example.ts.net printer") &&
+                                            has(out, n, "nas.example.ts.net nas"));
     t_true("old NULL", ts_hosts_build(out, sizeof out, &nm, NULL, 0, NULL, NULL) > 0);
     /* no self, no peers: markers only */
     nm.have_self = 0;

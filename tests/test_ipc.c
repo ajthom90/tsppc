@@ -22,6 +22,7 @@
 #include "../src/crypto/nacl.h"
 #include "../src/crypto/x25519.h"
 #include "../src/derp/derp.h"
+#include "../src/names/hosts.h"
 #include "../src/proto/encoding.h"
 #include "../src/state/store.h"
 
@@ -247,7 +248,7 @@ static int g_ctl_port = 1;
 
 static pid_t start_daemon(const char *statedir, const char *sock, const char *logpath, const char *key)
 {
-    char ctl[64];
+    char ctl[64], hosts[128];
     pid_t pid = fork();
     if (pid == 0) {
         int fd = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0600);
@@ -264,6 +265,9 @@ static pid_t start_daemon(const char *statedir, const char *sock, const char *lo
          * in these tests are plain TCP. */
         setenv("TSPPC_NO_TUN", "1", 1);
         setenv("TSPPC_DERP_PLAIN", "1", 1);
+        /* Never the real /etc/hosts either. */
+        snprintf(hosts, sizeof hosts, "%s/hosts", tmpdir);
+        setenv("TSPPC_HOSTS_FILE", hosts, 1);
         if (key) setenv("TSPPC_CONTROL_KEY", key, 1);
         else unsetenv("TSPPC_CONTROL_KEY");
         execl(TS_BIN_DIR "/tsppcd", "tsppcd", (char *)NULL);
@@ -448,6 +452,8 @@ static void remove_test_files(const char *statedir, const char *sock, const char
     unlink(countpath);
     unlink(sock);
     snprintf(p, sizeof p, "%s/%s", statedir, "state.bin");
+    unlink(p);
+    snprintf(p, sizeof p, "%s/hosts", tmpdir);
     unlink(p);
     rmdir(statedir);
     rmdir(tmpdir);
@@ -766,6 +772,7 @@ static void test_daemon_relay(void)
 {
     static fake f;
     char statedir[128], sock[128], logpath[128], countpath[128], evpath[128], key[65], out[8192], out2[8192], err[256];
+    char hostspath[128];
     ts_state st;
     pid_t pid, srv, rsrv;
     int lfd, rfd, rc;
@@ -785,7 +792,15 @@ static void test_daemon_relay(void)
     snprintf(countpath, sizeof countpath, "%s/conns", tmpdir);
     snprintf(evpath, sizeof evpath, "%s/relay", tmpdir);
     snprintf(g_lites_path, sizeof g_lites_path, "%s/lites", tmpdir);
+    snprintf(hostspath, sizeof hostspath, "%s/hosts", tmpdir);
     setenv("TSPPC_SOCKET", sock, 1);
+    {
+        FILE *hf = fopen(hostspath, "w");
+        if (hf) {
+            fputs("127.0.0.1\tlocalhost\n10.0.0.1 nas\n", hf);
+            fclose(hf);
+        }
+    }
 
     rc = load_state(statedir, &st);
     st.have_login = 1;
@@ -859,6 +874,15 @@ static void test_daemon_relay(void)
     t_true("relay: the dead region was not reported", !file_has(g_lites_path, "\"PreferredDERP\":9}"));
     t_true("relay: the log names the home region", wait_file_has(logpath, "home relay: region 7", 1000));
     t_true("relay: the log notes the relay up", file_has(logpath, "relay region 7 connected"));
+    /* Peer names: the hosts file (TSPPC_HOSTS_FILE, kept lines) gets the block. */
+    t_true("relay: hosts file has the peer's names",
+           wait_file_has(hostspath, "\n100.64.0.2\tpeer.example.test peer\n", 10000) &&
+               file_has(hostspath, "10.0.0.1 nas\n" TS_HOSTS_BEGIN "\n") &&
+               file_has(hostspath, "\t" SELFNAME " self\n"));
+    t_true("relay: status says how many names", wait_status(sock, "\nnames 2 names\n", out, sizeof out, 10000));
+    rc = run_cli("status", out2, sizeof out2);
+    t_true("relay: tsppc status prints the names line after filter",
+           rc == 0 && strstr(out2, "filter: none dropped 0\nnames: 2 names\n"));
 
     rc = run_cli("down", out, sizeof out);
     t_true("relay: down accepted", rc == 0);
@@ -867,15 +891,22 @@ static void test_daemon_relay(void)
            !strstr(out, "\nrelay ") && !strstr(out, "\ntunnel") && !strstr(out, "\nfilter") && !strstr(out, "\npath "));
     t_true("relay: down closes the relay connection", wait_file_has(evpath, "e", 10000));
     t_true("relay: the log says the data plane stopped", wait_file_has(logpath, "data plane stopped", 1000));
+    t_true("relay: down removes the names, keeps the rest",
+           wait_file_has(hostspath, "10.0.0.1 nas\n", 1000) && !file_has(hostspath, "tsppc") &&
+               wait_status(sock, "\nnames off\n", out, sizeof out, 10000));
 
     /* up again: a fresh data plane, the same home, a new relay connection. */
     raw_request(sock, "up\n", 3, out, sizeof out);
     t_true("relay: up again accepted", strncmp(out, "ok\n", 3) == 0);
     t_true("relay: up again connects the home relay", wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 120000));
     t_true("relay: a second relay connection", wait_file_has(evpath, "eu", 5000));
+    t_true("relay: up again writes the names again",
+           wait_file_has(hostspath, "\n100.64.0.2\tpeer.example.test peer\n", 10000));
 
     kill(pid, SIGTERM);
     t_true("relay: daemon exits", wait_exit(pid, 60000) == 0);
+    t_true("relay: exit removes the names, keeps the rest",
+           file_has(hostspath, "10.0.0.1 nas\n") && !file_has(hostspath, "tsppc"));
     {
         const uint8_t *keys[3];
         keys[0] = st.node_priv;
@@ -1161,6 +1192,8 @@ static void test_daemon(void)
     {
         char p[160];
         snprintf(p, sizeof p, "%s/%s", statedir, "state.bin");
+        unlink(p);
+        snprintf(p, sizeof p, "%s/hosts", tmpdir);
         unlink(p);
     }
     rmdir(statedir);

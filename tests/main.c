@@ -35,6 +35,7 @@ void test_dp_expiry(void);
 void test_dp_relay_full(void);
 void test_tun_cmds(void);
 void test_dpio(void);
+void test_names_io(void);
 
 int main(void)
 {
@@ -73,5 +74,6 @@ int main(void)
     test_dp_relay_full();
     test_tun_cmds();
     test_dpio();
+    test_names_io();
     return t_summary();
 }

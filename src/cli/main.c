@@ -108,12 +108,12 @@ static void fmt_ip(char *out, size_t cap, uint32_t a)
              (unsigned)(a >> 8 & 255), (unsigned)(a & 255));
 }
 
-/* The status keys ts_reply_parse leaves out: relay, tunnel, filter, and one
+/* The status keys ts_reply_parse leaves out: relay, tunnel, filter, names, and one
  * path line per peer with a WireGuard peer. Lines are taken from the reply
  * as received; values are cleaned before they are printed. */
 typedef struct {
-    char relay[TS_IPC_VALUE_MAX], tunnel[TS_IPC_VALUE_MAX], filter[TS_IPC_VALUE_MAX];
-    int have_relay, have_tunnel, have_filter;
+    char relay[TS_IPC_VALUE_MAX], tunnel[TS_IPC_VALUE_MAX], filter[TS_IPC_VALUE_MAX], names[TS_IPC_VALUE_MAX];
+    int have_relay, have_tunnel, have_filter, have_names;
 } extra_keys;
 
 static void scan_extras(extra_keys *x, const char *buf, size_t len)
@@ -135,6 +135,9 @@ static void scan_extras(extra_keys *x, const char *buf, size_t len)
         } else if (klen == 6 && memcmp(line, "filter", 6) == 0 && !x->have_filter) {
             ts_ipc_clean(x->filter, sizeof x->filter, line + voff, n - voff, 0);
             x->have_filter = 1;
+        } else if (klen == 5 && memcmp(line, "names", 5) == 0 && !x->have_names) {
+            ts_ipc_clean(x->names, sizeof x->names, line + voff, n - voff, 0);
+            x->have_names = 1;
         }
     }
 }
@@ -182,6 +185,7 @@ static int cmd_status(void)
     if (x.have_relay) printf("relay: %s\n", x.relay);
     if (x.have_tunnel) printf("tunnel: %s\n", x.tunnel);
     if (x.have_filter) printf("filter: %s\n", x.filter);
+    if (x.have_names) printf("names: %s\n", x.names);
     if (R.npeers) printf("Peers:\n");
     for (i = 0; i < R.npeers; i++) {
         char ip[16] = "-", path[128] = "";
