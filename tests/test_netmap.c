@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "../src/control/netmap.h"
+#include "../src/filter/filter.h"
 
 /* Invented keys and names only. */
 #define HA "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -43,11 +44,19 @@ typedef struct {
     size_t npeers;
     ts_node peers[TS_MAX_PEERS];
     ts_ping_req ping;
+    /* DERP map and filters, including the internal score table and session flags */
+    size_t nregions, nscores, nfilters, fblob_len;
+    uint32_t derp_gen, filter_gen;
+    int have_filter, derp_fresh, filter_fresh;
+    ts_derp_region regions[TS_DERP_MAX_REGIONS];
+    ts_derp_score scores[TS_DERP_SCORES_MAX];
+    char fblob[TS_FILTER_JSON_MAX + 4096];   /* each filter: name, NUL, length, text */
 } snap;
 
 static snap *take(const ts_netmap *m)
 {
     snap *s = (snap *)calloc(1, sizeof *s);
+    size_t i;
     if (!s) abort();
     s->self = m->self;
     s->have_self = m->have_self;
@@ -58,6 +67,26 @@ static snap *take(const ts_netmap *m)
     s->npeers = m->npeers;
     if (m->npeers) memcpy(s->peers, m->peers, m->npeers * sizeof(ts_node));
     s->ping = m->ping;
+    s->nregions = m->nregions;
+    if (m->nregions) memcpy(s->regions, m->regions, m->nregions * sizeof(ts_derp_region));
+    s->nscores = m->nscores;
+    if (m->nscores) memcpy(s->scores, m->scores, m->nscores * sizeof(ts_derp_score));
+    s->derp_gen = m->derp_gen;
+    s->filter_gen = m->filter_gen;
+    s->have_filter = m->have_filter;
+    s->derp_fresh = m->derp_fresh;
+    s->filter_fresh = m->filter_fresh;
+    s->nfilters = m->nfilters;
+    for (i = 0; i < m->nfilters; i++) {
+        size_t nl = strlen(m->filter_name[i]) + 1, len = m->filter_len[i];
+        if (s->fblob_len + nl + sizeof len + len > sizeof s->fblob) abort();
+        memcpy(s->fblob + s->fblob_len, m->filter_name[i], nl);
+        s->fblob_len += nl;
+        memcpy(s->fblob + s->fblob_len, &len, sizeof len);
+        s->fblob_len += sizeof len;
+        memcpy(s->fblob + s->fblob_len, m->filter_json[i], len);
+        s->fblob_len += len;
+    }
     return s;
 }
 
@@ -552,6 +581,401 @@ static void test_stream(void)
     }
 }
 
+/* ---- DERP map ------------------------------------------------------------ */
+
+static const ts_derp_region *region(const ts_netmap *m, int id)
+{
+    size_t i;
+    for (i = 0; i < m->nregions; i++)
+        if (m->regions[i].id == id) return &m->regions[i];
+    return NULL;
+}
+
+#define SELF_MSG "{\"Node\":" SELF_JSON("true") "}"
+
+#define REGION_1 \
+    "{\"RegionID\":1,\"RegionCode\":\"r1\",\"RegionName\":\"One\",\"NoMeasureNoHome\":true," \
+    "\"Nodes\":[{\"Name\":\"1a\",\"RegionID\":1,\"HostName\":\"derp1.example.test\"," \
+    "\"IPv4\":\"198.51.100.1\",\"IPv6\":\"2001:db8::1\",\"DERPPort\":443,\"STUNPort\":-1}]}"
+
+#define REGION_2 \
+    "{\"RegionID\":2,\"RegionCode\":\"r2\",\"Avoid\":true,\"Latitude\":1.5,\"Nodes\":[" \
+    "{\"Name\":\"2a\",\"HostName\":\"derp2.example.test\",\"IPv4\":\"192.0.2.2\",\"DERPPort\":0}," \
+    "{\"Name\":\"2b\",\"HostName\":\"derp2b.example.test\",\"IPv4\":\"none\"}," \
+    "{\"Name\":\"2c\",\"HostName\":\"derp2c.example.test\",\"IPv4\":\"192.0.2.3\",\"STUNOnly\":true}," \
+    "{\"Name\":\"2d\",\"HostName\":\"derp2d.example.test\",\"IPv4\":\"192.0.2.4\"," \
+    "\"CertName\":\"sha256-raw:00ff\"}," \
+    "null," \
+    "{\"Name\":\"2e\",\"HostName\":\"derp2e.example.test\",\"IPv4\":\"192.0.2.5\"," \
+    "\"CertName\":\"cert.example.test\",\"DERPPort\":8443,\"CanPort80\":true}," \
+    "{\"Name\":\"2f\",\"HostName\":\"derp2f.example.test\",\"IPv4\":\"192.0.2.6\",\"InsecureForTests\":true}," \
+    "{\"Name\":\"2g\",\"HostName\":\"bad host\",\"IPv4\":\"192.0.2.7\"}," \
+    "{\"Name\":\"2h\",\"HostName\":\"derp2h.example.test\"}," \
+    "{\"Name\":\"2i\",\"HostName\":\"derp2i.example.test\",\"IPv4\":\"192.0.2.08\"}," \
+    "{\"Name\":\"2j\",\"HostName\":\"derp2j.example.test\",\"IPv4\":\"192.0.2.9\",\"DERPPort\":70000}," \
+    "{\"Name\":\"2k\",\"HostName\":\"derp2k.example.test\",\"IPv4\":\"192.0.2.10\",\"DERPPort\":-1}]}"
+
+#define REGION_3 "{\"RegionCode\":\"r3\",\"Nodes\":[]}"
+
+#define DERP_FULL \
+    "{\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"1\":0.5,\"2\":2,\"7\":3}},\"Regions\":{" \
+    "\"2\":" REGION_2 ",\"1\":" REGION_1 ",\"3\":" REGION_3 ",\"4\":null},\"omitDefaultRegions\":true}}"
+
+static char *many_regions(int count, int first_id, const char *extra)
+{
+    size_t cap = (size_t)count * 160 + 512, n;
+    char *s = (char *)malloc(cap);
+    int i;
+    if (!s) abort();
+    n = (size_t)snprintf(s, cap, "{\"DERPMap\":{\"Regions\":{%s", extra);
+    /* Descending, so the lowest IDs arrive last and must evict higher ones. */
+    for (i = count - 1; i >= 0; i--)
+        n += (size_t)snprintf(s + n, cap - n, "%s\"%d\":{\"RegionCode\":\"x%d\",\"Nodes\":[{\"HostName\":"
+                              "\"d.example.test\",\"IPv4\":\"192.0.2.1\"}]}",
+                              (i == count - 1 && extra[0] == 0) ? "" : ",", first_id + i, i);
+    snprintf(s + n, cap - n, "}}}");
+    return s;
+}
+
+static void test_netmap_derpmap(void)
+{
+    ts_netmap m;
+    const ts_derp_region *r;
+    uint32_t g;
+    char *big;
+    size_t i;
+    int sorted;
+
+    ts_netmap_init(&m);
+    t_true("derp: none at first", m.nregions == 0 && m.derp_gen == 0 && m.regions != NULL);
+    t_true("derp: full map applies", apply(&m, SELF_MSG) == 0 && apply(&m, DERP_FULL) == 0);
+    t_true("derp: three regions, null one deleted", m.nregions == 3);
+    t_true("derp: sorted by ID", m.nregions == 3 && m.regions[0].id == 1 && m.regions[1].id == 2
+           && m.regions[2].id == 3);
+    t_true("derp: gen bumped", m.derp_gen != 0);
+    r = region(&m, 1);
+    t_true("derp: region 1", r && strcmp(r->code, "r1") == 0 && r->no_home == 1 && r->avoid == 0
+           && r->score == 0.5 && r->nnodes == 1);
+    if (r && r->nnodes == 1) {
+        t_true("derp: node 1a", strcmp(r->nodes[0].name, "1a") == 0
+               && strcmp(r->nodes[0].host, "derp1.example.test") == 0
+               && r->nodes[0].ipv4 == 0xC6336401u && r->nodes[0].port == 443);
+    }
+    r = region(&m, 2);
+    t_true("derp: region 2 flags and score", r && r->avoid == 1 && r->no_home == 0 && r->score == 2.0);
+    t_true("derp: region 2 keeps only usable nodes", r && r->nnodes == 2);
+    if (r && r->nnodes == 2) {
+        t_true("derp: DERPPort 0 is 443", strcmp(r->nodes[0].name, "2a") == 0
+               && strcmp(r->nodes[0].host, "derp2.example.test") == 0
+               && r->nodes[0].ipv4 == 0xC0000202u && r->nodes[0].port == 443);
+        t_true("derp: CertName is the TLS name", strcmp(r->nodes[1].name, "2e") == 0
+               && strcmp(r->nodes[1].host, "cert.example.test") == 0
+               && r->nodes[1].ipv4 == 0xC0000205u && r->nodes[1].port == 8443);
+    }
+    r = region(&m, 3);
+    t_true("derp: region without usable nodes kept", r && r->nnodes == 0 && r->score == 1.0
+           && strcmp(r->code, "r3") == 0);
+
+    g = m.derp_gen;
+    t_true("derp: same map again", apply(&m, DERP_FULL) == 0 && m.derp_gen == g);
+    t_true("derp: absent DERPMap", apply(&m, "{\"PeersRemoved\":[]}") == 0 && m.derp_gen == g
+           && m.nregions == 3);
+    t_true("derp: null DERPMap", apply(&m, "{\"DERPMap\":null}") == 0 && m.derp_gen == g && m.nregions == 3);
+    t_true("derp: empty DERPMap", apply(&m, "{\"DERPMap\":{}}") == 0 && m.derp_gen == g && m.nregions == 3);
+    t_true("derp: null RegionScore inherits", apply(&m,
+        "{\"DERPMap\":{\"HomeParams\":{\"RegionScore\":null}}}") == 0 && m.derp_gen == g
+        && region(&m, 1) && region(&m, 1)->score == 0.5);
+    t_true("derp: empty HomeParams inherits", apply(&m, "{\"DERPMap\":{\"HomeParams\":{}}}") == 0
+        && m.derp_gen == g);
+
+    /* A non-null Regions replaces every region; HomeParams is inherited. */
+    t_true("derp: replacement", apply(&m,
+        "{\"DERPMap\":{\"Regions\":{\"7\":" REGION_3 ",\"1\":" REGION_1 "}}}") == 0);
+    t_true("derp: replacement gen", m.derp_gen != g);
+    t_true("derp: replaced set", m.nregions == 2 && region(&m, 2) == NULL && region(&m, 1) && region(&m, 7));
+    t_true("derp: inherited score", region(&m, 1) && region(&m, 1)->score == 0.5);
+    t_true("derp: score for a region absent before", region(&m, 7) && region(&m, 7)->score == 3.0);
+    t_true("derp: regions back, scores still held", apply(&m,
+        "{\"DERPMap\":{\"Regions\":{\"2\":" REGION_2 "}}}") == 0 && m.nregions == 1
+        && region(&m, 2) && region(&m, 2)->score == 2.0);
+    g = m.derp_gen;
+    t_true("derp: new RegionScore replaces the table", apply(&m,
+        "{\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"2\":0,\"5\":-1}}}}") == 0
+        && region(&m, 2) && region(&m, 2)->score == 1.0 && m.derp_gen != g);
+    t_true("derp: score null is 1.0", apply(&m,
+        "{\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"2\":null}}}}") == 0
+        && region(&m, 2) && region(&m, 2)->score == 1.0);
+    g = m.derp_gen;
+    t_true("derp: duplicate region key, last wins", apply(&m,
+        "{\"DERPMap\":{\"Regions\":{\"2\":" REGION_2 ",\"9\":" REGION_1 ",\"2\":null,"
+        "\"9\":" REGION_3 "}}}") == 0 && m.nregions == 1 && region(&m, 9)
+        && strcmp(region(&m, 9)->code, "r3") == 0 && region(&m, 9)->nnodes == 0 && m.derp_gen != g);
+    t_true("derp: overlong RegionCode and Name stored empty", apply(&m,
+        "{\"DERPMap\":{\"Regions\":{\"1\":{\"RegionCode\":\"0123456789012345678901234567890123\","
+        "\"Nodes\":[{\"Name\":\"" HA "\",\"HostName\":\"d.example.test\",\"IPv4\":\"192.0.2.1\"}]}}}}") == 0
+        && region(&m, 1) && region(&m, 1)->code[0] == 0 && region(&m, 1)->nnodes == 1
+        && region(&m, 1)->nodes[0].name[0] == 0);
+    t_true("derp: more than 8 nodes, first 8 kept", apply(&m,
+        "{\"DERPMap\":{\"Regions\":{\"1\":{\"Nodes\":["
+        "{\"Name\":\"n1\",\"HostName\":\"d.example.test\",\"IPv4\":\"192.0.2.1\"},"
+        "{\"Name\":\"n2\",\"HostName\":\"d.example.test\",\"IPv4\":\"192.0.2.1\"},"
+        "{\"Name\":\"n3\",\"HostName\":\"d.example.test\",\"IPv4\":\"192.0.2.1\"},"
+        "{\"Name\":\"n4\",\"HostName\":\"d.example.test\",\"IPv4\":\"192.0.2.1\"},"
+        "{\"Name\":\"n5\",\"HostName\":\"d.example.test\",\"IPv4\":\"none\"},"
+        "{\"Name\":\"n6\",\"HostName\":\"d.example.test\",\"IPv4\":\"192.0.2.1\"},"
+        "{\"Name\":\"n7\",\"HostName\":\"d.example.test\",\"IPv4\":\"192.0.2.1\"},"
+        "{\"Name\":\"n8\",\"HostName\":\"d.example.test\",\"IPv4\":\"192.0.2.1\"},"
+        "{\"Name\":\"n9\",\"HostName\":\"d.example.test\",\"IPv4\":\"192.0.2.1\"},"
+        "{\"Name\":\"n10\",\"HostName\":\"d.example.test\",\"IPv4\":\"192.0.2.1\"}]}}}}") == 0
+        && region(&m, 1) && region(&m, 1)->nnodes == 8
+        && strcmp(region(&m, 1)->nodes[7].name, "n9") == 0);
+    t_true("derp: empty Regions clears", apply(&m, "{\"DERPMap\":{\"Regions\":{}}}") == 0 && m.nregions == 0);
+
+    /* More than TS_DERP_MAX_REGIONS: the lowest IDs are kept. IDs above
+     * INT_MAX are valid but never stored. */
+    big = many_regions(70, 100, "\"3000000000\":" REGION_3 ",\"9007199254740991\":" REGION_3);
+    t_true("derp: 72 regions apply", apply(&m, big) == 0);
+    free(big);
+    t_true("derp: lowest 64 kept", m.nregions == TS_DERP_MAX_REGIONS && m.regions[0].id == 100
+           && m.regions[TS_DERP_MAX_REGIONS - 1].id == 163);
+    sorted = 1;
+    for (i = 1; i < m.nregions; i++)
+        if (m.regions[i - 1].id >= m.regions[i].id) sorted = 0;
+    t_true("derp: still sorted", sorted);
+
+    /* Rejections: the map, regions and filters stay byte-identical. */
+    t_true("derp: back to the full map", apply(&m, DERP_FULL) == 0 && m.nregions == 3);
+    t_unchanged("derp: region ID 0", &m, "{\"DERPMap\":{\"Regions\":{\"0\":" REGION_3 "}}}");
+    t_unchanged("derp: region ID 2^53", &m, "{\"DERPMap\":{\"Regions\":{\"9007199254740992\":" REGION_3 "}}}");
+    t_unchanged("derp: region ID negative", &m, "{\"DERPMap\":{\"Regions\":{\"-1\":" REGION_3 "}}}");
+    t_unchanged("derp: region ID not a number", &m, "{\"DERPMap\":{\"Regions\":{\"x\":" REGION_3 "}}}");
+    t_unchanged("derp: score key not a number", &m,
+        "{\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"x\":1}}}}");
+    t_unchanged("derp: score key 0", &m, "{\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"0\":1}}}}");
+    t_unchanged("derp: score not a number", &m, "{\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"1\":\"x\"}}}}");
+    t_unchanged("derp: DERPMap not an object", &m, "{\"DERPMap\":[]}");
+    t_unchanged("derp: Regions not an object", &m, "{\"DERPMap\":{\"Regions\":[]}}");
+    t_unchanged("derp: HomeParams not an object", &m, "{\"DERPMap\":{\"HomeParams\":1}}");
+    t_unchanged("derp: region not an object", &m, "{\"DERPMap\":{\"Regions\":{\"1\":true}}}");
+    t_unchanged("derp: Nodes not an array", &m, "{\"DERPMap\":{\"Regions\":{\"1\":{\"Nodes\":{}}}}}");
+    t_unchanged("derp: node not an object", &m, "{\"DERPMap\":{\"Regions\":{\"1\":{\"Nodes\":[1]}}}}");
+    t_unchanged("derp: Avoid not a bool", &m, "{\"DERPMap\":{\"Regions\":{\"1\":{\"Avoid\":1}}}}");
+    t_unchanged("derp: RegionCode not a string", &m, "{\"DERPMap\":{\"Regions\":{\"1\":{\"RegionCode\":1}}}}");
+    t_unchanged("derp: IPv4 not a string", &m,
+        "{\"DERPMap\":{\"Regions\":{\"1\":{\"Nodes\":[{\"HostName\":\"d.example.test\",\"IPv4\":1}]}}}}");
+    t_unchanged("derp: DERPPort not an int", &m,
+        "{\"DERPMap\":{\"Regions\":{\"1\":{\"Nodes\":[{\"DERPPort\":\"443\"}]}}}}");
+    t_unchanged("derp: STUNOnly not a bool", &m,
+        "{\"DERPMap\":{\"Regions\":{\"1\":{\"Nodes\":[{\"STUNOnly\":\"no\"}]}}}}");
+    t_unchanged("derp: valid map, bad peer", &m,
+        "{\"DERPMap\":{\"Regions\":{\"5\":" REGION_1 "}},\"PacketFilters\":{\"q\":[]},"
+        "\"Peers\":[{\"ID\":\"bad\"}]}");
+
+    /* KeepAlive: checked, not applied. */
+    g = m.derp_gen;
+    t_true("derp: keepalive ignores DERPMap", apply(&m,
+        "{\"KeepAlive\":true,\"DERPMap\":{\"Regions\":{}}}") == 0 && m.nregions == 3 && m.derp_gen == g);
+    t_unchanged("derp: keepalive still type-checks", &m, "{\"KeepAlive\":true,\"DERPMap\":{\"Regions\":1}}");
+
+    /* Reset keeps the regions, and a reconnect map without DERPMap keeps them. */
+    ts_netmap_reset(&m);
+    t_true("derp: reset keeps regions", m.nregions == 3 && m.derp_gen == g && region(&m, 1)
+           && region(&m, 1)->score == 0.5);
+    t_true("derp: reconnect map without DERPMap keeps them", apply(&m, SELF_MSG) == 0
+           && m.nregions == 3 && m.derp_gen == g);
+    /* The first DERPMap of a session starts from nothing: no inherited scores. */
+    t_true("derp: first DERPMap after reset", apply(&m,
+        "{\"DERPMap\":{\"Regions\":{\"1\":" REGION_1 "}}}") == 0 && m.nregions == 1
+        && region(&m, 1) && region(&m, 1)->score == 1.0 && m.derp_gen != g);
+    t_true("derp: second DERPMap inherits again", apply(&m,
+        "{\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"1\":4}}}}") == 0 && m.nregions == 1
+        && region(&m, 1)->score == 4.0);
+    ts_netmap_reset(&m);
+    t_true("derp: first DERPMap without Regions empties", apply(&m,
+        "{\"Node\":" SELF_JSON("true") ",\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"1\":4}}}}") == 0
+        && m.nregions == 0);
+    ts_netmap_free(&m);
+}
+
+/* ---- packet filters -------------------------------------------------------- */
+
+#define RULE_SSH "[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":22,\"Last\":22}}]}]"
+#define RULE_WEB "[{\"SrcIPs\":[\"100.64.0.0/10\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":80,\"Last\":80}}]}]"
+
+static int filters_are(const ts_netmap *m, const char *const *names, const char *const *texts, size_t n)
+{
+    size_t i;
+    if (m->nfilters != n) return 0;
+    for (i = 0; i < n; i++) {
+        if (strcmp(m->filter_name[i], names[i]) != 0) return 0;
+        if (m->filter_len[i] != strlen(texts[i]) || memcmp(m->filter_json[i], texts[i], m->filter_len[i]))
+            return 0;
+    }
+    return 1;
+}
+
+static int compiles(const ts_netmap *m)
+{
+    ts_filter *f = NULL;
+    char err[128];
+    int rc = ts_filter_compile(&f, (const char *const *)m->filter_json, m->filter_len, m->nfilters,
+                               0x64400001u, err, sizeof err);
+    ts_filter_free(f);
+    return rc == 0;
+}
+
+static char *names_msg(int count, const char *extra)
+{
+    size_t cap = (size_t)count * 32 + 256, n;
+    char *s = (char *)malloc(cap);
+    int i;
+    if (!s) abort();
+    n = (size_t)snprintf(s, cap, "{\"PacketFilters\":{%s", extra);
+    for (i = 0; i < count; i++)
+        n += (size_t)snprintf(s + n, cap - n, "%s\"n%02d\":[]", (i == 0 && extra[0] == 0) ? "" : ",", i);
+    snprintf(s + n, cap - n, "}}");
+    return s;
+}
+
+static void test_netmap_filters(void)
+{
+    ts_netmap m;
+    uint32_t g;
+    char *s;
+    size_t n, cap;
+    static const char *const n3[] = { "aa", "base", "zz" };
+    static const char *const t3[] = { "[ ]", RULE_SSH, RULE_WEB };
+    static const char *const n2[] = { "aa", "base" };
+    static const char *const t2[] = { "[ ]", RULE_SSH };
+
+    ts_netmap_init(&m);
+    t_true("filter: none at first", apply(&m, SELF_MSG) == 0 && !m.have_filter && m.nfilters == 0
+           && m.filter_gen == 0);
+    t_true("filter: PacketFilter and PacketFilters in one message", apply(&m,
+        "{\"PacketFilters\":{\"zz\":" RULE_WEB ",\"aa\":[ ]},\"PacketFilter\":" RULE_SSH "}") == 0);
+    t_true("filter: sorted, base included, exact text", filters_are(&m, n3, t3, 3));
+    t_true("filter: have_filter and gen", m.have_filter == 1 && m.filter_gen != 0);
+    t_true("filter: texts NUL-terminated", m.nfilters == 3 && m.filter_json[1][m.filter_len[1]] == 0);
+    t_true("filter: stored texts compile", compiles(&m));
+    g = m.filter_gen;
+    t_true("filter: same again, gen unchanged", apply(&m,
+        "{\"PacketFilter\":" RULE_SSH ",\"PacketFilters\":{\"aa\":[ ],\"zz\":" RULE_WEB "}}") == 0
+        && filters_are(&m, n3, t3, 3) && m.filter_gen == g);
+    t_true("filter: absent means unchanged", apply(&m, "{\"PeersRemoved\":[]}") == 0
+           && filters_are(&m, n3, t3, 3) && m.filter_gen == g);
+    t_true("filter: null means unchanged", apply(&m, "{\"PacketFilter\":null,\"PacketFilters\":null}") == 0
+           && filters_are(&m, n3, t3, 3) && m.filter_gen == g);
+    t_true("filter: delete by null", apply(&m, "{\"PacketFilters\":{\"zz\":null,\"nope\":null}}") == 0
+           && filters_are(&m, n2, t2, 2) && m.filter_gen != g);
+    g = m.filter_gen;
+    {
+        static const char *const nn[] = { "new" };
+        static const char *const tn[] = { "[]" };
+        t_true("filter: \"*\":null clears first, wherever it is", apply(&m,
+            "{\"PacketFilters\":{\"new\":[],\"*\":null}}") == 0 && filters_are(&m, nn, tn, 1)
+            && m.filter_gen != g);
+    }
+    {
+        static const char *const nx[] = { "x" };
+        static const char *const tx[] = { "[]" };
+        t_true("filter: \"*\":null also clears this message's base", apply(&m,
+            "{\"PacketFilter\":" RULE_SSH ",\"PacketFilters\":{\"*\":null,\"x\":[]}}") == 0
+            && filters_are(&m, nx, tx, 1));
+        g = m.filter_gen;
+        t_true("filter: non-null \"*\" ignored", apply(&m, "{\"PacketFilters\":{\"*\":[]}}") == 0
+               && filters_are(&m, nx, tx, 1) && m.filter_gen == g);
+        t_true("filter: duplicate name, last wins", apply(&m,
+            "{\"PacketFilters\":{\"y\":[],\"y\":null,\"x\":null,\"x\":[]}}") == 0 && filters_are(&m, nx, tx, 1)
+            && m.filter_gen == g);
+    }
+    {
+        static const char *const nb[] = { "base" };
+        static const char *const tb[] = { "[]" };
+        t_true("filter: \"*\":null after PacketFilter clears it too", apply(&m,
+            "{\"PacketFilters\":{\"*\":null},\"PacketFilter\":[]}") == 0 && m.nfilters == 0);
+        t_true("filter: [] is a real, empty filter", apply(&m, "{\"PacketFilter\":[]}") == 0
+            && filters_are(&m, nb, tb, 1) && m.have_filter && compiles(&m));
+    }
+
+    /* Rejections leave everything byte-identical. */
+    t_unchanged("filter: PacketFilter not an array", &m, "{\"PacketFilter\":{}}");
+    t_unchanged("filter: PacketFilter a string", &m, "{\"PacketFilter\":\"[]\"}");
+    t_unchanged("filter: PacketFilters not an object", &m, "{\"PacketFilters\":[]}");
+    t_unchanged("filter: named value not an array", &m, "{\"PacketFilters\":{\"a\":{}}}");
+    t_unchanged("filter: \"*\" not an array", &m, "{\"PacketFilters\":{\"*\":1}}");
+    t_true("filter: plain rejection is not a limit", apply(&m, "{\"PacketFilters\":{\"a\":1}}") == -1
+           && !m.last_limit);
+    s = names_msg(TS_FILTER_NAMES_MAX + 1, "\"*\":null");
+    t_unchanged("filter: 17 names", &m, s);
+    t_true("filter: 17 names is a limit", apply(&m, s) == -1 && m.last_limit == 1);
+    free(s);
+    t_unchanged("filter: name of 64 bytes", &m,
+        "{\"PacketFilters\":{\"" HA "\":[]}}");
+    t_true("filter: long name is a limit", apply(&m, "{\"PacketFilters\":{\"" HA "\":[]}}") == -1
+           && m.last_limit == 1);
+    t_true("filter: name of 63 bytes", apply(&m,
+        "{\"PacketFilters\":{\"" "123456789012345678901234567890123456789012345678901234567890123" "\":[]}}") == 0
+        && m.nfilters == 2);
+    s = names_msg(TS_FILTER_NAMES_MAX, "\"*\":null");
+    t_true("filter: 16 names", apply(&m, s) == 0 && m.nfilters == TS_FILTER_NAMES_MAX);
+    free(s);
+    t_true("filter: at 16, set one and delete one", apply(&m,
+        "{\"PacketFilters\":{\"new\":[],\"n01\":null}}") == 0 && m.nfilters == TS_FILTER_NAMES_MAX);
+    t_true("filter: at 16, delete after set still passes", apply(&m,
+        "{\"PacketFilters\":{\"new2\":[],\"n02\":null}}") == 0 && m.nfilters == TS_FILTER_NAMES_MAX);
+    t_unchanged("filter: at 16, one more", &m, "{\"PacketFilters\":{\"extra\":[]}}");
+
+    /* All texts together over TS_FILTER_JSON_MAX. */
+    t_true("filter: back to one", apply(&m, "{\"PacketFilters\":{\"*\":null,\"a\":[]}}") == 0);
+    cap = TS_FILTER_JSON_MAX + 256;
+    s = (char *)malloc(cap);
+    if (!s) abort();
+    n = (size_t)snprintf(s, cap, "{\"PacketFilters\":{\"b\":[");
+    while (n < TS_FILTER_JSON_MAX + 64) s[n++] = ' ';
+    n += (size_t)snprintf(s + n, cap - n, "]}}");
+    t_unchanged("filter: total over TS_FILTER_JSON_MAX", &m, s);
+    t_true("filter: size is a limit", apply(&m, s) == -1 && m.last_limit == 1);
+    /* Exactly at the limit, together with "a" ([] is 2 bytes). */
+    n = (size_t)snprintf(s, cap, "{\"PacketFilters\":{\"b\":[");
+    while (n < sizeof "{\"PacketFilters\":{\"b\":[" - 1 + TS_FILTER_JSON_MAX - 4) s[n++] = ' ';
+    n += (size_t)snprintf(s + n, cap - n, "]}}");
+    t_true("filter: total at TS_FILTER_JSON_MAX", apply(&m, s) == 0 && m.nfilters == 2
+           && m.filter_len[0] + m.filter_len[1] == TS_FILTER_JSON_MAX);
+    free(s);
+
+    /* A message rejected after the filters were staged changes nothing. */
+    t_unchanged("filter: good filters, bad peer", &m,
+        "{\"PacketFilters\":{\"*\":null,\"q\":[]},\"Peers\":[{\"ID\":\"bad\"}]}");
+    g = m.filter_gen;
+    t_true("filter: keepalive ignores filters", apply(&m,
+        "{\"KeepAlive\":true,\"PacketFilters\":{\"*\":null}}") == 0 && m.nfilters == 2 && m.filter_gen == g);
+
+    /* Reset keeps the filters; a reconnect map without filter fields keeps them. */
+    t_true("filter: set a and stale", apply(&m, "{\"PacketFilters\":{\"*\":null,\"a\":[],\"stale\":[]}}") == 0);
+    g = m.filter_gen;
+    ts_netmap_reset(&m);
+    t_true("filter: reset keeps filters", m.nfilters == 2 && m.have_filter && m.filter_gen == g);
+    t_true("filter: reconnect map without filters keeps them", apply(&m, SELF_MSG) == 0
+           && m.nfilters == 2 && m.filter_gen == g);
+    {
+        static const char *const na[] = { "a" };
+        static const char *const ta[] = { "[]" };
+        t_true("filter: no stale named filter after a reconnect", apply(&m,
+            "{\"PacketFilters\":{\"a\":[]}}") == 0 && filters_are(&m, na, ta, 1) && m.filter_gen != g);
+        g = m.filter_gen;
+        t_true("filter: then deltas merge again", apply(&m, "{\"PacketFilters\":{\"b\":[]}}") == 0
+               && m.nfilters == 2 && m.filter_gen != g);
+    }
+    ts_netmap_free(&m);
+
+    /* have_filter alone counts as a change. */
+    ts_netmap_init(&m);
+    t_true("filter: delete-only message sets have_filter", apply(&m, SELF_MSG) == 0
+           && apply(&m, "{\"PacketFilters\":{\"x\":null}}") == 0 && m.have_filter && m.nfilters == 0
+           && m.filter_gen != 0);
+    ts_netmap_free(&m);
+}
+
 void test_netmap(void)
 {
     test_full_map();
@@ -560,5 +984,7 @@ void test_netmap(void)
     test_keepalive_and_extras();
     test_limits();
     test_unknown_and_null();
+    test_netmap_derpmap();
+    test_netmap_filters();
     test_stream();
 }

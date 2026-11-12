@@ -1,6 +1,7 @@
 #include "fuzz.h"
 #include "../src/control/netmap.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,9 +12,14 @@
  *   so the "initial MapResponse lacked Node" rejection is reached);
  * - invariants hold after every apply: npeers <= TS_MAX_PEERS, unique IDs,
  *   every name and ping string NUL-terminated, sleep within its cap;
- * - a rejected message leaves the observable state byte-for-byte unchanged;
+ * - a rejected message leaves the observable state byte-for-byte unchanged,
+ *   the DERP regions, score table, filters, gens and session flags included;
  * - an accepted message is idempotent: applying it again succeeds and changes
- *   nothing (every MapResponse field we apply is);
+ *   nothing, so derp_gen and filter_gen do not bump (every MapResponse field
+ *   we apply is idempotent);
+ * - regions are sorted by ID with nnodes <= TS_DERP_MAX_NODES and usable
+ *   nodes only; filters are sorted by name, NUL-terminated JSON arrays within
+ *   TS_FILTER_JSON_MAX together;
  * - the input fed to the stream framer whole and in small pieces gives the
  *   same messages and the same result, both raw and framed into messages
  *   (one over 4 KiB, so the buffer grows past its first allocation). */
@@ -28,14 +34,41 @@ typedef struct {
     size_t npeers;
     ts_node peers[TS_MAX_PEERS];
     ts_ping_req ping;
+    size_t nregions, nscores, nfilters, flen;
+    uint32_t derp_gen, filter_gen;
+    int have_filter, derp_fresh, filter_fresh;
+    ts_derp_region regions[TS_DERP_MAX_REGIONS];
+    ts_derp_score scores[TS_DERP_SCORES_MAX];
+    /* not compared directly: the filters, serialized (name, NUL, length, text) */
+    uint8_t *fb;
+    size_t fbcap;
 } snap;
+
+#define SNAP_FIXED offsetof(snap, fb)
 
 static ts_netmap M;
 static snap *BASE[3], *S1, *S2;
 
+static void fb_add(snap *s, const void *p, size_t n)
+{
+    if (s->flen + n > s->fbcap) {
+        size_t nc = (s->flen + n) * 2 + 64;
+        uint8_t *nb = (uint8_t *)realloc(s->fb, nc);
+        TS_FUZZ_ASSERT(nb != NULL);
+        s->fb = nb;
+        s->fbcap = nc;
+    }
+    memcpy(s->fb + s->flen, p, n);
+    s->flen += n;
+}
+
 static void take(snap *s, const ts_netmap *m)
 {
+    uint8_t *fb = s->fb;
+    size_t fbcap = s->fbcap, i;
     memset(s, 0, sizeof *s);
+    s->fb = fb;
+    s->fbcap = fbcap;
     s->self = m->self;
     s->have_self = m->have_self;
     s->tka = m->tka_enabled;
@@ -45,6 +78,27 @@ static void take(snap *s, const ts_netmap *m)
     s->npeers = m->npeers;
     if (m->npeers) memcpy(s->peers, m->peers, m->npeers * sizeof(ts_node));
     s->ping = m->ping;
+    s->nregions = m->nregions;
+    if (m->nregions) memcpy(s->regions, m->regions, m->nregions * sizeof(ts_derp_region));
+    s->nscores = m->nscores;
+    if (m->nscores) memcpy(s->scores, m->scores, m->nscores * sizeof(ts_derp_score));
+    s->derp_gen = m->derp_gen;
+    s->filter_gen = m->filter_gen;
+    s->have_filter = m->have_filter;
+    s->derp_fresh = m->derp_fresh;
+    s->filter_fresh = m->filter_fresh;
+    s->nfilters = m->nfilters;
+    for (i = 0; i < m->nfilters; i++) {
+        size_t len = m->filter_len[i];
+        fb_add(s, m->filter_name[i], strlen(m->filter_name[i]) + 1);
+        fb_add(s, &len, sizeof len);
+        fb_add(s, m->filter_json[i], len);
+    }
+}
+
+static int same(const snap *a, const snap *b)
+{
+    return memcmp(a, b, SNAP_FIXED) == 0 && (a->flen == 0 || memcmp(a->fb, b->fb, a->flen) == 0);
 }
 
 static void restore(ts_netmap *m, const snap *s)
@@ -59,6 +113,41 @@ static void restore(ts_netmap *m, const snap *s)
     m->npeers = s->npeers;
     if (s->npeers) memcpy(m->peers, s->peers, s->npeers * sizeof(ts_node));
     m->ping = s->ping;
+    m->nregions = s->nregions;
+    if (s->nregions) memcpy(m->regions, s->regions, s->nregions * sizeof(ts_derp_region));
+    m->nscores = s->nscores;
+    if (s->nscores) memcpy(m->scores, s->scores, s->nscores * sizeof(ts_derp_score));
+    m->derp_gen = s->derp_gen;
+    m->filter_gen = s->filter_gen;
+    m->have_filter = s->have_filter;
+    m->derp_fresh = s->derp_fresh;
+    m->filter_fresh = s->filter_fresh;
+    /* The netmap owns its filter strings (malloc); replace them with copies. */
+    {
+        size_t i, o = 0;
+        for (i = 0; i < m->nfilters; i++) {
+            free(m->filter_name[i]);
+            free(m->filter_json[i]);
+            m->filter_name[i] = m->filter_json[i] = NULL;
+            m->filter_len[i] = 0;
+        }
+        for (i = 0; i < s->nfilters; i++) {
+            size_t nl = strlen((const char *)s->fb + o) + 1, len;
+            m->filter_name[i] = (char *)malloc(nl);
+            TS_FUZZ_ASSERT(m->filter_name[i] != NULL);
+            memcpy(m->filter_name[i], s->fb + o, nl);
+            o += nl;
+            memcpy(&len, s->fb + o, sizeof len);
+            o += sizeof len;
+            m->filter_json[i] = (char *)malloc(len + 1);
+            TS_FUZZ_ASSERT(m->filter_json[i] != NULL);
+            memcpy(m->filter_json[i], s->fb + o, len);
+            m->filter_json[i][len] = 0;
+            m->filter_len[i] = len;
+            o += len;
+        }
+        m->nfilters = s->nfilters;
+    }
 }
 
 static void check_node(const ts_node *n)
@@ -82,6 +171,32 @@ static void invariants(const ts_netmap *m)
     TS_FUZZ_ASSERT(!m->ping.pending || m->ping.url[0] != 0);
     TS_FUZZ_ASSERT(m->sleep_ms <= TS_MAP_SLEEP_MAX_MS);
     TS_FUZZ_ASSERT(memchr(m->last_error, 0, sizeof m->last_error) != NULL);
+    TS_FUZZ_ASSERT(m->nregions <= TS_DERP_MAX_REGIONS && m->nscores <= TS_DERP_SCORES_MAX);
+    for (i = 0; i < m->nregions; i++) {
+        const ts_derp_region *g = &m->regions[i];
+        TS_FUZZ_ASSERT(g->id > 0 && (i == 0 || m->regions[i - 1].id < g->id));
+        TS_FUZZ_ASSERT(g->nnodes <= TS_DERP_MAX_NODES && g->score > 0);
+        TS_FUZZ_ASSERT(memchr(g->code, 0, sizeof g->code) != NULL);
+        for (k = 0; k < g->nnodes; k++) {
+            TS_FUZZ_ASSERT(memchr(g->nodes[k].name, 0, sizeof g->nodes[k].name) != NULL);
+            TS_FUZZ_ASSERT(g->nodes[k].host[0] != 0 && g->nodes[k].port != 0);
+            TS_FUZZ_ASSERT(memchr(g->nodes[k].host, 0, sizeof g->nodes[k].host) != NULL);
+        }
+    }
+    {
+        size_t total = 0;
+        TS_FUZZ_ASSERT(m->nfilters <= TS_FILTER_NAMES_MAX);
+        TS_FUZZ_ASSERT(m->nfilters == 0 || m->have_filter);
+        for (i = 0; i < m->nfilters; i++) {
+            TS_FUZZ_ASSERT(strlen(m->filter_name[i]) <= TS_FILTER_NAME_MAX);
+            TS_FUZZ_ASSERT(i == 0 || strcmp(m->filter_name[i - 1], m->filter_name[i]) < 0);
+            TS_FUZZ_ASSERT(m->filter_len[i] >= 2 && m->filter_json[i][0] == '['
+                           && m->filter_json[i][m->filter_len[i] - 1] == ']'
+                           && m->filter_json[i][m->filter_len[i]] == 0);
+            total += m->filter_len[i];
+        }
+        TS_FUZZ_ASSERT(total <= TS_FILTER_JSON_MAX);
+    }
 }
 
 typedef struct {
@@ -170,14 +285,14 @@ static void target(const uint8_t *data, size_t len)
         invariants(&M);
         TS_FUZZ_ASSERT(M.last_error[0] != 0);
         take(S2, &M);
-        TS_FUZZ_ASSERT(memcmp(S1, S2, sizeof *S1) == 0);
+        TS_FUZZ_ASSERT(same(S1, S2));
     } else {
         invariants(&M);
         take(S1, &M);
         TS_FUZZ_ASSERT(ts_netmap_apply(&M, json, len) == 0);
         invariants(&M);
         take(S2, &M);
-        TS_FUZZ_ASSERT(memcmp(S1, S2, sizeof *S1) == 0);
+        TS_FUZZ_ASSERT(same(S1, S2));
     }
     stream_check(data, len);
     stream_shaped(data, len);
@@ -205,13 +320,26 @@ static const char *const SEEDS[] = {
     "\"Peers\":[{\"ID\":10,\"Name\":\"a.example.test.\",\"DERP\":\"127.3.3.40:7\"},{\"ID\":11}],"
     "\"TKAInfo\":{\"Head\":\"h\",\"Disabled\":false},\"Debug\":{\"Exit\":1,\"SleepSeconds\":2.5},"
     "\"PingRequest\":{\"URL\":\"https://ping.example.test/x\",\"URLIsNoise\":true,\"Types\":\"\"},"
-    "\"DERPMap\":{\"Regions\":{}},\"KeepAlive\":false}",
+    "\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"1\":0.5,\"3\":2}},\"Regions\":{"
+    "\"1\":{\"RegionID\":1,\"RegionCode\":\"r1\",\"Avoid\":false,\"NoMeasureNoHome\":true,\"Nodes\":["
+    "{\"Name\":\"1a\",\"HostName\":\"d1.example.test\",\"IPv4\":\"192.0.2.1\",\"DERPPort\":0},"
+    "{\"Name\":\"1b\",\"HostName\":\"d1b.example.test\",\"IPv4\":\"none\",\"STUNOnly\":true},"
+    "{\"Name\":\"1c\",\"HostName\":\"d1c.example.test\",\"IPv4\":\"192.0.2.3\","
+    "\"CertName\":\"sha256-raw:00\",\"InsecureForTests\":false}]},"
+    "\"3\":{\"RegionCode\":\"r3\",\"Nodes\":[{\"HostName\":\"d3.example.test\",\"IPv4\":\"192.0.2.9\","
+    "\"CertName\":\"c3.example.test\",\"DERPPort\":8443}]},\"4\":null}},"
+    "\"PacketFilter\":[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":22,\"Last\":22}}]}],"
+    "\"PacketFilters\":{\"b\":[],\"a\":[{\"SrcIPs\":[\"100.64.0.0/10\"]}]},\"KeepAlive\":false}",
     "{\"PeersRemoved\":[10],\"OnlineChange\":{\"11\":true},\"PeerSeenChange\":{\"11\":true},"
     "\"PeersChanged\":[{\"ID\":12,\"Key\":\"nodekey:" HB "\"}],"
     "\"PeersChangedPatch\":[{\"NodeID\":11,\"DERPRegion\":4,\"Online\":false,\"Key\":\"nodekey:" HA "\","
     "\"DiscoKey\":\"discokey:" HA "\",\"KeyExpiry\":\"2100-01-01T00:00:00.5+02:00\"}],"
     "\"Peers\":[{\"ID\":13}]}",
     "{\"PeersChanged\":[{\"ID\":500},{\"ID\":501}],\"PeersRemoved\":[101]}",
+    "{\"DERPMap\":{\"Regions\":{\"2\":{\"Nodes\":[null,{\"HostName\":\"d2.example.test\",\"IPv4\":\"192.0.2.2\"}]},"
+    "\"3000000000\":{},\"2\":null,\"5\":{}},\"HomeParams\":{\"RegionScore\":null}},"
+    "\"PacketFilters\":{\"*\":null,\"x\":[],\"a\":null,\"x\":null,\"y\":[[1]]}}",
+    "{\"DERPMap\":{\"HomeParams\":{\"RegionScore\":{\"1\":-1,\"9\":1e3}}},\"PacketFilter\":[],\"PacketFilters\":{\"b\":null}}",
     "{\"KeepAlive\":true,\"PingRequest\":{\"URL\":\"https://ping.example.test/y\",\"Types\":\"c2n\"}}",
     "{\"Peers\":[],\"OnlineChange\":{\"100\":false,\"-5\":true},\"Debug\":{\"Exit\":null,\"SleepSeconds\":1e400}}",
     "\x0f\x00\x00\x00{\"KeepAlive\":1}\x00\x00\x00\x00\x02\x00\x00\x00{}\xff\xff\xff\x7f",
@@ -225,13 +353,14 @@ void ts_fuzz_netmap(void)
     char *big;
 
     TS_FUZZ_ASSERT(ts_netmap_init(&M) == 0);
-    BASE[0] = (snap *)malloc(sizeof(snap));
-    BASE[1] = (snap *)malloc(sizeof(snap));
-    BASE[2] = (snap *)malloc(sizeof(snap));
-    S1 = (snap *)malloc(sizeof(snap));
-    S2 = (snap *)malloc(sizeof(snap));
+    BASE[0] = (snap *)calloc(1, sizeof(snap));
+    BASE[1] = (snap *)calloc(1, sizeof(snap));
+    BASE[2] = (snap *)calloc(1, sizeof(snap));
+    S1 = (snap *)calloc(1, sizeof(snap));
+    S2 = (snap *)calloc(1, sizeof(snap));
     TS_FUZZ_ASSERT(BASE[0] && BASE[1] && BASE[2] && S1 && S2);
     TS_FUZZ_ASSERT(ts_netmap_apply(&M, SEEDS[0], strlen(SEEDS[0])) == 0);
+    TS_FUZZ_ASSERT(M.nregions == 2 && M.regions[0].nnodes == 1 && M.nfilters == 3 && M.have_filter);
     take(BASE[0], &M);
     ts_netmap_reset(&M);
     big = big_base();
@@ -249,9 +378,14 @@ void ts_fuzz_netmap(void)
     ts_fuzz_run("netmap", target, seeds, lens, nseeds, TS_FUZZ_DEFAULT_ITERS);
 
     ts_netmap_free(&M);
+    free(BASE[0]->fb);
     free(BASE[0]);
+    free(BASE[1]->fb);
     free(BASE[1]);
+    free(BASE[2]->fb);
     free(BASE[2]);
+    free(S1->fb);
     free(S1);
+    free(S2->fb);
     free(S2);
 }
