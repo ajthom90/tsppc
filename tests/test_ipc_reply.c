@@ -1,6 +1,7 @@
 #include "harness.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,6 +126,46 @@ static void test_parse(void)
     }
 }
 
+/* The ping line of a ping request's reply. */
+static void test_parse_ping(void)
+{
+    int rc = parse("ok\nping pong 23456 7 nyc\n");
+    t_true("reply ping: pong", rc == 0 && g_r.ok && g_r.ping == TS_REPLY_PONG && g_r.ping_latency_us == 23456 &&
+           g_r.ping_region == 7 && strcmp(g_r.ping_code, "nyc") == 0);
+    rc = parse("ok\nping timeout\n");
+    t_true("reply ping: timeout", rc == 0 && g_r.ping == TS_REPLY_PING_TIMEOUT && g_r.ping_code[0] == 0);
+    rc = parse("ok\nping pong 0 1 -\n");
+    t_true("reply ping: zero latency, unknown code", rc == 0 && g_r.ping == TS_REPLY_PONG &&
+           g_r.ping_latency_us == 0 && g_r.ping_region == 1 && strcmp(g_r.ping_code, "-") == 0);
+    rc = parse("ok\nping pong 4294967295 2147483647 a\x1b" "b\n");
+    t_true("reply ping: largest numbers, code cleaned", rc == 0 && g_r.ping == TS_REPLY_PONG &&
+           g_r.ping_latency_us == 4294967295u && g_r.ping_region == 2147483647 && strcmp(g_r.ping_code, "a?b") == 0);
+    rc = parse("ok\nstatus x\n");
+    t_true("reply ping: none", rc == 0 && g_r.ping == TS_REPLY_PING_NONE);
+    rc = parse("ok\nping pong 4294967296 7 nyc\nping pong 01 7 nyc\nping pong 1 0 nyc\nping pong 1 2147483648 x\n"
+               "ping pong 1 7\nping pong 1 7 \nping pong -1 7 x\nping pong 1  7 x\nping pong 1 07 x\n"
+               "ping pong 99999999999999999999 7 x\nping timeout \nping timeouts\nping\nping pongs 1 7 x\n");
+    t_true("reply ping: malformed lines skipped", rc == 0 && g_r.ping == TS_REPLY_PING_NONE);
+    rc = parse("ok\nping timeout\nping pong 5 7 nyc\n");
+    t_true("reply ping: first valid line wins", rc == 0 && g_r.ping == TS_REPLY_PING_TIMEOUT);
+    rc = parse("ok\nping bogus\nping pong 5 7 nyc\n");
+    t_true("reply ping: a bad line does not block a later good one", rc == 0 && g_r.ping == TS_REPLY_PONG &&
+           g_r.ping_latency_us == 5);
+    rc = parse("error unknown peer\n");
+    t_true("reply ping: an error", rc == 0 && !g_r.ok && strcmp(g_r.error, "unknown peer") == 0 &&
+           g_r.ping == TS_REPLY_PING_NONE);
+    {
+        char longc[200];
+        memset(longc, 0, sizeof longc);
+        memcpy(longc, "ok\nping pong 1 2 ", 17);
+        memset(longc + 17, 'c', 100);
+        longc[117] = '\n';
+        rc = parse(longc);
+        t_true("reply ping: a long code is cut to its field", rc == 0 && g_r.ping == TS_REPLY_PONG &&
+               strlen(g_r.ping_code) == sizeof g_r.ping_code - 1);
+    }
+}
+
 /* ---- ts_ipc_request --------------------------------------------------- */
 
 static int64_t mono_ms(void)
@@ -150,6 +191,8 @@ static int listen_at(const char *path, int backlog)
     return fd;
 }
 
+static char g_seen_path[128];   /* the serving child writes each request it read here */
+
 /* A serving child: accepts, reads the request line, then does what mode says. */
 static pid_t serve(const char *path, int mode, int lfd)
 {
@@ -160,7 +203,14 @@ static pid_t serve(const char *path, int mode, int lfd)
         char line[128], chunk[4096];
         int c = accept(lfd, NULL, NULL), i;
         if (c < 0) _exit(0);
-        if (read(c, line, sizeof line) < 0) {}
+        {
+            ssize_t k = read(c, line, sizeof line);
+            int fd = open(g_seen_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd >= 0) {
+                if (k > 0 && write(fd, line, (size_t)k) < 0) {}
+                close(fd);
+            }
+        }
         if (mode == 0) {
             /* stall: never answer, never close */
             sleep(30);
@@ -203,6 +253,7 @@ static void test_request(void)
     int64_t t0, dt;
 
     snprintf(path, sizeof path, "/tmp/tsppc-r.%d", (int)getpid());
+    snprintf(g_seen_path, sizeof g_seen_path, "/tmp/tsppc-rs.%d", (int)getpid());
     unlink(path);
     rc = ts_ipc_request(path, TS_IPC_STATUS, 1000, buf, sizeof buf, &len);
     t_true("request: missing socket is NO_DAEMON", rc == TS_REQ_NO_DAEMON && len == 0);
@@ -214,6 +265,17 @@ static void test_request(void)
     pid = serve(path, 1, lfd);
     rc = ts_ipc_request(path, TS_IPC_STATUS, 5000, buf, sizeof buf, &len);
     t_true("request: reply read to close", rc == TS_REQ_OK && len == 14 && memcmp(buf, "ok\nstate IDLE\n", 14) == 0);
+    rc = ts_ipc_request_line(path, "ping 100.64.0.2 5000\n", 5000, buf, sizeof buf, &len);
+    {
+        char seen[64] = "";
+        FILE *f = fopen(g_seen_path, "r");
+        if (f) {
+            if (!fgets(seen, sizeof seen, f)) seen[0] = 0;
+            fclose(f);
+        }
+        t_true("request: a request line is sent as given", rc == TS_REQ_OK && len == 14 &&
+               strcmp(seen, "ping 100.64.0.2 5000\n") == 0);
+    }
     stop(pid, lfd);
 
     lfd = listen_at(path, 4);
@@ -298,10 +360,12 @@ static void test_request(void)
         }
     }
     unlink(path);
+    unlink(g_seen_path);
 }
 
 void test_ipc_reply(void)
 {
     test_parse();
+    test_parse_ping();
     test_request();
 }

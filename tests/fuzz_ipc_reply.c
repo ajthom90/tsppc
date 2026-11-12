@@ -36,6 +36,10 @@ static void target(const uint8_t *data, size_t len)
     TS_FUZZ_ASSERT(printable(g_r.status, sizeof g_r.status) && printable(g_r.url, sizeof g_r.url));
     TS_FUZZ_ASSERT(printable(g_r.problem, sizeof g_r.problem) && printable(g_r.login, sizeof g_r.login));
     TS_FUZZ_ASSERT(printable(g_r.wanted, sizeof g_r.wanted) && printable(g_r.self, sizeof g_r.self));
+    TS_FUZZ_ASSERT(printable(g_r.ping_code, sizeof g_r.ping_code));
+    TS_FUZZ_ASSERT(g_r.ping == TS_REPLY_PING_NONE || g_r.ping == TS_REPLY_PONG || g_r.ping == TS_REPLY_PING_TIMEOUT);
+    if (g_r.ping == TS_REPLY_PONG) TS_FUZZ_ASSERT(g_r.ping_region > 0 && g_r.ping_code[0] != 0);
+    else TS_FUZZ_ASSERT(g_r.ping_latency_us == 0 && g_r.ping_region == 0 && g_r.ping_code[0] == 0);
     for (i = 0; i < g_r.npeers; i++) {
         TS_FUZZ_ASSERT(printable(g_peers[i].name, sizeof g_peers[i].name));
         TS_FUZZ_ASSERT(g_peers[i].have_ipv4 || g_peers[i].ipv4 == 0);
@@ -53,10 +57,13 @@ void ts_fuzz_ipc_reply(void)
         "ok\nstate NEED_LOGIN\nurl https://login.example.test/a/x\nproblem system clock is wrong\ntruncated\n",
         "error request too long\n",
         "ok\nexitnode x\nPeer 1.2.3.4 online x\npeer 1.2.3 online x\npeer 256.0.0.1 offline \x1b[2Jq\npeer\n",
+        "ok\nping pong 23456 7 nyc\n",
+        "ok\nping timeout\nping pong 4294967295 2147483647 \x1b[2Jq\n",
+        "error peer's node key has expired\n",
     };
-    const uint8_t *seeds[5];
-    size_t lens[5], i, n;
-    for (i = 0; i < 4; i++) {
+    const uint8_t *seeds[8];
+    size_t lens[8], i, n;
+    for (i = 0; i < 7; i++) {
         seeds[i] = (const uint8_t *)s[i];
         lens[i] = strlen(s[i]);
     }
@@ -69,7 +76,7 @@ void ts_fuzz_ipc_reply(void)
     n += (size_t)snprintf(g_big + n, sizeof g_big - n, "\n");
     for (i = 0; i < TS_MAX_PEERS + 1; i++)
         n += (size_t)snprintf(g_big + n, sizeof g_big - n, "peer %s online n\n", i & 1 ? "-" : "9.9.9.9");
-    seeds[4] = (const uint8_t *)g_big;
-    lens[4] = n;
-    ts_fuzz_run("ipc_reply", target, seeds, lens, 5, TS_FUZZ_DEFAULT_ITERS);
+    seeds[7] = (const uint8_t *)g_big;
+    lens[7] = n;
+    ts_fuzz_run("ipc_reply", target, seeds, lens, 8, TS_FUZZ_DEFAULT_ITERS);
 }

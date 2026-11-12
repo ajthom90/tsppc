@@ -22,6 +22,7 @@
 #include "../src/crypto/nacl.h"
 #include "../src/crypto/x25519.h"
 #include "../src/derp/derp.h"
+#include "../src/disco/disco.h"
 #include "../src/names/hosts.h"
 #include "../src/proto/encoding.h"
 #include "../src/state/store.h"
@@ -33,15 +34,74 @@
 #define TS_BIN_DIR "build/test"
 #endif
 
+static ts_ipc_args g_args;
+
 static int parse(const char *s, size_t n, ts_ipc_cmd *c)
 {
     char *b = (char *)malloc(n ? n : 1);   /* exact size, so ASan sees overreads */
     int rc;
     if (!b) abort();
     memcpy(b, s, n);
-    rc = ts_ipc_parse_request(b, n, c);
+    memset(&g_args, 0x5a, sizeof g_args);
+    rc = ts_ipc_parse_request(b, n, c, &g_args);
     free(b);
     return rc;
+}
+
+static int pp(const char *s)
+{
+    ts_ipc_cmd c = TS_IPC_STATUS;
+    return parse(s, strlen(s), &c) == 0 && c == TS_IPC_PING ? 0 : -1;
+}
+
+/* The ping request: a dotted quad and a timeout, nothing else. */
+static void test_parse_ping(void)
+{
+    char line[80];
+    int n;
+    ts_ipc_cmd c;
+    uint32_t a;
+    t_true("ipc ping: valid", pp("ping 100.64.0.2 5000\n") == 0 && g_args.ip == 0x64400002u &&
+           g_args.timeout_ms == 5000);
+    t_true("ipc ping: bounds of the timeout", pp("ping 1.2.3.4 100\n") == 0 && g_args.timeout_ms == 100 &&
+           pp("ping 1.2.3.4 10000\n") == 0 && g_args.timeout_ms == 10000);
+    t_true("ipc ping: timeout out of range", pp("ping 1.2.3.4 99\n") == -1 && pp("ping 1.2.3.4 10001\n") == -1 &&
+           pp("ping 1.2.3.4 0\n") == -1 && pp("ping 1.2.3.4 99999999999999999999\n") == -1 &&
+           pp("ping 1.2.3.4 -100\n") == -1 && pp("ping 1.2.3.4 +100\n") == -1);
+    t_true("ipc ping: timeout with a leading zero", pp("ping 1.2.3.4 0100\n") == -1 && pp("ping 1.2.3.4 05000\n") == -1);
+    t_true("ipc ping: edge addresses", pp("ping 0.0.0.0 100\n") == 0 && g_args.ip == 0 &&
+           pp("ping 255.255.255.255 100\n") == 0 && g_args.ip == 0xffffffffu);
+    t_true("ipc ping: bad addresses", pp("ping 256.1.1.1 100\n") == -1 && pp("ping 1.2.3 100\n") == -1 &&
+           pp("ping 1.2.3.4.5 100\n") == -1 && pp("ping 1..2.3 100\n") == -1 && pp("ping .1.2.3 100\n") == -1 &&
+           pp("ping 1.2.3. 100\n") == -1 && pp("ping 1.2.3.4a 100\n") == -1 && pp("ping ::1 100\n") == -1 &&
+           pp("ping peer 100\n") == -1 && pp("ping 1000.1.1.1 100\n") == -1);
+    t_true("ipc ping: leading zeros in the address", pp("ping 01.2.3.4 100\n") == -1 &&
+           pp("ping 1.2.3.04 100\n") == -1 && pp("ping 1.00.3.4 100\n") == -1);
+    t_true("ipc ping: spaces", pp("ping  1.2.3.4 100\n") == -1 && pp("ping 1.2.3.4  100\n") == -1 &&
+           pp("ping 1.2.3.4 100 \n") == -1 && pp(" ping 1.2.3.4 100\n") == -1 && pp("ping\t1.2.3.4 100\n") == -1 &&
+           pp("ping 1.2.3.4\n") == -1 && pp("ping\n") == -1 && pp("ping 1.2.3.4 100 7\n") == -1);
+    t_true("ipc ping: no newline, CRLF, NUL", parse("ping 1.2.3.4 100", 16, &c) == -1 &&
+           pp("ping 1.2.3.4 100\r\n") == -1 && parse("ping 1.2.3.4 100\n\0", 18, &c) == -1 &&
+           parse("ping 1.2.3.4\0" "100\n", 17, &c) == -1 && pp("PING 1.2.3.4 100\n") == -1);
+    /* Over-long: padded with digits past TS_IPC_LINE_MAX. */
+    memset(line, '1', sizeof line);
+    memcpy(line, "ping 1.2.3.4 ", 13);
+    line[64] = '\n';
+    t_true("ipc ping: over-long", parse(line, 65, &c) == -1);
+    t_true("ipc ping: the other commands zero the arguments",
+           parse("status\n", 7, &c) == 0 && g_args.ip == 0 && g_args.timeout_ms == 0);
+    n = ts_ipc_ping_line(line, sizeof line, 0x64400002u, 5000);
+    t_true("ipc ping: line format", n == 21 && strcmp(line, "ping 100.64.0.2 5000\n") == 0);
+    n = ts_ipc_ping_line(line, sizeof line, 0xffffffffu, 10000);
+    t_true("ipc ping: longest line fits the limit", n > 0 && (size_t)n <= TS_IPC_LINE_MAX &&
+           pp(line) == 0 && g_args.ip == 0xffffffffu && g_args.timeout_ms == 10000);
+    t_true("ipc ping: line refuses a bad timeout or a small buffer",
+           ts_ipc_ping_line(line, sizeof line, 1, 99) == -1 && ts_ipc_ping_line(line, sizeof line, 1, 10001) == -1 &&
+           ts_ipc_ping_line(line, 10, 1, 100) == -1);
+    t_true("ipc ping: cmd line for ping is empty", strcmp(ts_ipc_cmd_line(TS_IPC_PING), "") == 0);
+    t_true("ipv4: parse", ts_ipc_parse_ipv4("100.64.0.2", 10, &a) == 0 && a == 0x64400002u &&
+           ts_ipc_parse_ipv4("100.64.0.25", 10, &a) == 0 && a == 0x64400002u &&
+           ts_ipc_parse_ipv4("", 0, &a) == -1 && ts_ipc_parse_ipv4("1.2.3.04", 8, &a) == -1);
 }
 
 static void test_parse(void)
@@ -200,9 +260,10 @@ static void nap_ms(int ms)
     select(0, NULL, NULL, NULL, &tv);
 }
 
-/* Run tsppc with one argument; its stdout goes to out. Returns its exit status
- * (-1 if it did not exit normally within 60 s). */
-static int run_cli(const char *arg, char *out, size_t cap)
+/* Run tsppc with arguments (NULL-terminated, after the program name); its
+ * stdout and stderr go to out. Returns its exit status (-1 if it did not
+ * exit normally within 60 s). */
+static int run_cli_v(const char *const *args, char *out, size_t cap)
 {
     int p[2], st;
     size_t len = 0;
@@ -217,7 +278,17 @@ static int run_cli(const char *arg, char *out, size_t cap)
         dup2(p[1], 2);   /* messages are checked too, and kept out of the test output */
         close(p[0]);
         close(p[1]);
-        execl(TS_BIN_DIR "/tsppc", "tsppc", arg, (char *)NULL);
+        {
+            char *v[16];
+            int k = 0;
+            v[k++] = (char *)"tsppc";
+            while (args[k - 1] && k < 15) {
+                v[k] = (char *)args[k - 1];
+                k++;
+            }
+            v[k] = NULL;
+            execv(TS_BIN_DIR "/tsppc", v);
+        }
         _exit(127);
     }
     close(p[1]);
@@ -239,6 +310,14 @@ static int run_cli(const char *arg, char *out, size_t cap)
     if (mono_ms() > until) kill(pid, SIGKILL);
     if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st)) return -1;
     return WEXITSTATUS(st);
+}
+
+static int run_cli(const char *arg, char *out, size_t cap)
+{
+    const char *v[2];
+    v[0] = arg;
+    v[1] = NULL;
+    return run_cli_v(v, out, cap);
 }
 
 /* Start tsppcd with the test overrides: control at localhost:1 (refused), and
@@ -653,6 +732,29 @@ static void relay_frame(int fd, int type, const uint8_t *body, size_t n)
  * before sending anything is a home probe. Events go to evpath: 'u' upgraded,
  * 'r' ServerInfo sent, 'P'/'p' NotePreferred 1/0, 'e' closed after the
  * upgrade, 'b' a broken ClientInfo. */
+/* The peer the fake relay plays (test_daemon_ping): SendPackets to its node
+ * key that hold a disco ping sealed to its disco key get a pong back from it. */
+static int g_relay_answers;
+static uint8_t g_ans_node[32], g_ans_disco_priv[32], g_ans_disco_pub[32];
+
+static void relay_answer(int fd, const uint8_t *body, size_t len)
+{
+    ts_disco_shared sh;
+    ts_disco_msg m;
+    uint8_t out[32 + TS_DISCO_PONG_LEN], nonce[24];
+    static const uint8_t src[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 3, 3, 40 };
+    const uint8_t *pkt = body + 32;
+    size_t n = len - 32;
+    int k;
+    if (len < 32 || memcmp(body, g_ans_node, 32) != 0 || !ts_disco_looks_like(pkt, n)) return;
+    ts_disco_shared_init(&sh, g_ans_disco_priv, ts_disco_sender(pkt));
+    if (ts_disco_open(&m, pkt, n, &sh) != 0 || m.type != TS_DISCO_PING) return;
+    memset(nonce, 0x77, sizeof nonce);
+    memcpy(out, g_ans_node, 32);
+    k = ts_disco_seal_pong(out + 32, sizeof out - 32, g_ans_disco_pub, &sh, nonce, m.txid, src, RELAY_REGION);
+    if (k > 0) relay_frame(fd, TS_DERP_RECV_PACKET, out, 32 + (size_t)k);
+}
+
 static void relay_serve(int fd, const char *evpath, const uint8_t s_priv[32], const uint8_t s_pub[32])
 {
     static const char resp[] = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\n"
@@ -696,6 +798,8 @@ static void relay_serve(int fd, const char *evpath, const uint8_t s_priv[32], co
             note(evpath, "r");
         } else if (h[0] == TS_DERP_NOTE_PREFERRED && len == 1) {
             note(evpath, body[0] ? "P" : "p");
+        } else if (h[0] == TS_DERP_SEND_PACKET && g_relay_answers) {
+            relay_answer(fd, body, len);
         }
     }
     note(evpath, "e");
@@ -926,6 +1030,310 @@ static void test_daemon_relay(void)
     kill(rsrv, SIGKILL);
     waitpid(rsrv, NULL, 0);
     ts_wipe(&st, sizeof st);
+    unsetenv("TSPPC_SOCKET");
+    unlink(evpath);
+    unlink(g_lites_path);
+    remove_test_files(statedir, sock, logpath, countpath);
+}
+
+/* Read what the daemon sends on fd until it closes, for at most ms. Returns
+ * the time it took. */
+static int64_t read_until_close(int fd, char *out, size_t cap, int ms)
+{
+    size_t len = 0;
+    int64_t t0 = mono_ms(), until = t0 + ms;
+    out[0] = 0;
+    while (len + 1 < cap && mono_ms() < until) {
+        fd_set r;
+        struct timeval tv = { 0, 50000 };
+        ssize_t k;
+        FD_ZERO(&r);
+        FD_SET(fd, &r);
+        if (select(fd + 1, &r, NULL, NULL, &tv) <= 0) continue;
+        k = read(fd, out + len, cap - 1 - len);
+        if (k <= 0) break;
+        len += (size_t)k;
+    }
+    out[len] = 0;
+    return mono_ms() - t0;
+}
+
+/* Send a request and leave the connection open: the descriptor, or -1. */
+static int send_only(const char *sock, const char *req)
+{
+    int fd = ts_ipc_connect(sock);
+    if (fd >= 0 && write(fd, req, strlen(req)) != (ssize_t)strlen(req)) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+#define PEER2_KEY "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+#define PEER3_KEY "2222222222222222333333333333333344444444444444445555555555555555"
+#define PEER4_KEY "6666666666666666777777777777777788888888888888889999999999999999"
+#define PEER5_KEY "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbccccccccccccccccdddddddddddddddd"
+
+/* tsppcd answers ping requests, through the fake relay playing peer 2: a
+ * pong; a silent peer 3: a timeout, also at 10 s; errors for an unknown
+ * address and a peer with no disco key; cancels on an early close; down and
+ * SIGTERM answer a pending ping. tsppc ping prints upstream's lines. */
+static void test_daemon_ping(void)
+{
+    static fake f;
+    char statedir[128], sock[128], logpath[128], countpath[128], evpath[128], key[65], out[8192], err[256];
+    char d3hex[65], d2hex[65];
+    uint8_t d3priv[32], d3pub[32];
+    ts_state st;
+    pid_t pid, srv, rsrv;
+    int lfd, rfd, rc, i, fd;
+    uint16_t cport, rport;
+    int64_t t0, dt;
+
+    if (access(TS_BIN_DIR "/tsppcd", X_OK) != 0 || access(TS_BIN_DIR "/tsppc", X_OK) != 0) {
+        printf("SKIP: ping tests (no " TS_BIN_DIR "/tsppcd or tsppc here)\n");
+        return;
+    }
+    if (make_tmpdir() != 0) {
+        t_true("dping: temp dir", 0);
+        return;
+    }
+    snprintf(statedir, sizeof statedir, "%s/state", tmpdir);
+    snprintf(sock, sizeof sock, "%s/sock", tmpdir);
+    snprintf(logpath, sizeof logpath, "%s/log", tmpdir);
+    snprintf(countpath, sizeof countpath, "%s/conns", tmpdir);
+    snprintf(evpath, sizeof evpath, "%s/relay", tmpdir);
+    snprintf(g_lites_path, sizeof g_lites_path, "%s/lites", tmpdir);
+    setenv("TSPPC_SOCKET", sock, 1);
+
+    rc = load_state(statedir, &st);
+    st.have_login = 1;
+    t_true("dping: saved login written", rc == 0 && ts_state_save(&st, statedir, err, sizeof err) == 0);
+
+    /* Made-up disco keys for peers 2 and 3. */
+    for (i = 0; i < 32; i++) {
+        g_ans_disco_priv[i] = (uint8_t)(0x11 + 3 * i);
+        d3priv[i] = (uint8_t)(0x52 + 5 * i);
+    }
+    ts_state_clamp_key(g_ans_disco_priv);
+    ts_state_clamp_key(d3priv);
+    ts_x25519_public(g_ans_disco_pub, g_ans_disco_priv);
+    ts_x25519_public(d3pub, d3priv);
+    ts_hex_encode(d2hex, sizeof d2hex, g_ans_disco_pub, 32);
+    ts_hex_encode(d3hex, sizeof d3hex, d3pub, 32);
+    t_true("dping: peer key", ts_hex_decode(g_ans_node, 32, PEER2_KEY, 64) == 0);
+    g_relay_answers = 1;
+
+    rfd = listen_local(&rport);
+    lfd = listen_local(&cport);
+    if (rfd < 0 || lfd < 0) {
+        t_true("dping: fake servers listen", 0);
+        if (rfd >= 0) close(rfd);
+        if (lfd >= 0) close(lfd);
+        unsetenv("TSPPC_SOCKET");
+        remove_test_files(statedir, sock, logpath, countpath);
+        g_relay_answers = 0;
+        return;
+    }
+    snprintf(g_relay_map, sizeof g_relay_map,
+             "{\"Node\":{\"ID\":1,\"Name\":\"" SELFNAME ".\",\"Key\":\"nodekey:" HA "\","
+             "\"Addresses\":[\"100.64.0.1/32\"],\"MachineAuthorized\":true},"
+             "\"Peers\":[{\"ID\":2,\"Name\":\"peer.example.test.\",\"Key\":\"nodekey:" PEER2_KEY "\","
+             "\"DiscoKey\":\"discokey:%s\","
+             "\"Addresses\":[\"100.64.0.2/32\"],\"HomeDERP\":%d,\"Online\":true,\"MachineAuthorized\":true},"
+             "{\"ID\":3,\"Name\":\"quiet.example.test.\",\"Key\":\"nodekey:" PEER3_KEY "\","
+             "\"DiscoKey\":\"discokey:%s\","
+             "\"Addresses\":[\"100.64.0.3/32\"],\"HomeDERP\":%d,\"Online\":true,\"MachineAuthorized\":true},"
+             "{\"ID\":4,\"Name\":\"nodisco.example.test.\",\"Key\":\"nodekey:" PEER4_KEY "\","
+             "\"Addresses\":[\"100.64.0.4/32\"],\"HomeDERP\":%d,\"Online\":true,\"MachineAuthorized\":true},"
+             "{\"ID\":5,\"Name\":\"old.example.test.\",\"Key\":\"nodekey:" PEER5_KEY "\",\"Expired\":true,"
+             "\"Addresses\":[\"100.64.0.5/32\"],\"HomeDERP\":%d,\"Online\":true,\"MachineAuthorized\":true}],"
+             "\"DERPMap\":{\"Regions\":{"
+             "\"%d\":{\"RegionID\":%d,\"RegionCode\":\"tst\",\"Nodes\":[{\"Name\":\"%da\",\"RegionID\":%d,"
+             "\"HostName\":\"derp.example.test\",\"IPv4\":\"127.0.0.1\",\"DERPPort\":%u}]}}}}",
+             d2hex, RELAY_REGION, d3hex, RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION, RELAY_REGION,
+             RELAY_REGION, (unsigned)rport);
+
+    fk_init(&f, NULL, "");
+    f.handler = fk_relay_handler;
+    ts_hex_encode(key, sizeof key, f.control_pub, 32);
+    g_ctl_port = cport;
+    srv = fork();
+    if (srv == 0) {
+        close(rfd);
+        fake_server(lfd, &f, countpath);
+        _exit(0);
+    }
+    rsrv = fork();
+    if (rsrv == 0) {
+        close(lfd);
+        relay_server(rfd, evpath);
+        _exit(0);
+    }
+    close(lfd);
+    close(rfd);
+
+    pid = start_daemon(statedir, sock, logpath, key);
+    t_true("dping: socket appears", wait_socket(sock, pid, 120000) == 0);
+    t_true("dping: home relay connected", wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 120000));
+
+    raw_request(sock, "ping 100.64.0.2 5000\n", 21, out, sizeof out);
+    t_true("dping: a peer that answers gives a pong", strncmp(out, "ok\nping pong ", 13) == 0 &&
+           strstr(out, " 7 tst\n") != NULL);
+    if (strncmp(out, "ok\nping pong ", 13) != 0) printf("  ping said: %s\n", out);
+    t0 = mono_ms();
+    raw_request(sock, "ping 100.64.0.3 1000\n", 21, out, sizeof out);
+    dt = mono_ms() - t0;
+    t_true("dping: a silent peer times out on time", strcmp(out, "ok\nping timeout\n") == 0 && dt >= 900 && dt < 3000);
+    raw_request(sock, "ping 100.64.0.99 1000\n", 22, out, sizeof out);
+    t_true("dping: an unknown address", strcmp(out, "error no matching peer\n") == 0);
+    raw_request(sock, "ping 100.64.0.4 1000\n", 21, out, sizeof out);
+    t_true("dping: a peer with no disco key", strcmp(out, "error unknown peer\n") == 0);
+    raw_request(sock, "ping 100.64.0.5 1000\n", 21, out, sizeof out);
+    t_true("dping: an expired peer", strcmp(out, "error peer's node key has expired\n") == 0);
+    raw_request(sock, "ping 100.64.0.2 99\n", 19, out, sizeof out);
+    t_true("dping: a bad request", strcmp(out, "error unknown request\n") == 0);
+
+    /* A 10 s ping outlives the usual 10 s client deadline. */
+    t0 = mono_ms();
+    raw_request(sock, "ping 100.64.0.3 10000\n", 22, out, sizeof out);
+    dt = mono_ms() - t0;
+    t_true("dping: a 10 s ping is answered, not cut off", strcmp(out, "ok\nping timeout\n") == 0 &&
+           dt >= 9900 && dt < 10000 + TS_IPC_PING_MARGIN_MS);
+
+    /* Clients that close early cancel their pings: more than the data
+     * plane holds at once, then a ping still goes out. */
+    for (i = 0; i < 17; i++) {
+        fd = send_only(sock, "ping 100.64.0.3 10000\n");
+        nap_ms(100);
+        if (fd >= 0) close(fd);
+    }
+    nap_ms(300);
+    raw_request(sock, "ping 100.64.0.2 5000\n", 21, out, sizeof out);
+    t_true("dping: early closes cancelled their pings", strncmp(out, "ok\nping pong ", 13) == 0);
+
+    /* At most TS_IPC_MAX_PINGS clients wait for a ping; status still works. */
+    {
+        int held[TS_IPC_MAX_PINGS];
+        for (i = 0; i < TS_IPC_MAX_PINGS; i++) held[i] = send_only(sock, "ping 100.64.0.3 5000\n");
+        nap_ms(300);
+        t0 = mono_ms();
+        raw_request(sock, "ping 100.64.0.2 5000\n", 21, out, sizeof out);
+        dt = mono_ms() - t0;
+        t_true("dping: one ping over the limit is refused at once",
+               strcmp(out, "error too many pings in progress\n") == 0 && dt < 2000);
+        raw_request(sock, "status\n", 7, out, sizeof out);
+        t_true("dping: status works with the pings pending", strncmp(out, "ok\nstate RUNNING\n", 17) == 0);
+        for (i = 0; i < TS_IPC_MAX_PINGS; i++)
+            if (held[i] >= 0) close(held[i]);
+        nap_ms(300);
+        raw_request(sock, "ping 100.64.0.2 5000\n", 21, out, sizeof out);
+        t_true("dping: room again once they close", strncmp(out, "ok\nping pong ", 13) == 0);
+    }
+
+    /* tsppc ping. */
+    {
+        const char *a1[] = { "ping", "-c", "1", "peer", NULL };
+        const char *a2[] = { "ping", "-c", "1", "--until-direct=false", "PEER.example.test", NULL };
+        const char *a3[] = { "ping", "-c", "1", "--timeout", "500ms", "quiet", NULL };
+        const char *a4[] = { "ping", "self", NULL };
+        const char *a5[] = { "ping", "100.64.0.1", NULL };
+        const char *a6[] = { "ping", "100.64.0.99", NULL };
+        const char *a7[] = { "ping", "nobody", NULL };
+        const char *a8[] = { "ping", NULL };
+        const char *a9[] = { "ping", "-c", "2", "--timeout=200ms", "--until-direct=false", "quiet", NULL };
+        const char *a10[] = { "ping", "--timeout=30s", "peer", NULL };
+        const char *a11[] = { "ping", "nodisco", NULL };
+        rc = run_cli_v(a1, out, sizeof out);
+        t_true("cli ping: a pong, then no direct connection",
+               rc == 1 && strncmp(out, "pong from peer (100.64.0.2) via DERP(tst) in ", 45) == 0 &&
+                   strstr(out, "\ndirect connection not established\n") != NULL);
+        if (rc != 1) printf("  tsppc ping said (%d): %s\n", rc, out);
+        t0 = mono_ms();
+        rc = run_cli_v(a2, out, sizeof out);
+        dt = mono_ms() - t0;
+        t_true("cli ping: --until-direct=false exits 0 after the pause",
+               rc == 0 && strncmp(out, "pong from peer (100.64.0.2) via DERP(tst) in ", 45) == 0 && dt >= 1000);
+        rc = run_cli_v(a3, out, sizeof out);
+        t_true("cli ping: timed out, no reply", rc == 1 && strcmp(out, "ping \"100.64.0.3\" timed out\nno reply\n") == 0);
+        rc = run_cli_v(a9, out, sizeof out);
+        t_true("cli ping: two timeouts, no pause", rc == 1 &&
+               strcmp(out, "ping \"100.64.0.3\" timed out\nping \"100.64.0.3\" timed out\nno reply\n") == 0);
+        rc = run_cli_v(a4, out, sizeof out);
+        t_true("cli ping: our own name", rc == 0 && strcmp(out, "100.64.0.1 is local Tailscale IP\n") == 0);
+        rc = run_cli_v(a5, out, sizeof out);
+        t_true("cli ping: our own IP", rc == 0 && strcmp(out, "100.64.0.1 is local Tailscale IP\n") == 0);
+        rc = run_cli_v(a6, out, sizeof out);
+        t_true("cli ping: an unknown IP", rc == 1 && strcmp(out, "no matching peer\n") == 0);
+        rc = run_cli_v(a7, out, sizeof out);
+        t_true("cli ping: an unknown name", rc == 1 && strcmp(out, "no peer named \"nobody\"\n") == 0);
+        rc = run_cli_v(a11, out, sizeof out);
+        t_true("cli ping: a peer with no disco key", rc == 1 && strcmp(out, "unknown peer\n") == 0);
+        rc = run_cli_v(a8, out, sizeof out);
+        t_true("cli ping: no target is usage", rc == 2);
+        rc = run_cli_v(a10, out, sizeof out);
+        t_true("cli ping: a timeout over 10 s is usage", rc == 2 && strstr(out, "timeout") != NULL);
+    }
+
+    /* down answers a pending ping. */
+    fd = send_only(sock, "ping 100.64.0.3 10000\n");
+    nap_ms(300);
+    raw_request(sock, "down\n", 5, out, sizeof out);
+    t_true("dping: down accepted", strncmp(out, "ok\n", 3) == 0);
+    if (fd >= 0) {
+        dt = read_until_close(fd, out, sizeof out, 8000);
+        t_true("dping: down answers the pending ping", strcmp(out, "error not connected\n") == 0 && dt < 5000);
+        close(fd);
+    }
+    {
+        const char *a[] = { "ping", "peer", NULL };
+        rc = run_cli_v(a, out, sizeof out);
+        t_true("cli ping: down is stopped", rc == 1 && strcmp(out, "Tailscale is stopped.\n") == 0);
+    }
+
+    /* logout answers a pending ping too. */
+    raw_request(sock, "up\n", 3, out, sizeof out);
+    t_true("dping: up for logout", wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 120000));
+    fd = send_only(sock, "ping 100.64.0.3 10000\n");
+    nap_ms(300);
+    raw_request(sock, "logout\n", 7, out, sizeof out);
+    t_true("dping: logout accepted", strncmp(out, "ok\n", 3) == 0);
+    if (fd >= 0) {
+        dt = read_until_close(fd, out, sizeof out, 8000);
+        t_true("dping: logout answers the pending ping", strcmp(out, "error not connected\n") == 0 && dt < 5000);
+        close(fd);
+    }
+
+    /* SIGTERM with a ping pending: an error or EOF, at once. */
+    raw_request(sock, "up\n", 3, out, sizeof out);
+    t_true("dping: up again", wait_status(sock, "\nrelay 7 tst connected\n", out, sizeof out, 120000));
+    /* The log names no ping that went out fine. */
+    t_true("dping: pings sent are not logged", !file_has(logpath, "ping 100.64.0.2"));
+    fd = send_only(sock, "ping 100.64.0.3 10000\n");
+    nap_ms(300);
+    kill(pid, SIGTERM);
+    if (fd >= 0) {
+        dt = read_until_close(fd, out, sizeof out, 8000);
+        t_true("dping: SIGTERM answers or closes the pending ping",
+               (strcmp(out, "error not connected\n") == 0 || out[0] == 0) && dt < 5000);
+        close(fd);
+    }
+    t_true("dping: daemon exits", wait_exit(pid, 60000) == 0);
+    {
+        const uint8_t *keys[3];
+        keys[0] = st.node_priv;
+        keys[1] = st.machine_priv;
+        keys[2] = st.disco_priv;
+        t_true("dping: log holds no private keys", !log_has_key(logpath, keys, 3));
+    }
+    kill(srv, SIGKILL);
+    waitpid(srv, NULL, 0);
+    kill(rsrv, SIGKILL);
+    waitpid(rsrv, NULL, 0);
+    g_relay_answers = 0;
+    ts_wipe(&st, sizeof st);
+    ts_wipe(g_ans_disco_priv, sizeof g_ans_disco_priv);
+    ts_wipe(d3priv, sizeof d3priv);
     unsetenv("TSPPC_SOCKET");
     unlink(evpath);
     unlink(g_lites_path);
@@ -1210,6 +1618,7 @@ static void test_daemon(void)
 void test_ipc(void)
 {
     test_parse();
+    test_parse_ping();
     test_clean();
     test_split();
     test_listen();
@@ -1217,4 +1626,5 @@ void test_ipc(void)
     test_daemon();
     test_daemon_down();
     test_daemon_relay();
+    test_daemon_ping();
 }

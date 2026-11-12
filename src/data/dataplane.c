@@ -5,7 +5,9 @@
 #include <string.h>
 
 #include "../core/bytes.h"
+#include "../crypto/x25519.h"
 #include "../daemon/ipc.h"
+#include "../disco/disco.h"
 #include "../filter/packet.h"
 #include "../wg/handshake.h"
 
@@ -51,13 +53,28 @@ typedef struct {
     int configured;      /* in the WireGuard device */
     int rx_region;       /* region we last received this peer on, 0 none */
     int tx_region;       /* region last used to send to it, 0 none */
+    uint8_t disco_key[32];   /* netmap DiscoKey, zero none */
+    int have_shared;         /* shared is the box key for disco_key (all zero if unusable) */
+    ts_disco_shared shared;
+    int64_t pong_t[TS_DP_PONGS_PER_PEER];   /* last pongs sent to this peer */
+    int pong_pos, pong_n;
 } dpeer;
+
+typedef struct {
+    int used;
+    uint8_t txid[12];
+    uint8_t key[32];     /* the peer's node key */
+    uint64_t cookie;
+    int64_t sent, deadline;
+    int region;          /* sent to */
+} dping;
 
 struct ts_dp {
     ts_dp_io io;
     void *user;
     int running;
-    uint8_t priv[32], disco[32];
+    uint8_t priv[32], disco[32];   /* node private key, disco public key (zero: none) */
+    uint8_t node_pub[32], disco_priv[32];
     uint32_t self_ip;
     ts_wg_dev *wg;
     int64_t now;
@@ -80,6 +97,10 @@ struct ts_dp {
     int64_t ct_sec, ct_mono;
     int64_t next_expiry_check;
     unsigned long filtered, relay_full;
+    unsigned long disco_in, disco_bad, pongs_sent, pongs_limited, pings_sent, pongs_in;
+    int64_t pong_t[TS_DP_PONGS_PER_SEC];   /* last pongs sent to anyone */
+    int pong_pos, pong_n;
+    dping pings[TS_DP_MAX_PINGS];
     slot *slots[TS_DP_MAX_CONNS];
 #ifdef TS_TEST_HOOKS
     ts_dp_test_counts cnt;
@@ -243,6 +264,7 @@ static void slot_down(slot *s, int close_stream, const char *why)
     slot_free(s);
 }
 
+static void disco_recv(slot *s, const uint8_t src[32], const uint8_t *p, size_t n);
 static void derp_send(void *user, const uint8_t *p, size_t n);
 static void derp_recv(void *user, const uint8_t src[32], const uint8_t *p, size_t n);
 static void derp_gone(void *user, const uint8_t key[32]);
@@ -365,6 +387,105 @@ static void after_feed(slot *s, int rc)
     flush(s);
 }
 
+/* ---- Disco ------------------------------------------------------------------ */
+
+/* Sliding windows: at most cap events in any 1000 ms. t holds the times of
+ * the last cap allowed ones; with used == cap, t[pos] is the oldest. */
+static int win_ok(const int64_t *t, int pos, int used, int cap, int64_t now)
+{
+    return used < cap || now - t[pos] >= 1000;
+}
+
+static void win_add(int64_t *t, int *pos, int *used, int cap, int64_t now)
+{
+    t[*pos] = now;
+    *pos = (*pos + 1) % cap;
+    if (*used < cap) (*used)++;
+}
+
+/* End outstanding ping i and report it. */
+static void ping_end(ts_dp *dp, int i, int status, uint32_t latency_us)
+{
+    dping q = dp->pings[i];
+    ts_wipe(&dp->pings[i], sizeof dp->pings[i]);
+    if (dp->io.ping_result) dp->io.ping_result(dp->user, q.cookie, status, latency_us, q.region);
+}
+
+static void disco_answer(slot *s, dpeer *peer, const uint8_t src[32], const ts_disco_msg *m)
+{
+    ts_dp *dp = s->dp;
+    uint8_t nonce[24], out[TS_DISCO_PONG_LEN];
+    static const uint8_t ip[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 3, 3, 40 };
+    int n;
+
+    if (!win_ok(peer->pong_t, peer->pong_pos, peer->pong_n, TS_DP_PONGS_PER_PEER, dp->now) ||
+        !win_ok(dp->pong_t, dp->pong_pos, dp->pong_n, TS_DP_PONGS_PER_SEC, dp->now)) {
+        dp->pongs_limited++;
+        return;
+    }
+    if (dp->io.random(dp->user, nonce, sizeof nonce) != 0) return;
+    n = ts_disco_seal_pong(out, sizeof out, dp->disco, &peer->shared, nonce, m->txid, ip, (uint16_t)s->region);
+    if (n < 0) return;
+    win_add(peer->pong_t, &peer->pong_pos, &peer->pong_n, TS_DP_PONGS_PER_PEER, dp->now);
+    win_add(dp->pong_t, &dp->pong_pos, &dp->pong_n, TS_DP_PONGS_PER_SEC, dp->now);
+    dp->pongs_sent++;
+    slot_send(s, src, out, (size_t)n);   /* the region it came in on */
+}
+
+/* A pong ends the outstanding ping to the same peer with its TxID. */
+static void disco_pong(ts_dp *dp, const dpeer *peer, const ts_disco_msg *m)
+{
+    int i;
+    for (i = 0; i < TS_DP_MAX_PINGS; i++) {
+        dping *q = &dp->pings[i];
+        int64_t ms;
+        if (!q->used || memcmp(q->key, peer->key, 32) != 0 || memcmp(q->txid, m->txid, 12) != 0) continue;
+        if (dp->now >= q->deadline) return;   /* timed out: ts_dp_tick reports it */
+        ms = dp->now - q->sent;
+        if (ms < 0) ms = 0;
+        if (ms > 4000000) ms = 4000000;
+        ping_end(dp, i, TS_DP_PONG, (uint32_t)ms * 1000u);
+        return;
+    }
+}
+
+static void disco_recv(slot *s, const uint8_t src[32], const uint8_t *p, size_t n)
+{
+    ts_dp *dp = s->dp;
+    dpeer *peer = peer_by_key(dp, src);
+    ts_disco_msg m;
+
+    /* Before any X25519: a configured peer, sending from its netmap disco
+     * key, and a disco key of our own. */
+    if (!peer || key_zero(peer->disco_key) || key_zero(dp->disco) || !ts_disco_looks_like(p, n) ||
+        memcmp(ts_disco_sender(p), peer->disco_key, 32) != 0) {
+        dp->disco_bad++;
+        return;
+    }
+    if (!peer->have_shared) {
+        if (!ts_wg_dh_allow(dp->wg)) {
+            COUNT(dp, disco_budget);
+            dp->disco_bad++;
+            return;
+        }
+        COUNT(dp, disco_dh);
+        ts_disco_shared_init(&peer->shared, dp->disco_priv, peer->disco_key);
+        peer->have_shared = 1;
+    }
+    if (ts_disco_open(&m, p, n, &peer->shared) != 0) {
+        dp->disco_bad++;
+        return;
+    }
+    if (m.type == TS_DISCO_PING) {
+        disco_answer(s, peer, src, &m);
+    } else if (m.type == TS_DISCO_PONG) {
+        dp->pongs_in++;
+        disco_pong(dp, peer, &m);
+    } else {
+        COUNT(dp, disco_other);   /* CallMeMaybe and the relay types: not acted on */
+    }
+}
+
 /* ---- DERP callbacks (user is the slot) ------------------------------------- */
 
 static void derp_send(void *user, const uint8_t *p, size_t n)
@@ -387,7 +508,9 @@ static void derp_recv(void *user, const uint8_t src[32], const uint8_t *p, size_
 
     if (s->dead || !dp->running || s->state != S_UP) return;
     if (n >= DISCO_HDR_LEN && memcmp(p, DISCO_MAGIC, sizeof DISCO_MAGIC) == 0) {
-        COUNT(dp, disco);   /* no disco support: dropped, never WireGuard */
+        COUNT(dp, disco);   /* never WireGuard */
+        dp->disco_in++;
+        disco_recv(s, src, p, n);
         return;
     }
     peer = peer_by_key(dp, src);
@@ -535,6 +658,8 @@ fail:
 void ts_dp_stop(ts_dp *dp)
 {
     int i;
+    for (i = 0; i < TS_DP_MAX_PINGS; i++)
+        if (dp->pings[i].used) ping_end(dp, i, TS_DP_PING_STOPPED, 0);
     for (i = 0; i < TS_DP_MAX_CONNS; i++)
         if (dp->slots[i] && dp->slots[i]->state != S_FREE) slot_free(dp->slots[i]);
     if (dp->wg) ts_wg_free(dp->wg);
@@ -551,6 +676,11 @@ void ts_dp_stop(ts_dp *dp)
     ts_wipe(&dp->flows, sizeof dp->flows);
     ts_wipe(dp->priv, sizeof dp->priv);
     ts_wipe(dp->disco, sizeof dp->disco);
+    ts_wipe(dp->node_pub, sizeof dp->node_pub);
+    ts_wipe(dp->disco_priv, sizeof dp->disco_priv);
+    ts_wipe(dp->pings, sizeof dp->pings);
+    ts_wipe(dp->pong_t, sizeof dp->pong_t);
+    dp->pong_pos = dp->pong_n = 0;
     dp->self_ip = 0;
     dp->home = 0;
     dp->home_err[0] = 0;
@@ -576,11 +706,15 @@ void ts_dp_free(ts_dp *dp)
     free(dp);
 }
 
-int ts_dp_start(ts_dp *dp, const uint8_t node_priv[32], const uint8_t disco_pub[32], uint32_t self_ip)
+int ts_dp_start(ts_dp *dp, const uint8_t node_priv[32], const uint8_t disco_priv[32], uint32_t self_ip)
 {
     ts_dp_stop(dp);
     memcpy(dp->priv, node_priv, 32);
-    memcpy(dp->disco, disco_pub, 32);
+    ts_x25519_public(dp->node_pub, node_priv);
+    if (!key_zero(disco_priv)) {
+        memcpy(dp->disco_priv, disco_priv, 32);
+        ts_x25519_public(dp->disco, disco_priv);
+    }
     dp->self_ip = self_ip;
     ts_flows_init(&dp->flows);
     dp->wg = ts_wg_new(node_priv, &WG_IO, dp);
@@ -610,6 +744,7 @@ static void set_peers(ts_dp *dp, const ts_netmap *m)
         p->ipv4 = src->ipv4;
         p->have_ipv4 = src->have_ipv4 && src->ipv4 != 0;
         p->home = src->home_derp;
+        memcpy(p->disco_key, src->disco_key, 32);
         p->online = src->online;
         p->jailed = src->jailed;
         p->key_expiry = src->key_expiry;
@@ -632,14 +767,26 @@ static void set_peers(ts_dp *dp, const ts_netmap *m)
         dpeer *p = &dp->stage[i];
         if (!p->configured) continue;
         for (j = 0; j < dp->npeers; j++) {
-            if (dp->peers[j].configured && memcmp(dp->peers[j].key, p->key, 32) == 0) {
-                p->rx_region = dp->peers[j].rx_region;
-                p->tx_region = dp->peers[j].tx_region;
+            const dpeer *o = &dp->peers[j];
+            if (o->configured && memcmp(o->key, p->key, 32) == 0) {
+                p->rx_region = o->rx_region;
+                p->tx_region = o->tx_region;
+                memcpy(p->pong_t, o->pong_t, sizeof p->pong_t);
+                p->pong_pos = o->pong_pos;
+                p->pong_n = o->pong_n;
+                /* The box key only while the disco key stays the same (the
+                 * old entries are wiped below). */
+                if (o->have_shared && memcmp(o->disco_key, p->disco_key, 32) == 0) {
+                    p->shared = o->shared;
+                    p->have_shared = 1;
+                }
                 break;
             }
         }
         if (ts_wg_set_peer(dp->wg, p->key, p->ipv4) != 0) {
             p->configured = 0;
+            ts_wipe(&p->shared, sizeof p->shared);
+            p->have_shared = 0;
             ts_wg_remove_peer(dp->wg, p->key);   /* no stale sessions under this key */
         }
     }
@@ -659,6 +806,8 @@ static void expire_check(ts_dp *dp)
         if (!p->configured || !locally_expired(dp, p->key_expiry)) continue;
         p->expired = 1;
         p->configured = 0;
+        ts_wipe(&p->shared, sizeof p->shared);
+        p->have_shared = 0;
         ts_wg_remove_peer(dp->wg, p->key);
     }
 }
@@ -768,6 +917,8 @@ void ts_dp_tick(ts_dp *dp, int64_t now_ms)
     int i;
     dp->now = now_ms;
     if (!dp->running) return;
+    for (i = 0; i < TS_DP_MAX_PINGS; i++)
+        if (dp->pings[i].used && now_ms >= dp->pings[i].deadline) ping_end(dp, i, TS_DP_PING_TIMEOUT, 0);
     if (now_ms >= dp->next_expiry_check) expire_check(dp);
     ts_wg_tick(dp->wg, now_ms);
     for (i = 0; i < TS_DP_MAX_CONNS; i++) {
@@ -850,6 +1001,12 @@ void ts_dp_get_status(const ts_dp *dp, ts_dp_status *st)
     st->problem[0] = 0;
     st->filtered = dp->filtered;
     st->relay_full = dp->relay_full;
+    st->disco_in = dp->disco_in;
+    st->disco_bad = dp->disco_bad;
+    st->pongs_sent = dp->pongs_sent;
+    st->pongs_limited = dp->pongs_limited;
+    st->pings_sent = dp->pings_sent;
+    st->pongs_in = dp->pongs_in;
     if (dp->fstate == F_BIG)
         snprintf(st->problem, sizeof st->problem, "packet filter too large; inbound traffic blocked");
     else if (dp->fstate == F_INVALID)
@@ -869,7 +1026,90 @@ int ts_dp_peer_status(const ts_dp *dp, uint32_t ipv4, ts_wg_stats *st, int *regi
     return 0;
 }
 
+int ts_dp_ping(ts_dp *dp, uint32_t peer_ip, uint32_t timeout_ms, uint64_t cookie, int64_t now_ms)
+{
+    dpeer *peer = NULL;
+    dping *q = NULL;
+    slot *s;
+    uint8_t rnd[24 + 12], out[TS_DISCO_PING_LEN];
+    size_t i;
+    int expired = 0, fresh, n;
+
+    if (!dp->running) return TS_DP_PING_DOWN;
+    for (i = 0; i < dp->npeers && !peer; i++) {
+        dpeer *p = &dp->peers[i];
+        if (!p->have_ipv4 || p->ipv4 != peer_ip) continue;
+        if (p->configured) peer = p;
+        else if (p->expired) expired = 1;
+    }
+    if (!peer) return expired ? TS_DP_PING_EXPIRED : TS_DP_PING_UNKNOWN;
+    if (key_zero(peer->disco_key)) return TS_DP_PING_NO_DISCO;
+    if (!region_usable(dp, peer->home)) return TS_DP_PING_NO_HOME;
+    if (key_zero(dp->disco)) return TS_DP_PING_FAILED;
+    for (i = 0; i < TS_DP_MAX_PINGS && !q; i++)
+        if (!dp->pings[i].used) q = &dp->pings[i];
+    if (!q) return TS_DP_PING_BUSY;
+    if (dp->io.random(dp->user, rnd, sizeof rnd) != 0) return TS_DP_PING_FAILED;
+    if (!peer->have_shared) {   /* asked for locally, once per peer key: no budget */
+        COUNT(dp, disco_dh);
+        ts_disco_shared_init(&peer->shared, dp->disco_priv, peer->disco_key);
+        peer->have_shared = 1;
+    }
+    n = ts_disco_seal_ping(out, sizeof out, dp->disco, &peer->shared, rnd, rnd + 24, dp->node_pub);
+    if (n < 0) return TS_DP_PING_FAILED;
+
+    /* The home region's connection, dialed if there is none (B1 for data). */
+    s = slot_for_region(dp, peer->home);
+    fresh = !s;
+    if (fresh && !(s = slot_open(dp, peer->home))) return TS_DP_PING_FAILED;
+    q->used = 1;
+    memcpy(q->txid, rnd + 24, 12);
+    memcpy(q->key, peer->key, 32);
+    q->cookie = cookie;
+    q->sent = now_ms;
+    q->deadline = now_ms + (int64_t)timeout_ms;
+    q->region = peer->home;
+    dp->pings_sent++;
+    slot_send(s, peer->key, out, (size_t)n);   /* queued before a dial, so a failed dial keeps it */
+    if (fresh) dial(s);
+    return 0;
+}
+
+int ts_dp_ping_cancel(ts_dp *dp, uint64_t cookie)
+{
+    int i;
+    for (i = 0; i < TS_DP_MAX_PINGS; i++) {
+        if (dp->pings[i].used && dp->pings[i].cookie == cookie) {
+            ts_wipe(&dp->pings[i], sizeof dp->pings[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int64_t ts_dp_ping_deadline(const ts_dp *dp)
+{
+    int64_t d = -1;
+    int i;
+    for (i = 0; i < TS_DP_MAX_PINGS; i++)
+        if (dp->pings[i].used && (d < 0 || dp->pings[i].deadline < d)) d = dp->pings[i].deadline;
+    return d;
+}
+
 #ifdef TS_TEST_HOOKS
+int ts_dp_test_has_disco_priv(const ts_dp *dp)
+{
+    return !key_zero(dp->disco_priv);
+}
+
+int ts_dp_test_disco_keys(const ts_dp *dp)
+{
+    size_t i;
+    int k = 0;
+    for (i = 0; i < dp->npeers; i++) k += dp->peers[i].have_shared;
+    return k;
+}
+
 const ts_dp_test_counts *ts_dp_test_counters(const ts_dp *dp)
 {
     return &dp->cnt;

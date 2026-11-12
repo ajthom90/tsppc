@@ -27,15 +27,69 @@ const char *ts_ipc_socket_path(void)
     return TS_IPC_PATH;
 }
 
-int ts_ipc_parse_request(const char *line, size_t len, ts_ipc_cmd *out)
+int ts_ipc_parse_ipv4(const char *s, size_t n, uint32_t *out)
+{
+    uint32_t a = 0, part = 0;
+    size_t i, digits = 0;
+    int dots = 0;
+    for (i = 0; i < n; i++) {
+        if (s[i] >= '0' && s[i] <= '9') {
+            if (digits == 1 && part == 0) return -1;
+            part = part * 10 + (uint32_t)(s[i] - '0');
+            if (++digits > 3 || part > 255) return -1;
+        } else if (s[i] == '.') {
+            if (digits == 0 || ++dots > 3) return -1;
+            a = a << 8 | part;
+            part = 0;
+            digits = 0;
+        } else {
+            return -1;
+        }
+    }
+    if (dots != 3 || digits == 0) return -1;
+    *out = a << 8 | part;
+    return 0;
+}
+
+/* "<a.b.c.d> <timeout>" (after "ping ", before the newline). */
+static int parse_ping_args(const char *s, size_t n, ts_ipc_args *args)
+{
+    const char *sp = memchr(s, ' ', n);
+    size_t i, iplen, tlen;
+    uint32_t ip, t = 0;
+    if (!sp) return -1;
+    iplen = (size_t)(sp - s);
+    tlen = n - iplen - 1;
+    if (ts_ipc_parse_ipv4(s, iplen, &ip) != 0) return -1;
+    if (tlen == 0 || tlen > 5 || sp[1] == '0') return -1;
+    for (i = 0; i < tlen; i++) {
+        if (sp[1 + i] < '0' || sp[1 + i] > '9') return -1;
+        t = t * 10 + (uint32_t)(sp[1 + i] - '0');
+    }
+    if (t < TS_IPC_PING_MIN_MS || t > TS_IPC_PING_MAX_MS) return -1;
+    args->ip = ip;
+    args->timeout_ms = t;
+    return 0;
+}
+
+int ts_ipc_parse_request(const char *line, size_t len, ts_ipc_cmd *out, ts_ipc_args *args)
 {
     size_t i;
+    ts_ipc_args a;
     if (len == 0 || len > TS_IPC_LINE_MAX) return -1;
+    memset(&a, 0, sizeof a);
     for (i = 0; i < NCMDS; i++) {
         if (strlen(cmd_lines[i]) == len && memcmp(cmd_lines[i], line, len) == 0) {
             *out = (ts_ipc_cmd)i;
+            *args = a;
             return 0;
         }
+    }
+    if (len > 6 && memcmp(line, "ping ", 5) == 0 && line[len - 1] == '\n' &&
+        parse_ping_args(line + 5, len - 6, &a) == 0) {
+        *out = TS_IPC_PING;
+        *args = a;
+        return 0;
     }
     return -1;
 }
@@ -43,6 +97,19 @@ int ts_ipc_parse_request(const char *line, size_t len, ts_ipc_cmd *out)
 const char *ts_ipc_cmd_line(ts_ipc_cmd cmd)
 {
     return (size_t)cmd < NCMDS ? cmd_lines[cmd] : "";
+}
+
+int ts_ipc_ping_line(char *out, size_t cap, uint32_t ip, uint32_t timeout_ms)
+{
+    int n;
+    if (timeout_ms < TS_IPC_PING_MIN_MS || timeout_ms > TS_IPC_PING_MAX_MS || cap == 0) return -1;
+    n = snprintf(out, cap, "ping %u.%u.%u.%u %u\n", (unsigned)(ip >> 24), (unsigned)(ip >> 16 & 255),
+                 (unsigned)(ip >> 8 & 255), (unsigned)(ip & 255), (unsigned)timeout_ms);
+    if (n < 0 || (size_t)n >= cap) {
+        out[0] = 0;
+        return -1;
+    }
+    return n;
 }
 
 size_t ts_ipc_clean(char *out, size_t cap, const char *in, size_t n, int keep_newline)

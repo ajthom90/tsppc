@@ -207,6 +207,11 @@ static int hs_allow(ts_wg_dev *d)
     return 1;
 }
 
+int ts_wg_dh_allow(ts_wg_dev *d)
+{
+    return hs_allow(d);
+}
+
 static const uint8_t *cookie_for(const ts_wg_dev *d, const peer *p)
 {
     return p->have_cookie && d->now - p->cookie_at <= COOKIE_REFRESH_TIME ? p->cookie : NULL;

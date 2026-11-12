@@ -68,6 +68,10 @@ void ts_wg_tick(ts_wg_dev *d, int64_t now_ms);  /* call at least every 250 ms */
  * (priority packets included; keepalives and handshakes not) and their IP
  * bytes. */
 int ts_wg_peer_stats(const ts_wg_dev *d, const uint8_t key[32], ts_wg_stats *out);
+/* Take one Diffie-Hellman operation from the handshake budget (at most
+ * TS_WG_HS_PER_SEC in any second, shared with received handshakes) for work
+ * outside the device (disco box keys). 1 taken, 0 over budget. */
+int ts_wg_dh_allow(ts_wg_dev *d);
 
 /* The transport framing the device uses: type 4, receiver, LE counter, then
  * the ChaCha20-Poly1305 seal of pt padded with zeros to a multiple of 16.

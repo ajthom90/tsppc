@@ -29,7 +29,14 @@
  *
  * Peer names go into a tsppc block of /etc/hosts (names_io.c) while the data
  * plane runs; the block is removed when it stops, at exit, and at the next
- * start after a crash. */
+ * start after a crash.
+ *
+ * A ping request (ipc.h) holds its client open with no reply until the data
+ * plane reports the ping (pong, timeout, or stopped: down, logout, a restart
+ * of the data plane); its deadline is then the ping timeout plus
+ * TS_IPC_PING_MARGIN_MS. A client that closes or sends more cancels its
+ * ping. At most TS_IPC_MAX_PINGS clients wait at once, so status and the
+ * menu bar always have a slot. Only refused pings are logged. */
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -51,6 +58,7 @@
 #include "src/control/noise.h"
 #include "src/control/session.h"
 #include "src/core/bytes.h"
+#include "src/data/dataplane.h"
 #include "src/crypto/random.h"
 #include "src/net/keyfetch.h"
 #include "src/net/resolve.h"
@@ -83,6 +91,13 @@ typedef struct {
     size_t inlen;
     char *out;                      /* the reply, once the request is in */
     size_t outlen, outoff;
+    /* A ping request waiting for its result (ts_dpio_ping). The result is
+     * buffered by on_ping_result and the reply built by finish_pings, outside
+     * the data plane's calls. */
+    int ping;                       /* 1: pending */
+    uint64_t cookie;
+    int ping_done, ping_status, ping_region;
+    uint32_t ping_lat;
 } client;
 
 static struct {
@@ -124,6 +139,7 @@ static struct {
     ino_t lino;
     int64_t accept_paused_until;
     client cl[TS_IPC_MAX_CLIENTS];
+    uint64_t ping_seq;              /* the last ping cookie handed out */
 
     int fed;                        /* bytes reached the session this turn (the map may have changed) */
 
@@ -744,10 +760,109 @@ static void client_error(client *c, const char *text)
     c->outlen = n > 0 ? (size_t)n : 0;
 }
 
-static void do_request(client *c, ts_ipc_cmd cmd)
+/* Upstream's texts where it has one: no node with that IP is the engine's
+ * "no matching peer"; a peer with no disco key has no magicsock endpoint
+ * upstream, so "unknown peer"; an expired one is ipnlocal's text. "peer has
+ * no home relay" is ours (upstream would just time out). */
+static const char *ping_error_text(int rc)
+{
+    switch (rc) {
+    case TS_DP_PING_UNKNOWN: return "no matching peer";
+    case TS_DP_PING_EXPIRED: return "peer's node key has expired";
+    case TS_DP_PING_NO_DISCO: return "unknown peer";
+    case TS_DP_PING_NO_HOME: return "peer has no home relay";
+    case TS_DP_PING_BUSY: return "too many pings in flight";
+    case TS_DP_PING_DOWN: return "not connected";
+    default: return "ping failed";
+    }
+}
+
+/* Start a ping for c: on success no reply yet (finish_pings builds it). */
+static void start_ping(client *c, const ts_ipc_args *a)
+{
+    int rc, i, pending = 0;
+    uint64_t cookie = ++D.ping_seq;
+    char ip[16];
+    if (!D.sess || !D.want_up) {
+        client_error(c, ping_error_text(TS_DP_PING_DOWN));
+        return;
+    }
+    for (i = 0; i < TS_IPC_MAX_CLIENTS; i++)
+        if (D.cl[i].fd >= 0 && D.cl[i].ping) pending++;
+    if (pending >= TS_IPC_MAX_PINGS) {
+        client_error(c, "too many pings in progress");
+        return;
+    }
+    rc = ts_dpio_ping(a->ip, a->timeout_ms, cookie, now_ms());
+    if (rc != 0) {
+        /* Only failures are logged: a ping loop (tsppc ping -c 0) would
+         * otherwise add a line a second. */
+        fmt_ip(ip, sizeof ip, a->ip);
+        logline("ping %s refused: %s", ip, ping_error_text(rc));
+        client_error(c, ping_error_text(rc));
+        return;
+    }
+    c->ping = 1;
+    c->cookie = cookie;
+    c->ping_done = 0;
+    c->deadline = now_ms() + (int64_t)a->timeout_ms + TS_IPC_PING_MARGIN_MS;
+}
+
+/* The data plane's report on a ping (inside its calls: only recorded). */
+static void on_ping_result(void *user, uint64_t cookie, int status, uint32_t latency_us, int region_id)
+{
+    int i;
+    (void)user;
+    for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) {
+        client *c = &D.cl[i];
+        if (c->fd < 0 || !c->ping || c->ping_done || c->cookie != cookie) continue;
+        c->ping_done = 1;
+        c->ping_status = status;
+        c->ping_lat = latency_us;
+        c->ping_region = region_id;
+        return;
+    }
+}
+
+/* Build the replies of the pings that ended. */
+static void finish_pings(void)
+{
+    int i;
+    for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) {
+        client *c = &D.cl[i];
+        rbuild b;
+        char line[96];
+        if (c->fd < 0 || !c->ping || !c->ping_done) continue;
+        c->ping = 0;
+        if (c->ping_status == TS_DP_PONG) {
+            const char *code = D.sess ? region_code(ts_sess_netmap(D.sess), c->ping_region) : "-";
+            b.p = c->out;
+            b.len = 0;
+            b.cap = TS_IPC_RESP_MAX;
+            b.full = 0;
+            snprintf(line, sizeof line, "pong %lu %d %.40s", (unsigned long)c->ping_lat, c->ping_region, code);
+            put(&b, "ok", NULL);
+            put(&b, "ping", line);
+            c->outlen = b.len;
+        } else if (c->ping_status == TS_DP_PING_TIMEOUT) {
+            c->outlen = (size_t)snprintf(c->out, TS_IPC_RESP_MAX, "ok\nping timeout\n");
+        } else {
+            client_error(c, ping_error_text(TS_DP_PING_DOWN));
+        }
+        shutdown(c->fd, SHUT_RD);
+        /* Time to write it, even if the loop was held past the ping's
+         * deadline (a blocking command) and the check below runs now. */
+        c->deadline = now_ms() + TS_IPC_CLIENT_TIMEOUT_MS;
+    }
+}
+
+static void do_request(client *c, ts_ipc_cmd cmd, const ts_ipc_args *args)
 {
     rbuild b;
     switch (cmd) {
+    case TS_IPC_PING:
+        start_ping(c, args);
+        return;
     case TS_IPC_UP:
         if (!D.sess && up_before_session() != 0) {
             logline("up failed: the node state could not be saved");
@@ -796,6 +911,8 @@ static void do_request(client *c, ts_ipc_cmd cmd)
 
 static void client_close(client *c)
 {
+    if (c->ping && !c->ping_done) ts_dpio_ping_cancel(c->cookie);
+    c->ping = c->ping_done = 0;
     if (c->fd >= 0) close(c->fd);
     c->fd = -1;
     free(c->out);
@@ -844,15 +961,27 @@ static void accept_clients(void)
         }
         c->fd = fd;
         c->inlen = c->outlen = c->outoff = 0;
+        c->ping = c->ping_done = 0;
         c->deadline = now_ms() + TS_IPC_CLIENT_TIMEOUT_MS;
     }
 }
 
 static void client_read(client *c)
 {
-    ssize_t n = read(c->fd, c->in + c->inlen, sizeof c->in - c->inlen);
+    ssize_t n;
     char *nl;
     ts_ipc_cmd cmd;
+    ts_ipc_args args;
+    if (c->ping) {
+        /* Waiting for a ping: the client closing, or sending anything,
+         * cancels it. */
+        char b[16];
+        n = read(c->fd, b, sizeof b);
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
+        client_close(c);
+        return;
+    }
+    n = read(c->fd, c->in + c->inlen, sizeof c->in - c->inlen);
     if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
     if (n <= 0) {
         client_close(c);
@@ -865,7 +994,7 @@ static void client_read(client *c)
         char extra;
         /* One line and nothing after it, here or already waiting. */
         if (len != c->inlen || read(c->fd, &extra, 1) > 0) client_error(c, "unexpected bytes after the request");
-        else if (ts_ipc_parse_request(c->in, len, &cmd) == 0) do_request(c, cmd);
+        else if (ts_ipc_parse_request(c->in, len, &cmd, &args) == 0) do_request(c, cmd, &args);
         else client_error(c, "unknown request");
     } else if (c->inlen > TS_IPC_LINE_MAX) {
         client_error(c, "request too long");
@@ -914,7 +1043,13 @@ static void shutdown_all(void)
     int i;
     ts_dpio_shutdown();
     ts_names_shutdown();
-    for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) client_close(&D.cl[i]);
+    /* Pending pings were just ended (stopped): one try to tell them. */
+    finish_pings();
+    for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) {
+        client *c = &D.cl[i];
+        if (c->fd >= 0 && c->outlen > c->outoff) (void)write(c->fd, c->out + c->outoff, c->outlen - c->outoff);
+        client_close(c);
+    }
     if (D.lfd >= 0) {
         close(D.lfd);
         ts_ipc_unlink(D.sock_path, D.ldev, D.lino);
@@ -1018,6 +1153,7 @@ int main(int argc, char **argv)
         return 1;
     }
     ts_dpio_cleanup_route();
+    ts_dpio_set_ping_cb(on_ping_result, NULL);
     ts_names_init(logline);
     ts_names_cleanup();
     if (ts_state_load_or_create(&D.st, D.state_dir, err, sizeof err) != 0) {
@@ -1056,6 +1192,7 @@ int main(int argc, char **argv)
         kf_tick();
         conn_flush();
         ts_dpio_sync(D.sess, D.want_up, D.fed, now_ms());
+        finish_pings();
         {
             ts_dpio_view dv;
             ts_dpio_get_view(&dv);
@@ -1107,6 +1244,7 @@ int main(int argc, char **argv)
         }
         kf_events();
         ts_dpio_events(&r, &w, now_ms());
+        finish_pings();
         for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) {
             client *c = &D.cl[i];
             if (c->fd < 0) continue;

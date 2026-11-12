@@ -190,9 +190,11 @@ DCOBJS := $(OBJDIR)/tools/derp_check.o $(LIBOBJS)
 $(OBJDIR)/tsppcd: $(OBJDIR)/src/daemon/main.o $(LIBOBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(OBJDIR)/src/daemon/main.o $(LIBOBJS) $(VOBJS)
 
-# The CLI needs only the socket and reply code.
-$(OBJDIR)/tsppc: $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/daemon/ipc.o $(OBJDIR)/src/daemon/ipc_reply.o
-	$(CC) $(ARCH) $(SAN) -o $@ $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/daemon/ipc.o $(OBJDIR)/src/daemon/ipc_reply.o
+# The CLI needs only the socket and reply code, and its ping helpers.
+CLIOBJS := $(OBJDIR)/src/cli/main.o $(OBJDIR)/src/cli/ping.o $(OBJDIR)/src/daemon/ipc.o $(OBJDIR)/src/daemon/ipc_reply.o
+
+$(OBJDIR)/tsppc: $(CLIOBJS)
+	$(CC) $(ARCH) $(SAN) -o $@ $(CLIOBJS)
 
 $(OBJDIR)/keyfetch_check: $(KFOBJS) $(VOBJS)
 	$(CC) $(ARCH) $(SAN) -o $@ $(KFOBJS) $(VOBJS)

@@ -10,7 +10,6 @@
 
 #include "src/core/bytes.h"
 #include "src/crypto/random.h"
-#include "src/crypto/x25519.h"
 #include "src/data/dataplane.h"
 #include "src/derp/derp.h"
 #include "src/net/sock.h"
@@ -55,7 +54,7 @@ static struct {
     /* The running data plane and what it was started with. */
     int running;
     uint32_t self_ip;
-    uint8_t node_priv[32];
+    uint8_t node_priv[32], disco_priv[32];
     int last_state;
     int up_logged;             /* the home region last logged connected, 0 none */
     int home;                  /* the home chosen by the last probe round (kept across restarts) */
@@ -221,7 +220,19 @@ static int64_t io_wall(void *user, uint32_t *nsec)
     return (int64_t)tv.tv_sec;
 }
 
-static const ts_dp_io DP_IO = { io_dial, io_conn_send, io_conn_close, io_tun_write, io_random, io_wall };
+/* Ping results go to the callback set with ts_dpio_set_ping_cb (kept out of
+ * G, so ts_dpio_init does not clear it). */
+static ts_dpio_ping_fn g_ping_fn;
+static void *g_ping_user;
+
+static void io_ping_result(void *user, uint64_t cookie, int status, uint32_t latency_us, int region_id)
+{
+    (void)user;
+    if (g_ping_fn) g_ping_fn(g_ping_user, cookie, status, latency_us, region_id);
+}
+
+static const ts_dp_io DP_IO = { io_dial,   io_conn_send, io_conn_close, io_tun_write,
+                                io_random, io_wall,      io_ping_result };
 
 /* The connection failed (outside any data plane call): close it, then tell
  * the data plane. */
@@ -360,6 +371,7 @@ static void slot_events(int i, fd_set *r, fd_set *w)
 #ifdef TS_TEST_HOOKS
 int (*ts_dpio_test_tun_open)(char ifname[16]);
 int (*ts_dpio_test_run)(const char *const *argv);
+unsigned long ts_dpio_test_event_ticks;
 #define TUN_OPEN(n) (ts_dpio_test_tun_open ? ts_dpio_test_tun_open(n) : ts_tun_open(n))
 #define RUN(a) (ts_dpio_test_run ? ts_dpio_test_run(a) : ts_run(a))
 #else
@@ -643,6 +655,7 @@ static void dp_stop(const char *why)
     probes_cancel();
     tun_close();
     ts_wipe(G.node_priv, sizeof G.node_priv);
+    ts_wipe(G.disco_priv, sizeof G.disco_priv);
     G.running = 0;
     G.self_ip = 0;
     G.up_logged = 0;
@@ -654,17 +667,16 @@ static void dp_stop(const char *why)
 
 static void dp_start(const ts_netmap *nm, const ts_state *st)
 {
-    uint8_t disco_pub[32];
     if (G.now < G.start_retry_at) return;
-    ts_x25519_public(disco_pub, st->disco_priv);
     ts_dp_tick(G.dp, G.now);
-    if (ts_dp_start(G.dp, st->node_priv, disco_pub, nm->self.ipv4) != 0) {
+    if (ts_dp_start(G.dp, st->node_priv, st->disco_priv, nm->self.ipv4) != 0) {
         G.log("cannot start the data plane: out of memory");
         G.start_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
         return;
     }
     ts_dp_tick(G.dp, G.now);
     memcpy(G.node_priv, st->node_priv, 32);
+    memcpy(G.disco_priv, st->disco_priv, 32);
     G.self_ip = nm->self.ipv4;
     G.running = 1;
     g_nm = nm;
@@ -708,6 +720,8 @@ void ts_dpio_sync(ts_sess *sess, int want_up, int map_changed, int64_t now_ms)
             dp_stop(want_up ? ts_sess_state_name(state) : "down");
         else if (memcmp(st->node_priv, G.node_priv, 32) != 0)
             dp_stop("node key changed");
+        else if (memcmp(st->disco_priv, G.disco_priv, 32) != 0)
+            dp_stop("disco key changed");
         else if (state == TS_SESS_RUNNING && (!nm->have_self || !nm->self.have_ipv4 || nm->self.ipv4 != G.self_ip))
             dp_stop("address changed");
     }
@@ -762,6 +776,14 @@ void ts_dpio_fds(fd_set *r, fd_set *w, int *maxfd, int64_t *timeout_ms)
     int i, k;
     if (!G.running) return;
     if (*timeout_ms > TS_DPIO_TICK_MS) *timeout_ms = TS_DPIO_TICK_MS;
+    {
+        int64_t d = ts_dp_ping_deadline(G.dp), left;
+        if (d >= 0) {
+            left = d - G.clock();
+            if (left < 0) left = 0;
+            if (*timeout_ms > left) *timeout_ms = left;
+        }
+    }
     for (i = 0; i < TS_DP_MAX_CONNS; i++) {
         rslot *s = &G.s[i];
         int rd = 0, wr = 0;
@@ -807,6 +829,15 @@ void ts_dpio_events(fd_set *r, fd_set *w, int64_t now_ms)
     int i;
     G.now = now_ms;
     if (!G.running) return;
+    /* With a ping outstanding, tick first: a pong that arrives now is timed
+     * now, not at the last sync, and a due timeout is reported at once.
+     * Otherwise skip it: a tick on every wake costs a G3 too much. */
+    if (ts_dp_ping_deadline(G.dp) >= 0) {
+        ts_dp_tick(G.dp, now_ms);
+#ifdef TS_TEST_HOOKS
+        ts_dpio_test_event_ticks++;
+#endif
+    }
     for (i = 0; i < TS_DP_MAX_CONNS && G.running; i++) slot_events(i, r, w);
     if (G.running) tun_events(r);
     after_block();
@@ -875,6 +906,23 @@ void ts_dpio_get_view(ts_dpio_view *v)
     snprintf(v->ifname, sizeof v->ifname, "%s", v->tun_open ? G.ifname : "");
     snprintf(v->problem, sizeof v->problem, "%s%s%s", G.tun_problem, G.tun_problem[0] && ds.problem[0] ? "; " : "",
              ds.problem);
+}
+
+void ts_dpio_set_ping_cb(ts_dpio_ping_fn fn, void *user)
+{
+    g_ping_fn = fn;
+    g_ping_user = user;
+}
+
+int ts_dpio_ping(uint32_t peer_ip, uint32_t timeout_ms, uint64_t cookie, int64_t now_ms)
+{
+    if (!G.running || !G.dp || G.stopping) return TS_DP_PING_DOWN;
+    return ts_dp_ping(G.dp, peer_ip, timeout_ms, cookie, now_ms);
+}
+
+void ts_dpio_ping_cancel(uint64_t cookie)
+{
+    if (G.running && G.dp && !G.stopping) (void)ts_dp_ping_cancel(G.dp, cookie);
 }
 
 int ts_dpio_peer_status(uint32_t ipv4, ts_wg_stats *st, int *region)

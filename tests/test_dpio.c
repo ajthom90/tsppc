@@ -14,6 +14,7 @@
 
 #include "../src/control/session.h"
 #include "../src/daemon/dataplane_io.h"
+#include "../src/data/dataplane.h"
 
 #include "fake_control.inc"
 
@@ -25,6 +26,7 @@
 
 #define HA "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 #define HB "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+#define HD "1111111111111111222222222222222233333333333333334444444444444444"
 
 static fake F;
 static ts_sess *S;
@@ -36,6 +38,9 @@ static int n_open, n_run;
 static int tun_peer = -1;         /* the test's end of the fake tun */
 static char cmds[16384];
 static char logbuf[16384];
+static int g_peer_disco;          /* the peer has a DiscoKey in the map */
+static int n_res, res_status, res_region;
+static uint64_t res_cookie;
 
 static int64_t fake_clock(void)
 {
@@ -131,10 +136,10 @@ static void make_map(unsigned port)
     snprintf(g_map, sizeof g_map,
              "{\"Node\":{\"ID\":1,\"Name\":\"self.example.test.\",\"Key\":\"nodekey:" HA "\","
              "\"Addresses\":[\"100.64.0.1/32\"],\"MachineAuthorized\":true},"
-             "\"Peers\":[{\"ID\":2,\"Name\":\"p.example.test.\",\"Key\":\"nodekey:" HB "\","
+             "\"Peers\":[{\"ID\":2,\"Name\":\"p.example.test.\",\"Key\":\"nodekey:" HB "\",%s"
              "\"Addresses\":[\"100.64.0.2/32\"],\"HomeDERP\":7,\"Online\":true,\"MachineAuthorized\":true}],"
              "\"DERPMap\":{\"Regions\":{" REGION(7, port) "," REGION(8, port) "}}}",
-             port, port);
+             g_peer_disco ? "\"DiscoKey\":\"discokey:" HD "\"," : "", port, port);
 }
 
 /* One loop turn as the daemon's: sync, select (briefly, for real), events. */
@@ -363,10 +368,136 @@ static void test_dpio_home_gone(void)
     end();
 }
 
+static int ping_from_cb;           /* the callback tries a ping on STOPPED */
+static int ping_from_cb_rc;
+
+static void on_ping(void *user, uint64_t cookie, int status, uint32_t latency_us, int region_id)
+{
+    (void)latency_us;
+    if (user != &n_res) return;
+    if (ping_from_cb && status == TS_DP_PING_STOPPED)
+        ping_from_cb_rc = ts_dpio_ping(0x64400002u, 5000, 999, g_clock);   /* misuse: must be refused */
+    n_res++;
+    res_cookie = cookie;
+    res_status = status;
+    res_region = region_id;
+}
+
+/* ts_dpio_ping reaches the data plane with the state's disco key; results
+ * come through the registered callback, timeouts seen by ts_dpio_events
+ * alone (it ticks the data plane). The relay never answers here. */
+static void test_dpio_ping(void)
+{
+    int i;
+    n_res = 0;
+    ts_dpio_set_ping_cb(on_ping, &n_res);
+    g_peer_disco = 1;
+    if (begin() != 0) {
+        t_true("dpio ping: setup", 0);
+        end();
+        g_peer_disco = 0;
+        return;
+    }
+    t_true("dpio ping: not running", ts_dpio_ping(0x64400002u, 1000, 1, g_clock) == TS_DP_PING_DOWN);
+    turn(1);
+    turn(0);
+    t_true("dpio ping: unknown peer", ts_dpio_ping(0x64400003u, 1000, 1, g_clock) == TS_DP_PING_UNKNOWN);
+    /* With no ping outstanding, events do not tick the data plane. */
+    {
+        fd_set r, w;
+        unsigned long t0 = ts_dpio_test_event_ticks;
+        FD_ZERO(&r);
+        FD_ZERO(&w);
+        for (i = 0; i < 5; i++) {
+            g_clock += 10;
+            ts_dpio_events(&r, &w, g_clock);
+        }
+        t_true("dpio ping: no extra tick with no ping outstanding", ts_dpio_test_event_ticks == t0);
+    }
+    t_true("dpio ping: sent", ts_dpio_ping(0x64400002u, 300, 77, g_clock) == 0);
+    for (i = 0; i < 100 && n_res == 0; i++) {
+        fd_set r, w;
+        FD_ZERO(&r);
+        FD_ZERO(&w);
+        g_clock += 10;
+        ts_dpio_events(&r, &w, g_clock);
+    }
+    t_true("dpio ping: events tick while a ping is outstanding", ts_dpio_test_event_ticks > 0);
+    t_true("dpio ping: timeout through the callback, from events alone",
+           n_res == 1 && res_cookie == 77 && res_status == TS_DP_PING_TIMEOUT && res_region == 7 && i >= 29 && i <= 31);
+    /* The loop's sleep ends at the earliest ping deadline. */
+    {
+        fd_set r, w;
+        int maxfd = -1;
+        int64_t tmo = 1000;
+        FD_ZERO(&r);
+        FD_ZERO(&w);
+        ts_dpio_fds(&r, &w, &maxfd, &tmo);
+        t_true("dpio ping: no ping, the tick bounds the sleep", tmo == TS_DPIO_TICK_MS);
+        t_true("dpio ping: a 120 ms ping", ts_dpio_ping(0x64400002u, 120, 80, g_clock) == 0);
+        t_true("dpio ping: a 100 ms ping", ts_dpio_ping(0x64400002u, 100, 81, g_clock) == 0);
+        tmo = 1000;
+        ts_dpio_fds(&r, &w, &maxfd, &tmo);
+        t_true("dpio ping: the sleep ends at the earliest deadline", tmo == 100);
+        g_clock += 40;
+        tmo = 1000;
+        ts_dpio_fds(&r, &w, &maxfd, &tmo);
+        t_true("dpio ping: the time left to it", tmo == 60);
+        g_clock += 100;
+        tmo = 1000;
+        ts_dpio_fds(&r, &w, &maxfd, &tmo);
+        t_true("dpio ping: a passed deadline means no sleep", tmo == 0);
+        FD_ZERO(&r);
+        FD_ZERO(&w);
+        n_res = 0;
+        ts_dpio_events(&r, &w, g_clock);
+        t_true("dpio ping: both time out at once", n_res == 2 && res_status == TS_DP_PING_TIMEOUT);
+        tmo = 1000;
+        ts_dpio_fds(&r, &w, &maxfd, &tmo);
+        t_true("dpio ping: none left, the tick again", tmo == TS_DPIO_TICK_MS);
+        n_res = 1;
+    }
+    /* A cancelled ping is never reported and frees its place. */
+    {
+        int busy = 0;
+        for (i = 0; i < TS_DP_MAX_PINGS + 1; i++) {
+            if (ts_dpio_ping(0x64400002u, 5000, 1000 + (uint64_t)i, g_clock) != 0) busy++;
+            ts_dpio_ping_cancel(1000 + (uint64_t)i);
+        }
+        t_true("dpio ping: cancelled pings free their places", busy == 0);
+        t_true("dpio ping: cancelling an unknown cookie is harmless", (ts_dpio_ping_cancel(424242), 1));
+        g_clock += 6000;
+        turn(0);
+        t_true("dpio ping: cancelled pings are never reported", n_res == 1);
+    }
+    t_true("dpio ping: sent again", ts_dpio_ping(0x64400002u, 5000, 78, g_clock) == 0);
+    ping_from_cb = 1;
+    ping_from_cb_rc = 12345;
+    end();
+    ping_from_cb = 0;
+    t_true("dpio ping: shutdown ends it", n_res == 2 && res_cookie == 78 && res_status == TS_DP_PING_STOPPED);
+    t_true("dpio ping: a ping from the STOPPED callback is refused", ping_from_cb_rc == TS_DP_PING_DOWN);
+    t_true("dpio ping: after shutdown", ts_dpio_ping(0x64400002u, 1000, 1, g_clock) == TS_DP_PING_DOWN);
+    ts_dpio_set_ping_cb(NULL, NULL);
+    g_peer_disco = 0;
+
+    /* No DiscoKey for the peer. */
+    if (begin() != 0) {
+        t_true("dpio ping: setup 2", 0);
+        end();
+        return;
+    }
+    turn(1);
+    turn(0);
+    t_true("dpio ping: no disco key", ts_dpio_ping(0x64400002u, 1000, 1, g_clock) == TS_DP_PING_NO_DISCO);
+    end();
+}
+
 void test_dpio(void)
 {
     test_dpio_probe_clock();
     test_dpio_route_fail();
     test_dpio_tun_eof();
     test_dpio_home_gone();
+    test_dpio_ping();
 }

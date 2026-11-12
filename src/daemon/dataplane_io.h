@@ -21,8 +21,8 @@
  *   RUNNING: a reconnect empties it until the new map arrives).
  * - Stops (ts_dp_stop, route delete, address delete, interface down, tun
  *   closed) on IDLE, NEED_LOGIN, AWAIT_APPROVAL, FAILED, not wanted up, or a
- *   node key or self address change (then starts again); ts_dpio_shutdown on
- *   SIGTERM and SIGINT.
+ *   node key, disco key or self address change (then starts again);
+ *   ts_dpio_shutdown on SIGTERM and SIGINT.
  * - If no /dev/tunN opens, relays and home selection still run, packets for
  *   the tun device are dropped (counted), status shows "tunnel driver not
  *   loaded", and opening is retried every TS_DPIO_TUN_RETRY_MS. The same
@@ -78,9 +78,11 @@ void ts_dpio_cleanup_route(void);
  * session state changed, and act on finished probes. sess may be NULL. */
 void ts_dpio_sync(ts_sess *sess, int want_up, int map_changed, int64_t now_ms);
 /* Descriptors to wait on; *timeout_ms is lowered to what the data plane
- * needs (TS_DPIO_TICK_MS while running, 0 with decrypted data waiting). */
+ * needs (TS_DPIO_TICK_MS while running, the time to the earliest ping
+ * deadline if sooner, 0 with decrypted data waiting). */
 void ts_dpio_fds(fd_set *r, fd_set *w, int *maxfd, int64_t *timeout_ms);
-/* After select. */
+/* After select. While a ping is outstanding it ticks the data plane first
+ * (pong latency, timeouts on time); otherwise the tick waits for sync. */
 void ts_dpio_events(fd_set *r, fd_set *w, int64_t now_ms);
 /* Stop everything (signals, exit) and free. */
 void ts_dpio_shutdown(void);
@@ -102,10 +104,29 @@ void ts_dpio_get_view(ts_dpio_view *v);
 /* ts_dp_peer_status of the running data plane; -1 when it is not running. */
 int ts_dpio_peer_status(uint32_t ipv4, ts_wg_stats *st, int *region);
 
+/* Disco pings (src/data/dataplane.h, ts_dp_ping). ts_dpio_ping returns
+ * ts_dp_ping's result, or TS_DP_PING_DOWN when the data plane is not running
+ * or is stopping (so a ping started from a STOPPED callback, against the
+ * rule below, is refused rather than silently lost).
+ * ts_dpio_ping_cancel forgets an outstanding ping (never reported; nothing
+ * when there is none or the data plane is not running).
+ * Every ping that returned 0 is reported exactly once through the callback
+ * set with ts_dpio_set_ping_cb (kept across ts_dpio_init; NULL: none): its
+ * pong, its timeout, or TS_DP_PING_STOPPED when the data plane stops first
+ * (down, logout, a key or address change, ts_dpio_shutdown). The callback
+ * runs inside ts_dpio_sync, ts_dpio_events or ts_dpio_shutdown and must not
+ * call any ts_dpio_ function. */
+typedef void (*ts_dpio_ping_fn)(void *user, uint64_t cookie, int status, uint32_t latency_us, int region_id);
+void ts_dpio_set_ping_cb(ts_dpio_ping_fn fn, void *user);
+int ts_dpio_ping(uint32_t peer_ip, uint32_t timeout_ms, uint64_t cookie, int64_t now_ms);
+void ts_dpio_ping_cancel(uint64_t cookie);
+
 #ifdef TS_TEST_HOOKS
 /* Replace the tun device and the commands (NULL: the real ones). */
 extern int (*ts_dpio_test_tun_open)(char ifname[16]);
 extern int (*ts_dpio_test_run)(const char *const *argv);
+/* Data-plane ticks ts_dpio_events made (only while a ping is outstanding). */
+extern unsigned long ts_dpio_test_event_ticks;
 #endif
 
 #endif

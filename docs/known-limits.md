@@ -164,3 +164,14 @@ check.
 - Deleting only the begin marker line by hand turns the old entries into ordinary owner lines: tsppc no longer recognises them as its own and never removes them (a lone end marker is removed). Delete the whole section, or neither marker.
 - An edit the owner makes in the moment between tsppc reading the file and replacing it is lost. The window is very short and only exists while a map change is being written.
 - The resolver cache flush (`dscacheutil` on 10.5, `lookupd` on 10.4) runs in the daemon's loop and can hold it for up to 10 s if the command hangs (the data plane then restarts any relay probe round it interrupted).
+
+## `tsppc ping` and disco
+
+- Relay only until milestone 8: every pong comes through a DERP relay, so the default run (10 pings, until direct) always ends with `direct connection not established` and exit 1, as the official client does for a relayed peer. Use `--until-direct=false` for a zero exit.
+- Only disco ping and pong are handled. CallMeMaybe and the UDP relay messages are counted and ignored; with no direct paths there is nothing to act on.
+- tsppc answers a disco ping only from a current peer whose packet carries that peer's disco key from the network map. Upstream also accepts a disco key learned from a TSMP advertisement; a peer whose key reached tsppc that way and not yet through the map gets no pong until the map catches up.
+- Pongs are rate-limited to 10 a second per peer and 50 a second in all.
+- At most 4 pings can wait at once across all `tsppc ping` commands, so `tsppc status` and the menu bar app always find a free connection to the daemon.
+- `--timeout` accepts 100ms to 10s. Names resolve only to tailnet peers (full name, or its first label); there is no fallback to the system resolver.
+- "peer has no home relay" is tsppc's own message; upstream would time out instead.
+- Jailed and WireGuard-only peers are not configured in tsppc's data plane, so `tsppc ping` to them says `no matching peer` although `tsppc status` lists them; upstream would ping them.

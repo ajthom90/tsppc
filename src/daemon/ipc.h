@@ -2,6 +2,7 @@
 #define TS_DAEMON_IPC_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 /* The local control socket between tsppc (the CLI) and tsppcd (the daemon).
@@ -10,6 +11,24 @@
  * '\n', at most TS_IPC_LINE_MAX bytes with the newline), and reads the reply
  * until the daemon closes the connection. One request per connection; bytes
  * after the newline make it an error.
+ *
+ * Requests: "status", "up", "ip", "logout", "down", and
+ * "ping <a.b.c.d> <timeout_ms>" (a disco ping over the peer's home relay;
+ * timeout TS_IPC_PING_MIN_MS..TS_IPC_PING_MAX_MS in decimal, no leading
+ * zeros). A ping's reply waits for the result: "ok" and a ping line, or
+ * "error <text>": upstream's "no matching peer" (no peer has that address),
+ * "unknown peer" (the peer has no disco key: upstream has no endpoint for
+ * it) and "peer's node key has expired"; tsppc's own "peer has no home
+ * relay" (upstream would just time out), "not connected", "too many pings
+ * in progress" (TS_IPC_MAX_PINGS clients already wait, answered at once)
+ * and "too many pings in flight" / "ping failed" (the data plane's limits).
+ * While a ping is pending the client's deadline is the
+ * ping timeout plus TS_IPC_PING_MARGIN_MS (not TS_IPC_CLIENT_TIMEOUT_MS), so
+ * the daemon's own timeout answers first; a client should wait longer still
+ * (the CLI waits the ping timeout plus 3 s). A client that closes, or sends
+ * anything, while its ping is pending cancels it. down, logout and the data
+ * plane stopping answer a pending ping with "error not connected"; on
+ * SIGTERM the daemon tries once to send that, then closes.
  *
  * Every reply line is "<key> <value>\n" or "<key>\n". Keys:
  *   ok                      the command was accepted
@@ -42,6 +61,10 @@
  *                           delivered from and sent to it, whole seconds since
  *                           the last handshake; after all peer lines
  *   truncated               the reply hit TS_IPC_RESP_MAX
+ *   ping pong <latency_us> <region_id> <region_code>
+ *   ping timeout            the result of a ping request (only in its reply);
+ *                           region_id is the region the ping was sent to,
+ *                           region_code "-" when the map has none
  * self, ip, peer, relay, tunnel, filter and path come from the current map, and
  * are left out while wanted is down (the last map is stale then).
  * The menu bar's parser (ts_reply_parse) ignores relay, tunnel, filter and path.
@@ -58,9 +81,13 @@
 #define TS_IPC_PATH "/var/run/tsppc.sock"
 #define TS_IPC_LINE_MAX 64             /* longest request, newline included */
 #define TS_IPC_MAX_CLIENTS 8           /* more are accepted and closed at once */
-#define TS_IPC_CLIENT_TIMEOUT_MS 10000 /* a client must be done within this */
+#define TS_IPC_CLIENT_TIMEOUT_MS 10000 /* a client must be done within this (a pending ping: see above) */
 #define TS_IPC_RESP_MAX 131072         /* largest reply, bytes */
 #define TS_IPC_VALUE_MAX 2048          /* longest reply value a client must handle */
+#define TS_IPC_PING_MIN_MS 100        /* a ping request's timeout range */
+#define TS_IPC_PING_MAX_MS 10000
+#define TS_IPC_PING_MARGIN_MS 2000     /* a pending ping's client deadline: its timeout plus this */
+#define TS_IPC_MAX_PINGS 4             /* clients that may wait for a ping at once */
 #define TS_IPC_GROUP "admin"
 #define TS_IPC_GROUP_GID 80            /* admin's gid if the lookup fails */
 
@@ -69,21 +96,41 @@ typedef enum {
     TS_IPC_UP,
     TS_IPC_IP,
     TS_IPC_LOGOUT,
-    TS_IPC_DOWN
+    TS_IPC_DOWN,
+    TS_IPC_PING
 } ts_ipc_cmd;
+
+/* A request's arguments (ping only; zero for the others). */
+typedef struct {
+    uint32_t ip;              /* host byte order */
+    uint32_t timeout_ms;
+} ts_ipc_args;
 
 /* The socket path: TS_IPC_PATH. In builds with -DTS_TEST_HOOKS only, the
  * TSPPC_SOCKET environment variable overrides it. */
 const char *ts_ipc_socket_path(void);
 
 /* Parse one request line of len bytes: "status\n", "up\n", "ip\n",
- * "logout\n" or "down\n" exactly. Returns 0 with *out set, or -1 for anything else
- * (unknown command, missing newline, a NUL or other byte, len over
- * TS_IPC_LINE_MAX). */
-int ts_ipc_parse_request(const char *line, size_t len, ts_ipc_cmd *out);
+ * "logout\n" or "down\n" exactly, or "ping <a.b.c.d> <timeout_ms>\n" with
+ * single spaces, an address as ts_ipc_parse_ipv4 takes it and a timeout
+ * from TS_IPC_PING_MIN_MS to TS_IPC_PING_MAX_MS with no leading zero.
+ * Returns 0 with *out and *args set (args zeroed for commands without
+ * arguments), or -1 for anything else (unknown command, missing newline, a
+ * NUL or other byte, len over TS_IPC_LINE_MAX). */
+int ts_ipc_parse_request(const char *line, size_t len, ts_ipc_cmd *out, ts_ipc_args *args);
 
-/* The request line for cmd, newline included. */
+/* The request line for cmd, newline included; "" for TS_IPC_PING (use
+ * ts_ipc_ping_line). */
 const char *ts_ipc_cmd_line(ts_ipc_cmd cmd);
+
+/* Format "ping <a.b.c.d> <timeout_ms>\n" into out. Returns its length, or -1
+ * if timeout_ms is out of range or cap is too small. */
+int ts_ipc_ping_line(char *out, size_t cap, uint32_t ip, uint32_t timeout_ms);
+
+/* a.b.c.d, each part 1 to 3 digits, at most 255, no leading zero (so "01"
+ * is not read as octal by anyone), nothing else. 0 with *out in host byte
+ * order, or -1. */
+int ts_ipc_parse_ipv4(const char *s, size_t n, uint32_t *out);
 
 /* Copy in[0..n) to out for a terminal: bytes below 0x20 and from 0x7f up
  * become '?', except '\n' when keep_newline. Stops at cap - 1 bytes; out is
