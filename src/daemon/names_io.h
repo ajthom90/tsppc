@@ -12,11 +12,13 @@
  *
  * - While the data plane runs and the map has a self node without the
  *   disable-hosts-file-updates capability, the block lists the tailnet's
- *   names. It is built when the map changed (and on entering that state), and
- *   written only when it differs from the last block written, at most once
- *   every TS_NAMES_MIN_GAP_MS: a change inside the gap stays pending and the
- *   latest map is written when the gap has passed. Each write re-reads the
- *   file and merges into its current text; every line outside the block
+ *   names. When the map changed (and on entering that state), at most once
+ *   every TS_NAMES_MIN_GAP_MS after the last write (a change inside the gap
+ *   stays pending, and the latest map is used when the gap has passed), the
+ *   file is re-read, the block built against its current text and merged in,
+ *   and the file written only if the merged text differs from it. So an
+ *   unchanged map rewrites nothing, and a block the owner deleted by hand
+ *   comes back at the next map change. Every line outside the block
  *   survives byte for byte.
  * - Running with no self node (a reconnect empties the map): nothing changes.
  * - Not running, or the capability set: the block is removed once (no gap).
@@ -24,8 +26,9 @@
  *   not a regular file or is too large) leaves the file as it is, shows in
  *   status as "hosts file: <reason>", and is retried after TS_NAMES_RETRY_MS.
  * - The resolver cache is flushed after each change to the file, never when
- *   the file was not changed.
- * - Buffers (about 2.3 MB) are allocated on first use and freed by
+ *   the file was not changed; the flush blocks (ts_run), so it is reported
+ *   with ts_dpio_note_blocked.
+ * - Buffers (about 2.2 MB) are allocated on first use and freed by
  *   ts_names_shutdown; without memory nothing is written.
  *
  * Test builds (-DTS_TEST_HOOKS): TSPPC_HOSTS_FILE=<path> replaces /etc/hosts,
@@ -38,8 +41,10 @@
 
 /* No I/O. */
 void ts_names_init(ts_dpio_log_fn logf);
-/* At start (after the listen check) and from ts_names_shutdown: removes a
- * tsppc block if there is one, flushing the cache only if it removed one. */
+/* At start (after the listen check): removes leftover temp files of a crashed
+ * write (ts_hostsfile_remove_temps), then a tsppc block if there is one,
+ * flushing the cache only if it removed one. ts_names_shutdown removes the
+ * block the same way. */
 void ts_names_cleanup(void);
 /* After ts_dpio_sync each loop turn. nm is ts_sess_netmap (NULL without a
  * session), running the data plane's, map_changed when bytes reached the

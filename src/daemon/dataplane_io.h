@@ -31,7 +31,9 @@
  *   and when a read from the device fails or returns end of file.
  * - The interface and route commands block (up to 10 s each): the clock is
  *   read again after them, and a home probe round they interrupted starts
- *   over, so no probe is timed across them.
+ *   over, so no probe is timed across them. Other blocking commands (the
+ *   names cache flush, names_io.c) say so with ts_dpio_note_blocked and are
+ *   covered the same way.
  * - A new DERP map without the current home region (or with no usable node
  *   in it) starts a probe round at once.
  *
@@ -65,6 +67,10 @@ typedef int64_t (*ts_dpio_clock_fn)(void);   /* monotonic ms, as the now_ms argu
 
 /* Set up (no I/O). 0, or -1 if out of memory. */
 int ts_dpio_init(ts_dpio_log_fn logf, ts_dpio_clock_fn clock);
+/* A command outside this file blocked the loop (up to TS_RUN_LIMIT_MS):
+ * read the clock again and start over a home probe round in flight, at the
+ * next sync or events call. */
+void ts_dpio_note_blocked(void);
 /* At start: delete a route left by a crash, quietly. */
 void ts_dpio_cleanup_route(void);
 /* After the session's calls each loop turn: start, stop or restart the data

@@ -20,11 +20,8 @@ static struct {
     size_t filelen;
     char *out;                  /* the merged text (OUT_CAP) */
     char *blk;                  /* the block just built (TS_HOSTS_BLOCK_MAX) */
-    char *last;                 /* the block last written (TS_HOSTS_BLOCK_MAX) */
-    size_t lastlen;
-    int have_last;              /* last[] is in the file as far as we know */
     int mode;
-    int dirty;                  /* M_ON: build, and write if it differs */
+    int dirty;                  /* M_ON: build, merge, and write if the file changes */
     int remove_wanted;          /* M_OFF, M_DISABLED: the block is to go */
     int64_t last_write;         /* of a block, for the gap */
     int have_last_write;
@@ -46,8 +43,7 @@ static void free_bufs(void)
     free(N.file);
     free(N.out);
     free(N.blk);
-    free(N.last);
-    N.file = N.out = N.blk = N.last = NULL;
+    N.file = N.out = N.blk = NULL;
 }
 
 static int alloc_bufs(void)
@@ -56,8 +52,7 @@ static int alloc_bufs(void)
     N.file = (char *)malloc(TS_HOSTS_FILE_MAX);
     N.out = (char *)malloc(OUT_CAP);
     N.blk = (char *)malloc(TS_HOSTS_BLOCK_MAX);
-    N.last = (char *)malloc(TS_HOSTS_BLOCK_MAX);
-    if (N.file && N.out && N.blk && N.last) return 0;
+    if (N.file && N.out && N.blk) return 0;
     free_bufs();
     return -1;
 }
@@ -95,7 +90,9 @@ static void succeeded(void)
 static void flush(void)
 {
     COUNT(ts_names_test_flushes);
-    if (!N.no_flush) ts_hostsfile_flush_cache();
+    if (N.no_flush) return;
+    ts_hostsfile_flush_cache();
+    ts_dpio_note_blocked();   /* up to TS_RUN_LIMIT_MS: no probe is timed across it */
 }
 
 static int read_file(int64_t retry_at)
@@ -142,7 +139,6 @@ static int remove_block(int64_t retry_at)
     if (read_file(retry_at) != 0) return -1;
     r = merge_write(NULL, 0, retry_at);
     if (r < 0) return -1;
-    N.have_last = 0;
     succeeded();
     if (r > 0) {
         if (N.log) N.log("hosts file: peer names removed");
@@ -163,16 +159,10 @@ static void apply(const ts_netmap *nm, int64_t now)
     }
     N.nentries = ne;
     N.nskipped = ns;
-    if (N.have_last && (size_t)n == N.lastlen && memcmp(N.blk, N.last, (size_t)n) == 0) {
-        N.dirty = 0;
-        succeeded();
-        return;
-    }
+    /* Written only if the merged text differs from the file: an unchanged map
+     * rewrites nothing, and a block deleted by hand comes back. */
     r = merge_write(N.blk, (size_t)n, now + TS_NAMES_RETRY_MS);
     if (r < 0) return;
-    memcpy(N.last, N.blk, (size_t)n);
-    N.lastlen = (size_t)n;
-    N.have_last = 1;
     N.dirty = 0;
     succeeded();
     if (r > 0) {
@@ -185,6 +175,8 @@ static void apply(const ts_netmap *nm, int64_t now)
 
 void ts_names_cleanup(void)
 {
+    int n = ts_hostsfile_remove_temps(N.path);
+    if (n > 0 && N.log) N.log("hosts file: %d leftover temp file%s removed", n, n == 1 ? "" : "s");
     (void)remove_block(0);
 }
 

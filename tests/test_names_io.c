@@ -430,6 +430,124 @@ static void test_cleanup(void)
     unlink(path);
 }
 
+/* Fix round 1: too large through sync, a block deleted by hand comes back,
+ * an unchanged file is not rewritten. */
+static void test_restore_and_limits(void)
+{
+    static ts_node peers[2];
+    static char want[16384];
+    ts_netmap nm;
+    unsigned long w0;
+    int64_t t = 9000000;
+    ino_t ino;
+    FILE *f;
+
+    memset(&nm, 0, sizeof nm);
+    nm.peers = peers;
+    nm.have_self = 1;
+    setname(&nm.self, "self.example.ts.net.", IP(100, 64, 0, 1));
+    setname(&peers[0], "peer-a.example.ts.net.", IP(100, 64, 0, 2));
+    nm.npeers = 1;
+
+    put_file(path, ORIG, 0644);
+    ts_names_init(nlog);
+    w0 = ts_names_test_writes;
+    ts_names_sync(&nm, 1, 1, t);
+    expect(want, sizeof want, &nm, ORIG);
+    t_true("restore: written", file_is(path, want) && ts_names_test_writes == w0 + 1);
+
+    /* same map, file unchanged: no write, same inode */
+    ino = inode_of(path);
+    ts_names_sync(&nm, 1, 1, t + TS_NAMES_MIN_GAP_MS + 1);
+    t_true("restore: unchanged file not rewritten", ts_names_test_writes == w0 + 1 && inode_of(path) == ino);
+
+    /* the owner deletes the block by hand: the same map brings it back */
+    put_file(path, ORIG, 0644);
+    ts_names_sync(&nm, 1, 1, t + 2 * TS_NAMES_MIN_GAP_MS + 2);
+    t_true("restore: deleted block restored", file_is(path, want) && ts_names_test_writes == w0 + 2);
+    t += 4 * TS_NAMES_MIN_GAP_MS;
+
+    /* too large through sync: status says so, file untouched */
+    f = fopen(path, "w");
+    if (f) {
+        static char big[TS_HOSTS_FILE_MAX + 1];
+        memset(big, '#', sizeof big);
+        big[sizeof big - 1] = '\n';
+        fwrite(big, 1, sizeof big, f);
+        fclose(f);
+    }
+    ino = inode_of(path);
+    ts_names_sync(&nm, 1, 1, t);
+    {
+        struct stat sb;
+        t_true("too large: status", status_is("hosts file: too large"));
+        t_true("too large: file untouched", ts_names_test_writes == w0 + 2 && inode_of(path) == ino &&
+                                                lstat(path, &sb) == 0 && sb.st_size == TS_HOSTS_FILE_MAX + 1);
+    }
+    ts_names_shutdown();
+    t_true("too large: shutdown leaves it", inode_of(path) == ino);
+    unlink(path);
+}
+
+static void touch(const char *name)
+{
+    char p[192];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    put_file(p, "x\n", 0600);
+}
+
+static int exists_in_dir(const char *name)
+{
+    char p[192];
+    struct stat sb;
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return lstat(p, &sb) == 0;
+}
+
+/* Fix round 1: start-up removes mkstemp leftovers, and nothing else. */
+static void test_cleanup_temps(void)
+{
+    char p[192], q[192];
+    put_file(path, ORIG, 0644);
+    touch(".hosts.tsppc.Ab3dE9");
+    touch(".hosts.tsppc.ABCDEFG");
+    touch(".hosts.tsppc.ABC");
+    touch(".hosts.tsppc.");
+    touch("hosts.tsppc.ABCDEF");
+    touch("other-file");
+    snprintf(p, sizeof p, "%s/.hosts.tsppc.LINK01", dir);
+    snprintf(q, sizeof q, "%s/other-file", dir);
+    t_true("temps: symlink made", symlink(q, p) == 0);
+    snprintf(p, sizeof p, "%s/.hosts.tsppc.DIR001", dir);
+    t_true("temps: dir made", mkdir(p, 0755) == 0);
+
+    ts_names_init(nlog);
+    ts_names_cleanup();
+    t_true("temps: leftover removed", !exists_in_dir(".hosts.tsppc.Ab3dE9"));
+    t_true("temps: 7 chars kept", exists_in_dir(".hosts.tsppc.ABCDEFG"));
+    t_true("temps: 3 chars kept", exists_in_dir(".hosts.tsppc.ABC"));
+    t_true("temps: no suffix kept", exists_in_dir(".hosts.tsppc."));
+    t_true("temps: no dot kept", exists_in_dir("hosts.tsppc.ABCDEF"));
+    t_true("temps: symlink kept", exists_in_dir(".hosts.tsppc.LINK01") && file_is(q, "x\n"));
+    t_true("temps: dir kept", exists_in_dir(".hosts.tsppc.DIR001"));
+    t_true("temps: other files kept", exists_in_dir("other-file") && file_is(path, ORIG));
+    ts_names_shutdown();
+
+    rmdir(p);
+    snprintf(p, sizeof p, "%s/.hosts.tsppc.LINK01", dir);
+    unlink(p);
+    {
+        static const char *const names[] = { ".hosts.tsppc.ABCDEFG", ".hosts.tsppc.ABC", ".hosts.tsppc.",
+                                              "hosts.tsppc.ABCDEF", "other-file" };
+        size_t i;
+        for (i = 0; i < sizeof names / sizeof names[0]; i++) {
+            snprintf(p, sizeof p, "%s/%s", dir, names[i]);
+            unlink(p);
+        }
+    }
+    unlink(path);
+}
+
 void test_names_io(void)
 {
     snprintf(dir, sizeof dir, "/tmp/tsppc-n.XXXXXX");
@@ -445,6 +563,8 @@ void test_names_io(void)
     test_sync();
     test_broken_and_refused();
     test_cleanup();
+    test_restore_and_limits();
+    test_cleanup_temps();
     /* Other tests read TSPPC_NO_TUN (dataplane_io.c). */
     unsetenv("TSPPC_HOSTS_FILE");
     unsetenv("TSPPC_NO_TUN");

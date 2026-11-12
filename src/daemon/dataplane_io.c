@@ -374,6 +374,11 @@ static int run_quiet(const char *const *argv)
     return RUN(argv);
 }
 
+void ts_dpio_note_blocked(void)
+{
+    G.blocked = 1;
+}
+
 static int run_cmd(const char *const *argv, const char *what)
 {
     int rc = run_quiet(argv);

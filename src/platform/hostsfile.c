@@ -1,6 +1,7 @@
 /* The hosts file on disk. See hostsfile.h. */
 #include "hostsfile.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -158,6 +159,34 @@ fail:
     unlink(tmp);
     seterr(err, errcap, "cannot write", e);
     return -1;
+}
+
+#define TEMP_PREFIX ".hosts.tsppc."
+
+int ts_hostsfile_remove_temps(const char *path)
+{
+    char dirpath[1024], p[1100];
+    const char *slash = strrchr(path, '/');
+    size_t plen = strlen(TEMP_PREFIX);
+    struct dirent *e;
+    DIR *d;
+    int n = 0;
+
+    if (!slash) snprintf(dirpath, sizeof dirpath, ".");
+    else if (slash == path) snprintf(dirpath, sizeof dirpath, "/");
+    else if ((size_t)(slash - path) >= sizeof dirpath) return -1;
+    else snprintf(dirpath, sizeof dirpath, "%.*s", (int)(slash - path), path);
+    d = opendir(dirpath);
+    if (!d) return -1;
+    while ((e = readdir(d)) != NULL) {
+        struct stat sb;
+        if (strlen(e->d_name) != plen + 6 || strncmp(e->d_name, TEMP_PREFIX, plen) != 0) continue;
+        if (snprintf(p, sizeof p, "%s/%s", dirpath, e->d_name) >= (int)sizeof p) continue;
+        if (lstat(p, &sb) != 0 || !S_ISREG(sb.st_mode)) continue;
+        if (unlink(p) == 0) n++;
+    }
+    closedir(d);
+    return n;
 }
 
 void ts_hostsfile_flush_cache(void)

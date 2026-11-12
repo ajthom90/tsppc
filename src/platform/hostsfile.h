@@ -22,6 +22,12 @@ int ts_hostsfile_read(const char *path, char *buf, size_t cap, size_t *len, char
  * 0 or -1. */
 int ts_hostsfile_write(const char *path, const char *buf, size_t len, char *err, size_t errcap);
 
+/* Removes leftovers of a crashed ts_hostsfile_write in path's directory:
+ * entries named exactly ".hosts.tsppc." plus 6 characters (mkstemp's XXXXXX)
+ * that lstat says are regular files. Nothing else is touched. Returns how
+ * many were removed (-1 if the directory cannot be read). */
+int ts_hostsfile_remove_temps(const char *path);
+
 /* /usr/bin/dscacheutil -flushcache if it is executable (10.5), else
  * /usr/sbin/lookupd -flushcache if executable (10.4), through ts_run (blocks
  * up to TS_RUN_LIMIT_MS). The result is ignored. */
