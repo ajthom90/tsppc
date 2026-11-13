@@ -6,7 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "src/core/bytes.h"
@@ -72,6 +74,7 @@ static struct {
     char tun_problem[128];
     int64_t tun_retry_at;
     char kext_path[256];
+    char foreign_root[128];    /* test builds: prefix for the foreign driver paths */
     int kext_tried;            /* kextload was attempted, at kext_at */
     int64_t kext_at;
     unsigned long tun_dropped;
@@ -378,6 +381,7 @@ int (*ts_dpio_test_tun_open)(char ifname[16]);
 int (*ts_dpio_test_run)(const char *const *argv);
 unsigned long ts_dpio_test_event_ticks;
 long ts_dpio_test_kext_owner = -1;
+long ts_dpio_test_uptime_s = -1;
 #define TUN_OPEN(n) (ts_dpio_test_tun_open ? ts_dpio_test_tun_open(n) : ts_tun_open(n))
 #define RUN(a) (ts_dpio_test_run ? ts_dpio_test_run(a) : ts_run(a))
 #else
@@ -455,15 +459,66 @@ static int kext_safe(void)
     return (long)st.st_uid == owner && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0;
 }
 
+/* Where another tuntaposx is installed: its kext, and the StartupItem that
+ * loads it during boot. */
+static const char *const foreign_tun[] = {
+    "/Library/Extensions/tun.kext",
+    "/System/Library/Extensions/tun.kext",
+    "/Library/StartupItems/tun",
+};
+
+static int foreign_tun_installed(void)
+{
+    size_t i;
+    char p[sizeof G.foreign_root + 64];
+    struct stat st;
+    for (i = 0; i < sizeof foreign_tun / sizeof foreign_tun[0]; i++) {
+        snprintf(p, sizeof p, "%s%s", G.foreign_root, foreign_tun[i]);
+        if (lstat(p, &st) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Seconds since boot, or -1 if unknown. */
+static long uptime_s(void)
+{
+    int mib[2];
+    struct timeval bt;
+    size_t len = sizeof bt;
+    time_t now;
+#ifdef TS_TEST_HOOKS
+    if (ts_dpio_test_uptime_s >= 0) return ts_dpio_test_uptime_s;
+#endif
+    mib[0] = CTL_KERN;
+    mib[1] = KERN_BOOTTIME;
+    if (sysctl(mib, 2, &bt, &len, NULL, 0) != 0 || len != sizeof bt || bt.tv_sec <= 0) return -1;
+    now = time(NULL);
+    if (now < bt.tv_sec) return -1;   /* the wall clock was set back past the boot */
+    return (long)(now - bt.tv_sec);
+}
+
 /* No tun device opened and every failure was ENOENT: the driver is not
  * loaded. Load our own kext, at most once per TS_DPIO_TUN_RETRY_MS. Returns 1
- * if it loaded, so that the units are tried once more. Never unloads. */
-static int kext_load(int *ran)
+ * if it loaded, so that the units are tried once more. Never unloads.
+ *
+ * While another tuntaposx is installed but not loaded, its StartupItem may
+ * still load it during boot: ours is not loaded until the system has been up
+ * TS_DPIO_FOREIGN_WAIT_S (an unknown uptime does not wait). Meanwhile *waiting
+ * is set, the device is retried as usual, and theirs is used if it loads. */
+static int kext_load(int *ran, int *waiting)
 {
     const char *argv[3];
-    int rc;
+    int rc, foreign;
+    long up;
     if (G.kext_tried && G.now - G.kext_at < TS_DPIO_TUN_RETRY_MS) return 0;
     if (!kext_safe()) return 0;
+    foreign = foreign_tun_installed();
+    if (foreign && (up = uptime_s()) >= 0 && up < TS_DPIO_FOREIGN_WAIT_S) {
+        int64_t left = (int64_t)(TS_DPIO_FOREIGN_WAIT_S - up) * 1000;
+        *waiting = 1;
+        if (left < TS_DPIO_TUN_RETRY_MS) G.tun_retry_at = G.now + left;   /* load ours once the wait ends */
+        return 0;
+    }
     G.kext_tried = 1;
     G.kext_at = G.now;
     *ran = 1;
@@ -477,7 +532,8 @@ static int kext_load(int *ran)
         G.log("could not load the tunnel driver (%s)", G.kext_path);
         return 0;
     }
-    G.log("loaded the tunnel driver");
+    if (foreign) G.log("loaded the tunnel driver (another tun driver is installed but was not loaded)");
+    else G.log("loaded the tunnel driver");
     return 1;
 }
 
@@ -486,14 +542,14 @@ static void tun_open(void)
 {
     const char *argv[16];
     char buf[256];
-    int fd;
+    int fd, waiting = 0;
     if (G.no_tun || G.tun_fd >= 0) return;
     G.tun_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
     fd = TUN_OPEN(G.ifname);
     if (fd < 0 && errno == ENOENT) {
         int ran = 0;
         int e = errno;
-        int loaded = kext_load(&ran);
+        int loaded = kext_load(&ran, &waiting);
         errno = e;   /* the problem text below still says "not loaded" */
         if (ran)   /* kextload ran, and blocked */
             G.tun_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
@@ -501,7 +557,8 @@ static void tun_open(void)
     }
     if (fd < 0) {
         G.tun_err = errno;
-        if (errno == ENOENT) tun_problem("tunnel driver not loaded");
+        if (errno == ENOENT && waiting) tun_problem("waiting for another tun driver to load");
+        else if (errno == ENOENT) tun_problem("tunnel driver not loaded");
         else if (errno == EBUSY) tun_problem("every tunnel device is in use");
         else tun_problem("cannot open the tunnel device");
         return;
@@ -918,6 +975,8 @@ int ts_dpio_init(ts_dpio_log_fn logf, ts_dpio_clock_fn clock)
         G.plain = e && strcmp(e, "1") == 0;
         e = getenv("TSPPC_KEXT_PATH");
         if (e && strlen(e) < sizeof G.kext_path) snprintf(G.kext_path, sizeof G.kext_path, "%s", e);
+        e = getenv("TSPPC_FOREIGN_TUN_ROOT");
+        if (e && strlen(e) < sizeof G.foreign_root) snprintf(G.foreign_root, sizeof G.foreign_root, "%s", e);
     }
 #endif
     if (!G.kext_path[0]) snprintf(G.kext_path, sizeof G.kext_path, "%s", TS_KEXT_PATH);

@@ -29,6 +29,14 @@
  *   happens when the address or the tailnet route cannot be set (the device
  *   is then taken down and closed first: no half-configured tunnel is left)
  *   and when a read from the device fails or returns end of file.
+ * - With no device at all, our kext (TS_KEXT_PATH, root-owned only) is
+ *   loaded with kextload, at most once per TS_DPIO_TUN_RETRY_MS. While
+ *   another tuntaposx is installed but not loaded (tun.kext in
+ *   /Library/Extensions or /System/Library/Extensions, or the StartupItem
+ *   /Library/StartupItems/tun), ours waits until the system has been up
+ *   TS_DPIO_FOREIGN_WAIT_S, status says "waiting for another tun driver to
+ *   load", and the device is retried meanwhile, so theirs is used if its
+ *   StartupItem loads it.
  * - The interface and route commands block (up to 10 s each): the clock is
  *   read again after them, and a home probe round they interrupted starts
  *   over, so no probe is timed across them. Other blocking commands (the
@@ -49,7 +57,8 @@
  *
  * Test builds (-DTS_TEST_HOOKS): TSPPC_NO_TUN=1 opens no tun and runs no
  * command (tun writes are only counted); TSPPC_DERP_PLAIN=1 skips TLS on
- * relay connections. */
+ * relay connections; TSPPC_KEXT_PATH replaces TS_KEXT_PATH and
+ * TSPPC_FOREIGN_TUN_ROOT is put before each foreign driver path. */
 
 #define TS_DPIO_CONNECT_TIMEOUT_MS 60000
 #define TS_DPIO_PROBE_TIMEOUT_MS 5000
@@ -58,6 +67,7 @@
 #define TS_DPIO_HOME_FAILS 3
 #define TS_DPIO_TUN_RETRY_MS 30000
 #define TS_KEXT_PATH "/Library/Extensions/tsppc-tun.kext"
+#define TS_DPIO_FOREIGN_WAIT_S 120     /* uptime before ours loads while another tun driver is installed */
 #define TS_DPIO_TICK_MS 250            /* the data plane's tick, the loop's longest sleep while it runs */
 #define TS_DPIO_TUN_BUF 2048
 #define TS_DPIO_TUN_READS 64           /* packets read from tun per loop turn */
@@ -142,6 +152,8 @@ extern int (*ts_dpio_test_run)(const char *const *argv);
 extern unsigned long ts_dpio_test_event_ticks;
 /* -1: the kext directory must be owned by root; otherwise the uid to accept. */
 extern long ts_dpio_test_kext_owner;
+/* -1: the real uptime (kern.boottime); otherwise the seconds to report. */
+extern long ts_dpio_test_uptime_s;
 /* 1 if a home probe round is wanted or running. */
 int ts_dpio_test_probe_wanted(void);
 #endif

@@ -662,13 +662,42 @@ static int kext_run(const char *const *argv)
     return fake_run(argv);
 }
 
-/* A kext directory (mode given) and a session; the test user counts as root. */
+/* Where another tuntaposx would be installed, under the test's own root
+ * (empty unless a test adds one), in creation order. */
+static char foreign_root[64];
+static const char *const foreign_dirs[] = {
+    "/Library", "/Library/Extensions", "/Library/Extensions/tun.kext", "/Library/StartupItems",
+    "/Library/StartupItems/tun", "/System", "/System/Library", "/System/Library/Extensions",
+    "/System/Library/Extensions/tun.kext",
+};
+#define N_FOREIGN_DIRS (sizeof foreign_dirs / sizeof foreign_dirs[0])
+
+/* Make the directories of foreign_dirs up to and including want. */
+static int foreign_add(const char *want)
+{
+    size_t i;
+    char p[160];
+    for (i = 0; i < N_FOREIGN_DIRS; i++) {
+        if (strncmp(want, foreign_dirs[i], strlen(foreign_dirs[i])) != 0) continue;
+        snprintf(p, sizeof p, "%s%s", foreign_root, foreign_dirs[i]);
+        if (mkdir(p, 0755) != 0 && errno != EEXIST) return -1;
+    }
+    return 0;
+}
+
+/* A kext directory (mode given) and a session; the test user counts as root.
+ * No other tun driver is installed and the system has been up for a day,
+ * unless a test says otherwise. */
 static int kext_begin(mode_t mode, int use_kext_hooks)
 {
     snprintf(kext_dir, sizeof kext_dir, "/tmp/tsppc-kext.XXXXXX");
     if (!mkdtemp(kext_dir)) return -1;
     chmod(kext_dir, mode);
     setenv("TSPPC_KEXT_PATH", kext_dir, 1);
+    snprintf(foreign_root, sizeof foreign_root, "/tmp/tsppc-foreign.XXXXXX");
+    if (!mkdtemp(foreign_root)) return -1;
+    setenv("TSPPC_FOREIGN_TUN_ROOT", foreign_root, 1);
+    ts_dpio_test_uptime_s = 86400;
     ts_dpio_test_kext_owner = (long)getuid();
     kext_loaded = kext_fail = kext_calls = 0;
     kext_argv1[0] = 0;
@@ -686,6 +715,18 @@ static void kext_end(void)
     unsetenv("TSPPC_KEXT_PATH");
     ts_dpio_test_kext_owner = -1;
     rmdir(kext_dir);
+    if (foreign_root[0]) {
+        size_t i;
+        char p[160];
+        for (i = N_FOREIGN_DIRS; i-- > 0;) {
+            snprintf(p, sizeof p, "%s%s", foreign_root, foreign_dirs[i]);
+            rmdir(p);
+        }
+        rmdir(foreign_root);
+        foreign_root[0] = 0;
+    }
+    unsetenv("TSPPC_FOREIGN_TUN_ROOT");
+    ts_dpio_test_uptime_s = -1;
 }
 
 static void test_dpio_kextload(void)
@@ -702,6 +743,7 @@ static void test_dpio_kextload(void)
     t_true("dpio: kextload when no driver: argv is kextload and the path", strcmp(kext_argv1, kext_dir) == 0);
     t_true("dpio: kextload when no driver: the tunnel is up", v.tun_open && v.problem[0] == 0);
     t_true("dpio: kextload when no driver: logged", has(logbuf, "loaded the tunnel driver"));
+    t_true("dpio: kextload when no driver: no word of another driver", !has(logbuf, "another tun driver"));
     kext_end();
 }
 
@@ -813,6 +855,88 @@ static void test_dpio_no_kextload_foreign(void)
     }
 }
 
+/* Another tuntaposx is installed but not loaded (yet: its own StartupItem
+ * may still be on the way during boot): ours waits until the system has been
+ * up TS_DPIO_FOREIGN_WAIT_S, retrying the device meanwhile. */
+static void test_dpio_foreign_installed_wait(void)
+{
+    static const char *const where[3] = {"/Library/Extensions/tun.kext", "/System/Library/Extensions/tun.kext",
+                                         "/Library/StartupItems/tun"};
+    char label[128];
+    int i;
+    for (i = 0; i < 3; i++) {
+        ts_dpio_view v;
+        int opens;
+        int64_t t0;
+        if (kext_begin(0755, 1) != 0 || foreign_add(where[i]) != 0) {
+            t_true("dpio: foreign installed: setup", 0);
+            kext_end();
+            continue;
+        }
+        ts_dpio_test_uptime_s = 30;
+        turn(1);
+        ts_dpio_get_view(&v);
+        snprintf(label, sizeof label, "dpio: foreign installed (%s), up 30 s: no kextload", where[i]);
+        t_true(label, kext_calls == 0);
+        snprintf(label, sizeof label, "dpio: foreign installed (%s), up 30 s: status says waiting", where[i]);
+        t_true(label, !v.tun_open && has(v.problem, "waiting for another tun driver to load"));
+        /* Still waiting a retry later: the device is tried again, not ours. */
+        opens = n_open;
+        t0 = g_clock;
+        ts_dpio_test_uptime_s = 60;
+        while (g_clock < t0 + TS_DPIO_TUN_RETRY_MS + 1000) {
+            g_clock += 1000;
+            turn(0);
+        }
+        ts_dpio_get_view(&v);
+        snprintf(label, sizeof label, "dpio: foreign installed (%s), up 60 s: device retried, still no kextload", where[i]);
+        t_true(label, n_open > opens && kext_calls == 0 && has(v.problem, "waiting for another tun driver to load"));
+        if (i == 0) {
+            /* Theirs loads: the next retry uses it, and ours is never loaded. */
+            kext_loaded = 1;
+            t0 = g_clock;
+            while (!v.tun_open && g_clock < t0 + TS_DPIO_TUN_RETRY_MS + 1000) {
+                g_clock += 1000;
+                turn(0);
+                ts_dpio_get_view(&v);
+            }
+            t_true("dpio: foreign installed, then loaded: its device is used", v.tun_open && kext_calls == 0 &&
+                                                                               v.problem[0] == 0);
+        } else {
+            /* The wait ends: ours is loaded on the next retry. */
+            ts_dpio_test_uptime_s = TS_DPIO_FOREIGN_WAIT_S;
+            t0 = g_clock;
+            while (kext_calls == 0 && g_clock < t0 + TS_DPIO_TUN_RETRY_MS + 1000) {
+                g_clock += 1000;
+                turn(0);
+            }
+            ts_dpio_get_view(&v);
+            snprintf(label, sizeof label, "dpio: foreign installed (%s), wait over: ours loaded", where[i]);
+            t_true(label, kext_calls == 1 && v.tun_open &&
+                              has(logbuf, "loaded the tunnel driver (another tun driver is installed but was not loaded)"));
+        }
+        kext_end();
+    }
+}
+
+/* Up long enough already: ours is loaded at once, and the log says why. */
+static void test_dpio_foreign_installed_late(void)
+{
+    ts_dpio_view v;
+    if (kext_begin(0755, 1) != 0 || foreign_add("/Library/StartupItems/tun") != 0) {
+        t_true("dpio: foreign installed, up 200 s: setup", 0);
+        kext_end();
+        return;
+    }
+    ts_dpio_test_uptime_s = 200;
+    turn(1);
+    ts_dpio_get_view(&v);
+    t_true("dpio: foreign installed, up 200 s: kextload at once", kext_calls == 1 && v.tun_open);
+    t_true("dpio: foreign installed, up 200 s: logged",
+           has(logbuf, "loaded the tunnel driver (another tun driver is installed but was not loaded)"));
+    kext_end();
+}
+
 void test_dpio(void)
 {
     test_dpio_probe_clock();
@@ -827,4 +951,6 @@ void test_dpio(void)
     test_dpio_kextload_wrong_owner();
     test_dpio_kextload_rate();
     test_dpio_no_kextload_foreign();
+    test_dpio_foreign_installed_wait();
+    test_dpio_foreign_installed_late();
 }
