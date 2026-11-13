@@ -239,7 +239,8 @@ for r in /Library/Receipts/tsppc*.pkg; do
     if [ -e "$r" ]; then rm -rf "$r" && removed "$r (receipt)"; fi
 done
 if [ -x /usr/sbin/pkgutil ] && /usr/sbin/pkgutil --pkg-info "$PKG_ID" >/dev/null 2>&1; then
-    /usr/sbin/pkgutil --forget "$PKG_ID" >/dev/null && removed "the $PKG_ID receipt"
+    # Leopard reports the bundle receipt removed above, then says it has none.
+    /usr/sbin/pkgutil --forget "$PKG_ID" >/dev/null 2>&1 && removed "the $PKG_ID receipt"
 fi
 if [ "$remove_state" = 1 ] && [ -d "$STATE" ]; then
     rm -rf "$STATE" && removed "$STATE"

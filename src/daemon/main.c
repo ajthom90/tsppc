@@ -1088,9 +1088,16 @@ static void check_conditions(void)
 
     jump = ts_wake_check(&D.wake, wall_ms(), now);
     if (jump != 0) {
-        logline("woke from sleep (wall clock jumped %ld s)", (long)(jump / 1000));
-        ts_rebind_request(&D.gate, "woke from sleep", now);
-        if (jump > 0) D.rebind_reset = 1;
+        /* Forward: a sleep (the monotonic clock stops while asleep). Back: the
+         * clock was set back; the sessions are kept (see Amendments). */
+        if (jump > 0) {
+            logline("woke from sleep (wall clock jumped %ld s)", (long)(jump / 1000));
+            ts_rebind_request(&D.gate, "woke from sleep", now);
+            D.rebind_reset = 1;
+        } else {
+            logline("wall clock set back %ld s", (long)(-jump / 1000));
+            ts_rebind_request(&D.gate, "wall clock set back", now);
+        }
     }
 #ifdef TS_TEST_HOOKS
     if (got_test_wake) {
