@@ -36,8 +36,13 @@ newer package stops the running daemon first; the new one keeps the identity.
 
 To build the package, run `make package` on a PowerPC Mac or the Leopard VM
 (gcc-4.0 and the 10.4u SDK); `tools/check-pkg.sh` checks it. A release is
-built with `tools/release.sh <tag>` from a clean checkout at the tag; it
-writes `build/release/SHA256SUMS` and neither signs nor uploads.
+built on the host Mac with
+`TSPPC_SSH_CONFIG=<ssh config> tools/release.sh <tag>`, from a clean checkout
+at the tag: it ships `git archive <tag>` to a fresh `~/tsppc-release/<tag>` on
+the Leopard VM, runs the PowerPC suite and the release, app, driver and
+package builds there, copies the `.dmg` and the uninstaller back to
+`build/release/`, and writes `build/release/SHA256SUMS`. It neither signs nor
+uploads.
 
 ## Uninstall
 
@@ -45,9 +50,11 @@ writes `build/release/SHA256SUMS` and neither signs nor uploads.
 
 It stops the daemon, removes its route and `/etc/hosts` entries (even after a
 crash), quits the menu bar app, unloads tsppc's own driver (never another
-one), and removes the installed files, the log and the receipt. `-y` skips the
-questions. `--remove-state` also deletes `/var/db/tsppc`; the node then stays
-in your tailnet's admin console until you remove it there. It exits 1 if the
+one), and removes the installed files, the log and the receipt. `-y` answers
+yes to every question. `--remove-state` also deletes `/var/db/tsppc`, this
+Mac's node identity, after asking; **with `-y` as well, it deletes it without
+asking**. The node then stays in your tailnet's admin console until you
+remove it there. It exits 1 if the
 daemon, the route or the `/etc/hosts` block is still there afterwards.
 
 ## License

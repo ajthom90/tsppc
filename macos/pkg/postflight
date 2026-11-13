@@ -3,6 +3,8 @@
 # It starts the daemon now (it also starts at every boot) and, for an install
 # from the Installer app, opens the menu bar app for the user at the console.
 # Nothing here fails the install: the files are in place by now.
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
 PLIST=/Library/LaunchDaemons/com.github.ajthom90.tsppcd.plist
 APP=/Applications/tsppc.app
 

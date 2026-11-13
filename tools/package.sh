@@ -9,7 +9,8 @@
 #   tsppc-<version>.pkg   a bundle-style package, which Tiger's Installer reads
 #   tsppc-uninstall       the uninstaller, as installed
 #   tsppc-<version>.dmg   UDZO image with the package, the uninstaller, ReadMe.txt
-# and ends with tools/check-pkg.sh on the package.
+# tools/check-pkg.sh checks the package before the disk image is built; a
+# failed run removes its outputs.
 #
 # sudo is used only to give the staging tree root ownership (the payload's
 # owners come from it) and to remove that tree.
@@ -69,7 +70,10 @@ clear_stage() {
     *) echo "package.sh: not removing unexpected staging path $STAGE" >&2 ;;
     esac
 }
-trap 'clear_stage; rm -rf "$DMGSRC"' EXIT
+# Outputs of a run that did not finish are removed, so a failed run never
+# leaves a package or image behind.
+done_ok=0
+trap 'clear_stage; rm -rf "$DMGSRC"; [ "$done_ok" = 1 ] || rm -rf "$PKG" "$DMG" "$OUT/tsppc-uninstall"' EXIT
 trap 'exit 1' HUP INT TERM
 
 clear_stage
@@ -136,6 +140,9 @@ cp macos/pkg/Description.plist "$C/Resources/English.lproj/Description.plist" ||
 } >"$C/Resources/License.txt" || die "cannot write License.txt"
 grep -q 'Mattias Nissler' "$C/Resources/License.txt" || die "the tuntaposx notice was not found"
 
+# The package passes its checks before anything is built from it.
+sh tools/check-pkg.sh "$PKG" || die "check-pkg.sh failed"
+
 # The uninstaller beside the package, for the checksums and the disk image.
 cp "$UNINST" "$OUT/tsppc-uninstall" && chmod 755 "$OUT/tsppc-uninstall" || die "cannot copy the uninstaller"
 
@@ -147,6 +154,6 @@ cp macos/pkg/ReadMe.txt "$DMGSRC/ReadMe.txt" || die "cannot stage the disk image
 hdiutil create -quiet -ov -fs HFS+ -format UDZO -volname "tsppc $VERSION" \
     -srcfolder "$DMGSRC" "$DMG" || die "hdiutil create failed"
 
-sh tools/check-pkg.sh "$PKG" || die "check-pkg.sh failed"
+done_ok=1
 echo "built $PKG"
 echo "built $DMG"

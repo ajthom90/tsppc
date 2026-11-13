@@ -2,7 +2,8 @@
 # tsppc uninstaller, installed as /usr/local/sbin/tsppc-uninstall.
 # Usage: sudo tsppc-uninstall [-y] [--remove-state]
 #   -y              do not ask; answer yes to every question
-#   --remove-state  also delete /var/db/tsppc (this Mac's node identity)
+#   --remove-state  also delete /var/db/tsppc (this Mac's node identity),
+#                   after asking; with -y as well, it is deleted without asking
 #
 # Stops tsppcd, removes its route and /etc/hosts block (tsppcd --cleanup),
 # quits the menu bar app, unloads tsppc's own driver (never another tun
@@ -31,6 +32,9 @@ UNLOAD_TRIES=5
 
 usage() {
     echo "usage: sudo $0 [-y] [--remove-state]" >&2
+    echo "  -y              answer yes to every question" >&2
+    echo "  --remove-state  also delete $STATE (this Mac's node identity);" >&2
+    echo "                  with -y it is deleted without asking" >&2
     exit 2
 }
 
@@ -73,10 +77,11 @@ if [ "$remove_state" = 1 ]; then
     fi
 fi
 
-# The pids of processes named exactly tsppcd. Not ps -p: on Tiger it
-# succeeds for a pid that is gone.
+# The pids of root's processes named exactly tsppcd (another user's process
+# of that name is not the installed daemon). Not ps -p: on Tiger it succeeds
+# for a pid that is gone.
 tsppcd_pids() {
-    ps axc -o pid,command | awk 'NR > 1 && $2 == "tsppcd" { printf "%s%s", s, $1; s = " " }'
+    ps axc -o pid,uid,command | awk 'NR > 1 && $2 == 0 && $3 == "tsppcd" { printf "%s%s", s, $1; s = " " }'
 }
 
 # The pids of the menu bar app at its installed path (not a copy elsewhere).
@@ -96,10 +101,43 @@ wait_gone() {
     done
 }
 
+# job_loaded: 0 if launchd has the job (Tiger lists labels only; Leopard
+# lists PID, status and label).
+job_loaded() {
+    launchctl list 2>/dev/null | awk -v l="$LABEL" '$NF == l { f = 1 } END { exit !f }'
+}
+
 # 1. Stop the daemon. Nothing is removed while one still runs.
 if [ -f "$PLIST" ]; then
     launchctl unload "$PLIST" && echo "Stopped $LABEL." ||
         echo "launchctl unload $PLIST failed; checking for tsppcd anyway" >&2
+elif job_loaded; then
+    # The job is loaded but its plist is gone. Tiger's launchctl has no
+    # remove, so there unload a minimal plist with the same label.
+    if launchctl remove "$LABEL" >/dev/null 2>&1; then
+        echo "Removed the $LABEL job."
+    else
+        tmpd=$(mktemp -d /tmp/tsppc-uninstall.XXXXXX) || tmpd=
+        if [ -n "$tmpd" ]; then
+            cat >"$tmpd/$LABEL.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$LABEL</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$DAEMON</string>
+	</array>
+</dict>
+</plist>
+EOF
+            launchctl unload "$tmpd/$LABEL.plist" && echo "Stopped $LABEL." ||
+                echo "could not remove the $LABEL job" >&2
+            rm -rf "$tmpd"
+        fi
+    fi
 fi
 if ! wait_gone tsppcd_pids "$WAIT_SEC"; then
     echo "tsppcd is still running (pid $(tsppcd_pids)) after ${WAIT_SEC}s." >&2
@@ -156,8 +194,11 @@ pids=$(app_pids)
 if [ -n "$pids" ]; then
     # shellcheck disable=SC2086
     kill -TERM $pids 2>/dev/null
-    wait_gone app_pids 5 || echo "$APP is still running (pid $(app_pids))" >&2
-    echo "Quit $APP."
+    if wait_gone app_pids 5; then
+        echo "Quit $APP."
+    else
+        echo "$APP is still running (pid $(app_pids))" >&2
+    fi
 fi
 
 # 4. Unload tsppc's own driver, by its bundle ID only.
