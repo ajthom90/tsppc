@@ -14,8 +14,8 @@ if [ "${1:-}" = --cli ]; then
     SYMS="getenv"
     STRS="TSPPC_SOCKET"
 else
-    SYMS="ts_noise_init_eph ts_resolve_test_delay ts_wg_test_dh_count ts_wg_test_has_keys ts_wg_test_keypairs ts_dpio_test_tun_open ts_dpio_test_run ts_dpio_test_event_ticks ts_dp_test_counters ts_dp_test_on_deliver ts_dp_test_has_keys ts_dp_test_has_disco_priv ts_dp_test_disco_keys ts_names_test_writes ts_names_test_flushes ts_names_test_reads ts_names_test_flush getenv"
-    STRS="TSPPC_STATE_DIR TSPPC_SOCKET TSPPC_CONTROL TSPPC_CONTROL_KEY TSPPC_NO_TUN TSPPC_DERP_PLAIN TSPPC_HOSTS_FILE"
+    SYMS="ts_noise_init_eph ts_resolve_test_delay ts_wg_test_dh_count ts_wg_test_has_keys ts_wg_test_keypairs ts_dpio_test_tun_open ts_dpio_test_run ts_dpio_test_event_ticks ts_dpio_test_kext_owner ts_dpio_test_uptime_s ts_dp_test_counters ts_dp_test_on_deliver ts_dp_test_has_keys ts_dp_test_has_disco_priv ts_dp_test_disco_keys ts_names_test_writes ts_names_test_flushes ts_names_test_reads ts_names_test_flush getenv"
+    STRS="TSPPC_STATE_DIR TSPPC_SOCKET TSPPC_CONTROL TSPPC_CONTROL_KEY TSPPC_NO_TUN TSPPC_DERP_PLAIN TSPPC_HOSTS_FILE TSPPC_KEXT_PATH TSPPC_FOREIGN_TUN_ROOT"
 fi
 REL=${1:?usage: $0 [--cli] <release program> [<hooked program>]}
 HOOKED=${2:-}
