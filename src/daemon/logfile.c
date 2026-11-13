@@ -23,18 +23,36 @@ static void fail(char *err, size_t cap, const char *what, int e)
     else snprintf(err, cap, "log file: %s", what);
 }
 
-/* Open path for appending; returns the descriptor or -1. O_NONBLOCK keeps a
- * FIFO from blocking the open; it is cleared once the file is known to be a
- * regular one. */
+/* Open path for appending; returns the descriptor or -1. Tiger's kernel
+ * ignores O_NOFOLLOW, so links are refused by lstat first: an existing path
+ * must be a regular file and the opened file the same one (device and
+ * inode); a missing one is created with O_EXCL, which never follows a link.
+ * O_NONBLOCK keeps a FIFO from blocking the open; it is cleared once the
+ * file is known to be a regular one. */
 static int open_regular(const char *path, char *err, size_t cap)
 {
-    struct stat sb;
-    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0644);
+    struct stat ls, sb;
+    int fd, existed;
+    if (lstat(path, &ls) == 0) {
+        if (!S_ISREG(ls.st_mode)) {
+            fail(err, cap, "not a regular file", 0);
+            return -1;
+        }
+        existed = 1;
+        fd = open(path, O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK);
+    } else if (errno == ENOENT) {
+        existed = 0;
+        fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK, 0644);
+    } else {
+        fail(err, cap, "cannot open", errno);
+        return -1;
+    }
     if (fd < 0) {
         fail(err, cap, "cannot open", errno);
         return -1;
     }
-    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode)) {
+    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode) ||
+        (existed && (sb.st_dev != ls.st_dev || sb.st_ino != ls.st_ino))) {
         close(fd);
         fail(err, cap, "not a regular file", 0);
         return -1;
