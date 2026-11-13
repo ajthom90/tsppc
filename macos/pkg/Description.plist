@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>IFPkgDescriptionDescription</key>
+	<string>An unofficial Tailscale client for PowerPC Macs running Mac OS X 10.4 or 10.5. tsppc is not affiliated with or endorsed by Tailscale Inc.</string>
+	<key>IFPkgDescriptionTitle</key>
+	<string>tsppc</string>
+</dict>
+</plist>

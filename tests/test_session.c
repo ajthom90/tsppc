@@ -1062,6 +1062,50 @@ static void test_backoff_growth(void)
     end();
 }
 
+/* ts_sess_retry_now: a rebind's retry skips the wait and the grown backoff. */
+static void test_retry_now(void)
+{
+    int i, n;
+    int64_t t;
+    begin(h_auto);
+    F.refuse_all = 1;
+    ts_sess_up(S);
+    fk_pump(&F);
+    for (i = 0; i < 5; i++) {
+        n = F.nconnect;
+        t = F.now;
+        while (F.nconnect == n && F.now - t < 120000) fk_advance(&F, 10, 10);
+    }
+    t_true("retry now: BACKOFF with a grown backoff", ts_sess_get_state(S) == TS_SESS_BACKOFF && S->backoff_ms >= 32000);
+    n = F.nconnect;
+    ts_sess_retry_now(S);
+    fk_pump(&F);
+    t_true("retry now: connects at once", F.nconnect > n);
+    t_true("retry now: backoff starts over", ts_sess_get_state(S) == TS_SESS_BACKOFF && S->backoff_ms == 2000);
+    n = F.nconnect;
+    t = F.now;
+    while (F.nconnect == n && F.now - t < 120000) fk_advance(&F, 10, 10);
+    t_true("retry now: next wait at most 1 s", F.now - t <= 1000);
+    /* Recovered: a retry_now while connected changes nothing. */
+    F.refuse_all = 0;
+    F.map_first = MAP_OK;
+    fk_advance(&F, 3000, 100);
+    t_true("retry now: RUNNING after recovery", ts_sess_get_state(S) == TS_SESS_RUNNING);
+    n = F.nconnect;
+    i = F.ndisconnect;
+    ts_sess_retry_now(S);
+    fk_pump(&F);
+    t_true("retry now: no-op while connected", F.nconnect == n && F.ndisconnect == i &&
+           ts_sess_get_state(S) == TS_SESS_RUNNING);
+    end();
+    /* Never started: stays IDLE. */
+    begin(h_auto);
+    ts_sess_retry_now(S);
+    fk_pump(&F);
+    t_true("retry now: no-op while IDLE", F.nconnect == 0 && ts_sess_get_state(S) == TS_SESS_IDLE);
+    end();
+}
+
 static void test_keepalive(void)
 {
     begin_running();
@@ -2031,6 +2075,7 @@ void test_session(void)
     test_status();
     test_goaway();
     test_backoff_growth();
+    test_retry_now();
     test_keepalive();
     test_rate_limits();
     test_map_status();

@@ -11,7 +11,10 @@
 # PowerPC, with the ppc-test compiler and flags), menubar (the PowerPC menu bar
 # app, build/ppc/tsppc.app, from macos/menubar and the release socket, reply
 # and menu model objects; needs gcc-4.0 and the 10.4u SDK, so it builds on the
-# PowerPC VM, not on the host; check it there with tools/check-app.sh).
+# PowerPC VM, not on the host; check it there with tools/check-app.sh),
+# package (on the VM: make ppc, make menubar, tools/check-app.sh,
+# tools/driver.sh build, then tools/package.sh with the version from
+# TS_IPN_VERSION, giving build/release/tsppc-<version>.pkg and .dmg).
 # test, asan and ppc-test also build their own tsppcd and tsppc (with test
 # hooks, for the daemon tests) and the matching release programs, and check
 # with tools/check-release.sh that the release daemon and CLI have no test
@@ -30,7 +33,7 @@ ALLTESTS := $(wildcard tests/*.c)
 BSRCS   := $(shell find $(BEARSSL)/src -name '*.c' | sort)
 
 ifeq ($(TARGET),)
-.PHONY: test asan ct-test ppc-test fuzz keyfetch-check derp-check release ppc menubar clean
+.PHONY: test asan ct-test ppc-test fuzz keyfetch-check derp-check release ppc menubar package clean
 # The release build that goes with each test target.
 rel_test := release
 rel_asan := release
@@ -55,6 +58,15 @@ menubar:
 	@if ! command -v gcc-4.0 >/dev/null 2>&1 || [ ! -d /Developer/SDKs/MacOSX10.4u.sdk ]; then \
 	  echo "make menubar: needs gcc-4.0 and /Developer/SDKs/MacOSX10.4u.sdk (Xcode 2.5 or 3.1); build it on a PowerPC Mac or the VM" >&2; exit 1; fi
 	@$(MAKE) --no-print-directory TARGET=ppc app
+
+package:
+	@if ! command -v gcc-4.0 >/dev/null 2>&1 || [ ! -d /Developer/SDKs/MacOSX10.4u.sdk ]; then \
+	  echo "make package: needs gcc-4.0 and /Developer/SDKs/MacOSX10.4u.sdk (Xcode 2.5 or 3.1); build it on a PowerPC Mac or the VM" >&2; exit 1; fi
+	@$(MAKE) --no-print-directory ppc
+	@$(MAKE) --no-print-directory menubar
+	@sh tools/check-app.sh build/ppc/tsppc.app
+	@sh tools/driver.sh build
+	@sh tools/package.sh "$$(sed -n 's/^#define TS_IPN_VERSION "\(.*\)-ppc"$$/\1/p' src/state/hostinfo.h)"
 
 keyfetch-check:
 	@$(MAKE) --no-print-directory TARGET=test build/test/keyfetch_check

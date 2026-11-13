@@ -9,14 +9,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../src/control/session.h"
+#include "../src/core/bytes.h"
+#include "../src/crypto/nacl.h"
+#include "../src/crypto/x25519.h"
+#include "../src/derp/derp.h"
+#include "../src/state/store.h"
 #include "../src/daemon/dataplane_io.h"
 #include "../src/data/dataplane.h"
 
 #include "fake_control.inc"
+#include "fake_relay.inc"
 
 /* The daemon's data-plane I/O with a fake tun device (one end of a socket
  * pair) and fake commands: never the real /dev/tun, ifconfig or route. A
@@ -36,6 +45,7 @@ static int64_t run_cost;
 static int route_fail;            /* route adds still to fail */
 static int n_open, n_run;
 static int tun_peer = -1;         /* the test's end of the fake tun */
+static int tun_fd = -1;           /* the daemon's end, as opened */
 static char cmds[16384];
 static char logbuf[16384];
 static int g_peer_disco;          /* the peer has a DiscoKey in the map */
@@ -73,6 +83,7 @@ static int fake_tun_open(char ifname[16])
     fl = fcntl(sv[1], F_GETFL);
     fcntl(sv[1], F_SETFL, fl | O_NONBLOCK);   /* the test never blocks on it */
     snprintf(ifname, 16, "tun9");
+    tun_fd = sv[0];
     return sv[0];
 }
 
@@ -493,6 +504,439 @@ static void test_dpio_ping(void)
     end();
 }
 
+/* ---- Rebind, against a relay ----------------------------------------------- */
+
+/* The fake relay (fake_relay.inc) in a child process on the regions'
+ * listening socket; each ServerInfo it sends writes 'r' to a pipe. */
+static void relay_ev(void *ctx, char e)
+{
+    if (e == 'r') (void)write(*(int *)ctx, "r", 1);
+}
+
+/* ServerInfos the relay has sent so far, waiting up to 1 s (real time) for
+ * at least want. */
+static int relay_infos(int evfd, int *total, int want)
+{
+    char b[64];
+    ssize_t n;
+    int i;
+    for (i = 0; i < 100; i++) {
+        while ((n = read(evfd, b, sizeof b)) > 0) *total += (int)n;
+        if (*total >= want) break;
+        usleep(10000);
+    }
+    return *total;
+}
+
+static int home_up_within(int64_t ms)
+{
+    ts_dpio_view v;
+    int64_t until = g_clock + ms;
+    while (g_clock <= until) {
+        turn(0);
+        ts_dpio_get_view(&v);
+        if (v.home_up) return 1;
+    }
+    return 0;
+}
+
+/* ts_dpio_rebind: relays closed and redialed, sessions dropped, a probe round
+ * wanted; the tun device, its address and route untouched. Nothing while the
+ * data plane is stopped. */
+static void test_dpio_rebind(void)
+{
+    ts_dpio_view v;
+    int ev[2], infos = 0, runs, fl;
+    pid_t pid;
+    char b[8];
+
+    setenv("TSPPC_DERP_PLAIN", "1", 1);
+    if (begin() != 0 || pipe(ev) != 0) {
+        t_true("rebind: setup", 0);
+        unsetenv("TSPPC_DERP_PLAIN");
+        end();
+        return;
+    }
+    unsetenv("TSPPC_DERP_PLAIN");
+    fl = fcntl(ev[0], F_GETFL);
+    fcntl(ev[0], F_SETFL, fl | O_NONBLOCK);
+    pid = fork();
+    if (pid == 0) {
+        fr_sink sink;
+        close(ev[0]);
+        sink.event = relay_ev;
+        sink.on_send = NULL;
+        sink.on_client = NULL;
+        sink.ctx = &ev[1];
+        fr_server(lfd, &sink);
+        _exit(0);
+    }
+    close(ev[1]);
+    t_true("rebind: relay started", pid > 0);
+
+    ts_dpio_rebind("test", 1, 1);
+    t_true("rebind: not running, nothing logged", logbuf[0] == 0 && !has(logbuf, "rebinding"));
+
+    turn(1);
+    t_true("rebind: home up", pid > 0 && home_up_within(10000));
+    t_true("rebind: the relay served one ServerInfo", relay_infos(ev[0], &infos, 1) == 1);
+    t_true("rebind: no probe round wanted before", ts_dpio_test_probe_wanted() == 0);
+    ts_dpio_get_view(&v);
+    t_true("rebind: tunnel open", v.tun_open && n_open == 1 && tun_fd >= 0);
+    runs = n_run;
+    logbuf[0] = 0;
+
+    ts_dpio_rebind("test", 1, 1);
+    t_true("rebind: logged, with the sessions reset", has(logbuf, "rebinding relays (test; sessions reset)"));
+    ts_dpio_get_view(&v);
+    t_true("rebind: home down at once", v.running && !v.home_up);
+    t_true("rebind: a probe round wanted", ts_dpio_test_probe_wanted() == 1);
+    t_true("rebind: home up again within 2 s", home_up_within(2000));
+    t_true("rebind: over a new relay connection", relay_infos(ev[0], &infos, 2) == 2);
+    ts_dpio_get_view(&v);
+    t_true("rebind: the same tun descriptor", v.tun_open && n_open == 1 && fcntl(tun_fd, F_GETFD) != -1);
+    t_true("rebind: tun still connected", read(tun_peer, b, sizeof b) < 0 && errno == EAGAIN);
+    t_true("rebind: no interface or route command", n_run == runs);
+    t_true("rebind: data plane kept running", !has(logbuf, "data plane stopped") && !has(logbuf, "tunnel tun9 up"));
+
+    /* Rebinds close the home connection each time, but are not home relay
+     * failures: no "failed N times" and no probe round for it. */
+    {
+        int i, k, probing = 0;
+        for (k = 0; k < 50 && ts_dpio_test_probe_wanted(); k++) turn(0);   /* let the round end */
+        t_true("rebind: probe round over", !ts_dpio_test_probe_wanted());
+        logbuf[0] = 0;
+        for (i = 0; i < 2 * TS_DPIO_HOME_FAILS; i++) {
+            ts_dpio_rebind("network changed", 0, 0);
+            for (k = 0; k < 3; k++) {
+                turn(0);
+                probing |= ts_dpio_test_probe_wanted();
+            }
+        }
+        t_true("rebind: rebinds logged, sessions kept",
+               has(logbuf, "rebinding relays (network changed)") && !has(logbuf, "sessions reset"));
+        t_true("rebind: no home failure count", !has(logbuf, "failed") && !probing);
+        t_true("rebind: home up after the last rebind", home_up_within(2000));
+    }
+
+    if (pid > 0) {
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+    }
+    close(ev[0]);
+    end();
+    logbuf[0] = 0;
+    ts_dpio_rebind("test", 1, 1);   /* after shutdown: nothing */
+    t_true("rebind: after shutdown, nothing logged", logbuf[0] == 0);
+}
+
+/* ---- Loading the kext when no tun device exists ------------------------- */
+
+static int kext_loaded;           /* kextload has run and worked */
+static int kext_fail;             /* kextload exits non-zero */
+static int kext_calls;
+static char kext_argv1[256];
+static char kext_dir[64];
+
+static int kext_tun_open(char ifname[16])
+{
+    if (!kext_loaded) {
+        n_open++;
+        errno = ENOENT;
+        return -1;
+    }
+    return fake_tun_open(ifname);
+}
+
+static int kext_run(const char *const *argv)
+{
+    if (strcmp(argv[0], "/sbin/kextload") == 0) {
+        kext_calls++;
+        g_clock += 2000;   /* it blocks */
+        snprintf(kext_argv1, sizeof kext_argv1, "%s", argv[1] ? argv[1] : "(null)");
+        if (argv[1] && argv[2]) kext_argv1[0] = 0;   /* exactly two elements */
+        if (kext_fail) return 1;
+        kext_loaded = 1;
+        return 0;
+    }
+    return fake_run(argv);
+}
+
+/* Where another tuntaposx would be installed, under the test's own root
+ * (empty unless a test adds one), in creation order. */
+static char foreign_root[64];
+static const char *const foreign_dirs[] = {
+    "/Library", "/Library/Extensions", "/Library/Extensions/tun.kext", "/Library/StartupItems",
+    "/Library/StartupItems/tun", "/System", "/System/Library", "/System/Library/Extensions",
+    "/System/Library/Extensions/tun.kext",
+};
+#define N_FOREIGN_DIRS (sizeof foreign_dirs / sizeof foreign_dirs[0])
+
+/* Make the directories of foreign_dirs up to and including want. */
+static int foreign_add(const char *want)
+{
+    size_t i;
+    char p[160];
+    for (i = 0; i < N_FOREIGN_DIRS; i++) {
+        if (strncmp(want, foreign_dirs[i], strlen(foreign_dirs[i])) != 0) continue;
+        snprintf(p, sizeof p, "%s%s", foreign_root, foreign_dirs[i]);
+        if (mkdir(p, 0755) != 0 && errno != EEXIST) return -1;
+    }
+    return 0;
+}
+
+/* A kext directory (mode given) and a session; the test user counts as root.
+ * No other tun driver is installed and the system has been up for a day,
+ * unless a test says otherwise. */
+static int kext_begin(mode_t mode, int use_kext_hooks)
+{
+    snprintf(kext_dir, sizeof kext_dir, "/tmp/tsppc-kext.XXXXXX");
+    if (!mkdtemp(kext_dir)) return -1;
+    chmod(kext_dir, mode);
+    setenv("TSPPC_KEXT_PATH", kext_dir, 1);
+    snprintf(foreign_root, sizeof foreign_root, "/tmp/tsppc-foreign.XXXXXX");
+    if (!mkdtemp(foreign_root)) return -1;
+    setenv("TSPPC_FOREIGN_TUN_ROOT", foreign_root, 1);
+    ts_dpio_test_uptime_s = 86400;
+    ts_dpio_test_kext_owner = (long)getuid();
+    kext_loaded = kext_fail = kext_calls = 0;
+    kext_argv1[0] = 0;
+    if (begin() != 0) return -1;
+    if (use_kext_hooks) {
+        ts_dpio_test_tun_open = kext_tun_open;
+        ts_dpio_test_run = kext_run;
+    }
+    return 0;
+}
+
+static void kext_end(void)
+{
+    end();
+    unsetenv("TSPPC_KEXT_PATH");
+    ts_dpio_test_kext_owner = -1;
+    rmdir(kext_dir);
+    if (foreign_root[0]) {
+        size_t i;
+        char p[160];
+        for (i = N_FOREIGN_DIRS; i-- > 0;) {
+            snprintf(p, sizeof p, "%s%s", foreign_root, foreign_dirs[i]);
+            rmdir(p);
+        }
+        rmdir(foreign_root);
+        foreign_root[0] = 0;
+    }
+    unsetenv("TSPPC_FOREIGN_TUN_ROOT");
+    ts_dpio_test_uptime_s = -1;
+}
+
+static void test_dpio_kextload(void)
+{
+    ts_dpio_view v;
+    if (kext_begin(0755, 1) != 0) {
+        t_true("dpio: kextload when no driver: setup", 0);
+        kext_end();
+        return;
+    }
+    turn(1);
+    ts_dpio_get_view(&v);
+    t_true("dpio: kextload when no driver: run once", kext_calls == 1);
+    t_true("dpio: kextload when no driver: argv is kextload and the path", strcmp(kext_argv1, kext_dir) == 0);
+    t_true("dpio: kextload when no driver: the tunnel is up", v.tun_open && v.problem[0] == 0);
+    t_true("dpio: kextload when no driver: logged", has(logbuf, "loaded the tunnel driver"));
+    t_true("dpio: kextload when no driver: no word of another driver", !has(logbuf, "another tun driver"));
+    kext_end();
+}
+
+static void test_dpio_no_kextload_when_device(void)
+{
+    ts_dpio_view v;
+    if (kext_begin(0755, 0) != 0) {
+        t_true("dpio: no kextload when a device opens: setup", 0);
+        kext_end();
+        return;
+    }
+    kext_loaded = 1;
+    ts_dpio_test_tun_open = kext_tun_open;
+    ts_dpio_test_run = kext_run;
+    turn(1);
+    ts_dpio_get_view(&v);
+    t_true("dpio: no kextload when a device opens: up", v.tun_open);
+    t_true("dpio: no kextload when a device opens: never called", kext_calls == 0 && !has(logbuf, "tunnel driver"));
+    kext_end();
+}
+
+static void test_dpio_no_kextload_unsafe(void)
+{
+    ts_dpio_view v;
+    if (kext_begin(0777, 1) != 0) {
+        t_true("dpio: no kextload for an unsafe kext: setup", 0);
+        kext_end();
+        return;
+    }
+    turn(1);
+    ts_dpio_get_view(&v);
+    t_true("dpio: no kextload for an unsafe kext: not called", kext_calls == 0);
+    t_true("dpio: no kextload for an unsafe kext: status", !v.tun_open && has(v.problem, "tunnel driver not loaded"));
+    kext_end();
+}
+
+static void test_dpio_kextload_wrong_owner(void)
+{
+    if (kext_begin(0755, 1) != 0) {
+        t_true("dpio: no kextload for a non-root kext: setup", 0);
+        kext_end();
+        return;
+    }
+    ts_dpio_test_kext_owner = (long)getuid() + 1;   /* the directory is not owned by "root" */
+    turn(1);
+    t_true("dpio: no kextload for a non-root kext: not called", kext_calls == 0);
+    kext_end();
+}
+
+static void test_dpio_kextload_rate(void)
+{
+    ts_dpio_view v;
+    int64_t t0;
+    if (kext_begin(0755, 1) != 0) {
+        t_true("dpio: kextload rate limited: setup", 0);
+        kext_end();
+        return;
+    }
+    kext_fail = 1;
+    turn(1);
+    t0 = g_clock;
+    t_true("dpio: kextload rate limited: first try", kext_calls == 1);
+    ts_dpio_get_view(&v);
+    t_true("dpio: kextload rate limited: failure logged", has(logbuf, "could not load the tunnel driver (") &&
+                                                          has(v.problem, "tunnel driver not loaded"));
+    while (g_clock < t0 + TS_DPIO_TUN_RETRY_MS - 2000) {
+        g_clock += 1000;
+        turn(0);
+    }
+    t_true("dpio: kextload rate limited: not again within the interval", kext_calls == 1);
+    g_clock = t0 + TS_DPIO_TUN_RETRY_MS + 3000;
+    turn(0);
+    t_true("dpio: kextload rate limited: again after the interval", kext_calls == 2);
+    g_clock += 1000;
+    turn(0);
+    t_true("dpio: kextload rate limited: not on the next turn", kext_calls == 2);
+    kext_end();
+}
+
+static int kext_err;
+static int kext_err_open(char ifname[16])
+{
+    (void)ifname;
+    n_open++;
+    errno = kext_err;
+    return -1;
+}
+
+/* Another tuntaposx is loaded (units busy or not ours to open): never stack. */
+static void test_dpio_no_kextload_foreign(void)
+{
+    static const int errs[2] = {EBUSY, EACCES};
+    static const char *const want[2] = {"every tunnel device is in use", "cannot open the tunnel device"};
+    int i;
+    for (i = 0; i < 2; i++) {
+        ts_dpio_view v;
+        if (kext_begin(0755, 1) != 0) {
+            t_true("dpio: no kextload over a foreign driver: setup", 0);
+            kext_end();
+            continue;
+        }
+        kext_err = errs[i];
+        ts_dpio_test_tun_open = kext_err_open;
+        turn(1);
+        ts_dpio_get_view(&v);
+        t_true("dpio: no kextload over a foreign driver: not called", kext_calls == 0);
+        t_true("dpio: no kextload over a foreign driver: status says why", !v.tun_open && has(v.problem, want[i]));
+        kext_end();
+    }
+}
+
+/* Another tuntaposx is installed but not loaded (yet: its own StartupItem
+ * may still be on the way during boot): ours waits until the system has been
+ * up TS_DPIO_FOREIGN_WAIT_S, retrying the device meanwhile. */
+static void test_dpio_foreign_installed_wait(void)
+{
+    static const char *const where[3] = {"/Library/Extensions/tun.kext", "/System/Library/Extensions/tun.kext",
+                                         "/Library/StartupItems/tun"};
+    char label[128];
+    int i;
+    for (i = 0; i < 3; i++) {
+        ts_dpio_view v;
+        int opens;
+        int64_t t0;
+        if (kext_begin(0755, 1) != 0 || foreign_add(where[i]) != 0) {
+            t_true("dpio: foreign installed: setup", 0);
+            kext_end();
+            continue;
+        }
+        ts_dpio_test_uptime_s = 30;
+        turn(1);
+        ts_dpio_get_view(&v);
+        snprintf(label, sizeof label, "dpio: foreign installed (%s), up 30 s: no kextload", where[i]);
+        t_true(label, kext_calls == 0);
+        snprintf(label, sizeof label, "dpio: foreign installed (%s), up 30 s: status says waiting", where[i]);
+        t_true(label, !v.tun_open && has(v.problem, "waiting for another tun driver to load"));
+        /* Still waiting a retry later: the device is tried again, not ours. */
+        opens = n_open;
+        t0 = g_clock;
+        ts_dpio_test_uptime_s = 60;
+        while (g_clock < t0 + TS_DPIO_TUN_RETRY_MS + 1000) {
+            g_clock += 1000;
+            turn(0);
+        }
+        ts_dpio_get_view(&v);
+        snprintf(label, sizeof label, "dpio: foreign installed (%s), up 60 s: device retried, still no kextload", where[i]);
+        t_true(label, n_open > opens && kext_calls == 0 && has(v.problem, "waiting for another tun driver to load"));
+        if (i == 0) {
+            /* Theirs loads: the next retry uses it, and ours is never loaded. */
+            kext_loaded = 1;
+            t0 = g_clock;
+            while (!v.tun_open && g_clock < t0 + TS_DPIO_TUN_RETRY_MS + 1000) {
+                g_clock += 1000;
+                turn(0);
+                ts_dpio_get_view(&v);
+            }
+            t_true("dpio: foreign installed, then loaded: its device is used", v.tun_open && kext_calls == 0 &&
+                                                                               v.problem[0] == 0);
+        } else {
+            /* The wait ends: ours is loaded on the next retry. */
+            ts_dpio_test_uptime_s = TS_DPIO_FOREIGN_WAIT_S;
+            t0 = g_clock;
+            while (kext_calls == 0 && g_clock < t0 + TS_DPIO_TUN_RETRY_MS + 1000) {
+                g_clock += 1000;
+                turn(0);
+            }
+            ts_dpio_get_view(&v);
+            snprintf(label, sizeof label, "dpio: foreign installed (%s), wait over: ours loaded", where[i]);
+            t_true(label, kext_calls == 1 && v.tun_open &&
+                              has(logbuf, "loaded the tunnel driver (another tun driver is installed but was not loaded)"));
+        }
+        kext_end();
+    }
+}
+
+/* Up long enough already: ours is loaded at once, and the log says why. */
+static void test_dpio_foreign_installed_late(void)
+{
+    ts_dpio_view v;
+    if (kext_begin(0755, 1) != 0 || foreign_add("/Library/StartupItems/tun") != 0) {
+        t_true("dpio: foreign installed, up 200 s: setup", 0);
+        kext_end();
+        return;
+    }
+    ts_dpio_test_uptime_s = 200;
+    turn(1);
+    ts_dpio_get_view(&v);
+    t_true("dpio: foreign installed, up 200 s: kextload at once", kext_calls == 1 && v.tun_open);
+    t_true("dpio: foreign installed, up 200 s: logged",
+           has(logbuf, "loaded the tunnel driver (another tun driver is installed but was not loaded)"));
+    kext_end();
+}
+
 void test_dpio(void)
 {
     test_dpio_probe_clock();
@@ -500,4 +944,13 @@ void test_dpio(void)
     test_dpio_tun_eof();
     test_dpio_home_gone();
     test_dpio_ping();
+    test_dpio_rebind();
+    test_dpio_kextload();
+    test_dpio_no_kextload_when_device();
+    test_dpio_no_kextload_unsafe();
+    test_dpio_kextload_wrong_owner();
+    test_dpio_kextload_rate();
+    test_dpio_no_kextload_foreign();
+    test_dpio_foreign_installed_wait();
+    test_dpio_foreign_installed_late();
 }

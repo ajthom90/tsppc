@@ -5,7 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "src/core/bytes.h"
@@ -60,6 +63,7 @@ static struct {
     int home;                  /* the home chosen by the last probe round (kept across restarts) */
     int cur;                   /* the home the data plane has now (ts_dp_set_home), 0 none */
     int stopping;
+    int rebinding;             /* inside ts_dpio_rebind: closes are not failures */
     int home_fails;            /* home connection failures with the home never up in between */
     int64_t start_retry_at;
 
@@ -69,6 +73,10 @@ static struct {
     int tun_err;               /* errno of the last failed open, 0 if none */
     char tun_problem[128];
     int64_t tun_retry_at;
+    char kext_path[256];
+    char foreign_root[128];    /* test builds: prefix for the foreign driver paths */
+    int kext_tried;            /* kextload was attempted, at kext_at */
+    int64_t kext_at;
     unsigned long tun_dropped;
 
     rslot s[TS_DP_MAX_CONNS];
@@ -119,7 +127,7 @@ static void slot_close(rslot *s)
 /* A home connection failed (never counted while stopping). */
 static void note_home_fail(int region)
 {
-    if (G.running && !G.stopping && region > 0 && region == G.cur) G.home_fails++;
+    if (G.running && !G.stopping && !G.rebinding && region > 0 && region == G.cur) G.home_fails++;
 }
 
 /* The region holding this node in the netmap the data plane was last given.
@@ -372,6 +380,8 @@ static void slot_events(int i, fd_set *r, fd_set *w)
 int (*ts_dpio_test_tun_open)(char ifname[16]);
 int (*ts_dpio_test_run)(const char *const *argv);
 unsigned long ts_dpio_test_event_ticks;
+long ts_dpio_test_kext_owner = -1;
+long ts_dpio_test_uptime_s = -1;
 #define TUN_OPEN(n) (ts_dpio_test_tun_open ? ts_dpio_test_tun_open(n) : ts_tun_open(n))
 #define RUN(a) (ts_dpio_test_run ? ts_dpio_test_run(a) : ts_run(a))
 #else
@@ -434,18 +444,121 @@ static void tun_problem(const char *p)
     snprintf(G.tun_problem, sizeof G.tun_problem, "%s", p);
 }
 
+static void after_block(void);
+
+/* Is the kext a real directory that only root can change? The daemon runs as
+ * root and loads it, so a kext anyone else could write must never be loaded. */
+static int kext_safe(void)
+{
+    struct stat st;
+    long owner = 0;
+#ifdef TS_TEST_HOOKS
+    if (ts_dpio_test_kext_owner >= 0) owner = ts_dpio_test_kext_owner;
+#endif
+    if (lstat(G.kext_path, &st) != 0 || !S_ISDIR(st.st_mode)) return 0;
+    return (long)st.st_uid == owner && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+/* Where another tuntaposx is installed: its kext, and the StartupItem that
+ * loads it during boot. */
+static const char *const foreign_tun[] = {
+    "/Library/Extensions/tun.kext",
+    "/System/Library/Extensions/tun.kext",
+    "/Library/StartupItems/tun",
+};
+
+static int foreign_tun_installed(void)
+{
+    size_t i;
+    char p[sizeof G.foreign_root + 64];
+    struct stat st;
+    for (i = 0; i < sizeof foreign_tun / sizeof foreign_tun[0]; i++) {
+        snprintf(p, sizeof p, "%s%s", G.foreign_root, foreign_tun[i]);
+        if (lstat(p, &st) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Seconds since boot, or -1 if unknown. */
+static long uptime_s(void)
+{
+    int mib[2];
+    struct timeval bt;
+    size_t len = sizeof bt;
+    time_t now;
+#ifdef TS_TEST_HOOKS
+    if (ts_dpio_test_uptime_s >= 0) return ts_dpio_test_uptime_s;
+#endif
+    mib[0] = CTL_KERN;
+    mib[1] = KERN_BOOTTIME;
+    if (sysctl(mib, 2, &bt, &len, NULL, 0) != 0 || len != sizeof bt || bt.tv_sec <= 0) return -1;
+    now = time(NULL);
+    if (now < bt.tv_sec) return -1;   /* the wall clock was set back past the boot */
+    return (long)(now - bt.tv_sec);
+}
+
+/* No tun device opened and every failure was ENOENT: the driver is not
+ * loaded. Load our own kext, at most once per TS_DPIO_TUN_RETRY_MS. Returns 1
+ * if it loaded, so that the units are tried once more. Never unloads.
+ *
+ * While another tuntaposx is installed but not loaded, its StartupItem may
+ * still load it during boot: ours is not loaded until the system has been up
+ * TS_DPIO_FOREIGN_WAIT_S (an unknown uptime does not wait). Meanwhile *waiting
+ * is set, the device is retried as usual, and theirs is used if it loads. */
+static int kext_load(int *ran, int *waiting)
+{
+    const char *argv[3];
+    int rc, foreign;
+    long up;
+    if (G.kext_tried && G.now - G.kext_at < TS_DPIO_TUN_RETRY_MS) return 0;
+    if (!kext_safe()) return 0;
+    foreign = foreign_tun_installed();
+    if (foreign && (up = uptime_s()) >= 0 && up < TS_DPIO_FOREIGN_WAIT_S) {
+        int64_t left = (int64_t)(TS_DPIO_FOREIGN_WAIT_S - up) * 1000;
+        *waiting = 1;
+        if (left < TS_DPIO_TUN_RETRY_MS) G.tun_retry_at = G.now + left;   /* load ours once the wait ends */
+        return 0;
+    }
+    G.kext_tried = 1;
+    G.kext_at = G.now;
+    *ran = 1;
+    argv[0] = "/sbin/kextload";
+    argv[1] = G.kext_path;
+    argv[2] = NULL;
+    rc = run_quiet(argv);   /* blocks */
+    after_block();
+    G.kext_at = G.now;
+    if (rc != 0) {
+        G.log("could not load the tunnel driver (%s)", G.kext_path);
+        return 0;
+    }
+    if (foreign) G.log("loaded the tunnel driver (another tun driver is installed but was not loaded)");
+    else G.log("loaded the tunnel driver");
+    return 1;
+}
+
 /* Open the tun device and give it our address and the tailnet route. */
 static void tun_open(void)
 {
     const char *argv[16];
     char buf[256];
-    int fd;
+    int fd, waiting = 0;
     if (G.no_tun || G.tun_fd >= 0) return;
     G.tun_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
     fd = TUN_OPEN(G.ifname);
+    if (fd < 0 && errno == ENOENT) {
+        int ran = 0;
+        int e = errno;
+        int loaded = kext_load(&ran, &waiting);
+        errno = e;   /* the problem text below still says "not loaded" */
+        if (ran)   /* kextload ran, and blocked */
+            G.tun_retry_at = G.now + TS_DPIO_TUN_RETRY_MS;
+        if (loaded) fd = TUN_OPEN(G.ifname);
+    }
     if (fd < 0) {
         G.tun_err = errno;
-        if (errno == ENOENT) tun_problem("tunnel driver not loaded");
+        if (errno == ENOENT && waiting) tun_problem("waiting for another tun driver to load");
+        else if (errno == ENOENT) tun_problem("tunnel driver not loaded");
         else if (errno == EBUSY) tun_problem("every tunnel device is in use");
         else tun_problem("cannot open the tunnel device");
         return;
@@ -860,8 +973,13 @@ int ts_dpio_init(ts_dpio_log_fn logf, ts_dpio_clock_fn clock)
         G.no_tun = e && strcmp(e, "1") == 0;
         e = getenv("TSPPC_DERP_PLAIN");
         G.plain = e && strcmp(e, "1") == 0;
+        e = getenv("TSPPC_KEXT_PATH");
+        if (e && strlen(e) < sizeof G.kext_path) snprintf(G.kext_path, sizeof G.kext_path, "%s", e);
+        e = getenv("TSPPC_FOREIGN_TUN_ROOT");
+        if (e && strlen(e) < sizeof G.foreign_root) snprintf(G.foreign_root, sizeof G.foreign_root, "%s", e);
     }
 #endif
+    if (!G.kext_path[0]) snprintf(G.kext_path, sizeof G.kext_path, "%s", TS_KEXT_PATH);
     G.pr = (ts_derp_region *)calloc(TS_DERP_MAX_REGIONS, sizeof *G.pr);
     G.dp = ts_dp_new(&DP_IO, NULL);
     if (!G.pr || !G.dp) {
@@ -907,6 +1025,31 @@ void ts_dpio_get_view(ts_dpio_view *v)
     snprintf(v->problem, sizeof v->problem, "%s%s%s", G.tun_problem, G.tun_problem[0] && ds.problem[0] ? "; " : "",
              ds.problem);
 }
+
+void ts_dpio_rebind(const char *why, int probe_again, int reset_sessions)
+{
+    int i;
+    if (!G.dp || !G.running || G.stopping || G.rebinding) return;
+    /* G.now, never later than the next sync's time: that tick redials. */
+    G.log("rebinding relays (%s%s)", why ? why : "", reset_sessions ? "; sessions reset" : "");
+    G.rebinding = 1;
+    ts_dp_rebind(G.dp, G.now, reset_sessions);
+    G.rebinding = 0;
+    for (i = 0; i < TS_DP_MAX_CONNS; i++)
+        if (G.s[i].phase != R_NONE || G.s[i].fd >= 0) slot_close(&G.s[i]);
+    G.up_logged = 0;   /* "connected (home)" is logged again */
+    if (probe_again) {
+        probes_cancel();
+        G.probe_want = 1;
+    }
+}
+
+#ifdef TS_TEST_HOOKS
+int ts_dpio_test_probe_wanted(void)
+{
+    return G.probe_want || G.probing;
+}
+#endif
 
 void ts_dpio_set_ping_cb(ts_dpio_ping_fn fn, void *user)
 {

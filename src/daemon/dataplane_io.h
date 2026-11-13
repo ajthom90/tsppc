@@ -29,6 +29,14 @@
  *   happens when the address or the tailnet route cannot be set (the device
  *   is then taken down and closed first: no half-configured tunnel is left)
  *   and when a read from the device fails or returns end of file.
+ * - With no device at all, our kext (TS_KEXT_PATH, root-owned only) is
+ *   loaded with kextload, at most once per TS_DPIO_TUN_RETRY_MS. While
+ *   another tuntaposx is installed but not loaded (tun.kext in
+ *   /Library/Extensions or /System/Library/Extensions, or the StartupItem
+ *   /Library/StartupItems/tun), ours waits until the system has been up
+ *   TS_DPIO_FOREIGN_WAIT_S, status says "waiting for another tun driver to
+ *   load", and the device is retried meanwhile, so theirs is used if its
+ *   StartupItem loads it.
  * - The interface and route commands block (up to 10 s each): the clock is
  *   read again after them, and a home probe round they interrupted starts
  *   over, so no probe is timed across them. Other blocking commands (the
@@ -49,7 +57,8 @@
  *
  * Test builds (-DTS_TEST_HOOKS): TSPPC_NO_TUN=1 opens no tun and runs no
  * command (tun writes are only counted); TSPPC_DERP_PLAIN=1 skips TLS on
- * relay connections. */
+ * relay connections; TSPPC_KEXT_PATH replaces TS_KEXT_PATH and
+ * TSPPC_FOREIGN_TUN_ROOT is put before each foreign driver path. */
 
 #define TS_DPIO_CONNECT_TIMEOUT_MS 60000
 #define TS_DPIO_PROBE_TIMEOUT_MS 5000
@@ -57,6 +66,8 @@
 #define TS_DPIO_REPROBE_MS (30 * 60 * 1000)
 #define TS_DPIO_HOME_FAILS 3
 #define TS_DPIO_TUN_RETRY_MS 30000
+#define TS_KEXT_PATH "/Library/Extensions/tsppc-tun.kext"
+#define TS_DPIO_FOREIGN_WAIT_S 120     /* uptime before ours loads while another tun driver is installed */
 #define TS_DPIO_TICK_MS 250            /* the data plane's tick, the loop's longest sleep while it runs */
 #define TS_DPIO_TUN_BUF 2048
 #define TS_DPIO_TUN_READS 64           /* packets read from tun per loop turn */
@@ -84,6 +95,18 @@ void ts_dpio_fds(fd_set *r, fd_set *w, int *maxfd, int64_t *timeout_ms);
 /* After select. While a ping is outstanding it ticks the data plane first
  * (pong latency, timeouts on time); otherwise the tick waits for sync. */
 void ts_dpio_events(fd_set *r, fd_set *w, int64_t now_ms);
+/* After a wake or a network change: logs "rebinding relays (<why>)" (with
+ * "; sessions reset" after <why> when reset_sessions), calls
+ * ts_dp_rebind (reset_sessions passed on: 1 after a real sleep, 0 for a
+ * network change or a clock stepped back, when peers would refuse new
+ * initiations with an older timestamp) and closes every relay socket; the
+ * relays are dialed again at the next sync. These closes are not counted as
+ * home relay failures. With probe_again, a running home probe round is
+ * cancelled and a new one starts at the next sync. The tun device, its
+ * address and the route are untouched, so connections over the tailnet
+ * address survive. Nothing unless the data plane is running. Not from inside
+ * a callback. */
+void ts_dpio_rebind(const char *why, int probe_again, int reset_sessions);
 /* Stop everything (signals, exit) and free. */
 void ts_dpio_shutdown(void);
 
@@ -127,6 +150,12 @@ extern int (*ts_dpio_test_tun_open)(char ifname[16]);
 extern int (*ts_dpio_test_run)(const char *const *argv);
 /* Data-plane ticks ts_dpio_events made (only while a ping is outstanding). */
 extern unsigned long ts_dpio_test_event_ticks;
+/* -1: the kext directory must be owned by root; otherwise the uid to accept. */
+extern long ts_dpio_test_kext_owner;
+/* -1: the real uptime (kern.boottime); otherwise the seconds to report. */
+extern long ts_dpio_test_uptime_s;
+/* 1 if a home probe round is wanted or running. */
+int ts_dpio_test_probe_wanted(void);
 #endif
 
 #endif

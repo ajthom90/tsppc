@@ -48,6 +48,10 @@ for l in $libs; do
     /System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa) seen_cocoa=1 ;;
     /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation) ;;
     /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit) ;;
+    # The Login Items code calls CFPreferences, so the linker records
+    # CoreFoundation (and the CoreServices umbrella it comes through) itself.
+    /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation) ;;
+    /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices) ;;
     /usr/lib/libSystem.B.dylib) ;;
     /usr/lib/libgcc_s.1.dylib) ;;
     /usr/lib/libobjc.A.dylib) ;;

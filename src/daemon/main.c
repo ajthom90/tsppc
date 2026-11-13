@@ -1,4 +1,7 @@
-/* tsppcd: the daemon. Runs in the foreground (no launchd yet) as root.
+/* tsppcd: the daemon. Runs in the foreground as root (launchd runs it with
+ * -l <logfile>: stderr goes to that file, capped by logfile.c, or stays
+ * stderr, with the reason first, if it cannot be opened; tsppcd --cleanup
+ * removes what a crash left, and exits 1 if a daemon is running).
  *
  * One select() loop over the control connection, the DNS helper's pipe, the
  * control key fetch, the local socket and its clients, and a signal pipe.
@@ -36,7 +39,21 @@
  * of the data plane); its deadline is then the ping timeout plus
  * TS_IPC_PING_MARGIN_MS. A client that closes or sends more cancels its
  * ping. At most TS_IPC_MAX_PINGS clients wait at once, so status and the
- * menu bar always have a slot. Only refused pings are logged. */
+ * menu bar always have a slot. Only refused pings are logged.
+ *
+ * Sleep and network changes (conditions.h): each turn, after the data plane
+ * sync, the wall clock (gettimeofday) is compared with the monotonic one; a
+ * jump of TS_WAKE_JUMP_MS or more means the Mac slept (or the clock was
+ * stepped). Every TS_NET_POLL_MS the IPv4 addresses and default route are
+ * fingerprinted (netinfo.h); a failed snapshot is ignored. Either asks for a
+ * rebind, at most one per TS_REBIND_MIN_GAP_MS: the control connection, if
+ * any, is closed and the session told (its own backoff then decides when it
+ * reconnects), and the relays are redialed with a new home probe round
+ * (ts_dpio_rebind). WireGuard sessions are reset only when a forward wake was
+ * seen since the last rebind; a clock stepped back or a network change keeps
+ * them. The loop never sleeps longer than LOOP_MS, so a wake is seen within a
+ * second. In test builds SIGUSR1 stands for a wake and SIGUSR2 for a network
+ * change. */
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -52,8 +69,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "conditions.h"
 #include "dataplane_io.h"
 #include "ipc.h"
+#include "ipc_reply.h"
+#include "logfile.h"
 #include "names_io.h"
 #include "src/control/noise.h"
 #include "src/control/session.h"
@@ -143,6 +163,14 @@ static struct {
 
     int fed;                        /* bytes reached the session this turn (the map may have changed) */
 
+    /* Sleep and network changes. */
+    ts_wake wake;
+    ts_rebind_gate gate;
+    int rebind_reset;               /* a forward wake was seen since the last rebind */
+    int net_primed;
+    uint64_t net_fp;
+    int64_t net_next;
+
     int sigpipe[2];
     char logged_state[32];
     char logged_reason[TEXT_MAX];
@@ -152,6 +180,9 @@ static ts_keyfetch KF;              /* about 100 KiB: not on the stack */
 static uint8_t rbuf[READ_CHUNK];
 static mach_timebase_info_data_t tb;
 static volatile sig_atomic_t got_signal;
+#ifdef TS_TEST_HOOKS
+static volatile sig_atomic_t got_test_wake, got_test_net;
+#endif
 
 /* ---- Time and logging --------------------------------------------------- */
 
@@ -164,6 +195,7 @@ static int64_t now_ms(void)
 }
 
 static int64_t t_start;
+static int g_logfile;   /* -l: check the log file's size after each line */
 
 /* Log a line. Callers never pass keys or the login URL. */
 static void logline(const char *fmt, ...)
@@ -176,6 +208,7 @@ static void logline(const char *fmt, ...)
     va_end(ap);
     ts_ipc_clean(safe, sizeof safe, msg, strlen(msg), 0);
     fprintf(stderr, "tsppcd: [%5ld.%03ld] %s\n", (long)(t / 1000), (long)(t % 1000), safe);
+    if (g_logfile) ts_logfile_check();
 }
 
 /* ---- The control connection (the session's I/O) ------------------------- */
@@ -1026,6 +1059,99 @@ static void on_signal(int sig)
     errno = e;
 }
 
+#ifdef TS_TEST_HOOKS
+/* SIGUSR1: act as after a wake; SIGUSR2: as after a network change. */
+static void on_test_signal(int sig)
+{
+    int e = errno;
+    char b = 1;
+    if (sig == SIGUSR1) got_test_wake = 1;
+    else got_test_net = 1;
+    (void)write(D.sigpipe[1], &b, 1);
+    errno = e;
+}
+#endif
+
+/* Wall clock milliseconds, for spotting a sleep only. */
+static int64_t wall_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* Notice a wake or a network change, and rebind when the gate allows. From
+ * the loop body only (ts_dpio_rebind is not for callbacks). */
+static void check_conditions(void)
+{
+    int64_t now = now_ms(), jump;
+    char why[64];
+
+    jump = ts_wake_check(&D.wake, wall_ms(), now);
+    if (jump != 0) {
+        /* Forward: a sleep (the monotonic clock stops while asleep). Back: the
+         * clock was set back; the sessions are kept (see Amendments). */
+        if (jump > 0) {
+            logline("woke from sleep (wall clock jumped %lld s)", (long long)(jump / 1000));
+            ts_rebind_request(&D.gate, "woke from sleep", now);
+            D.rebind_reset = 1;
+        } else {
+            logline("wall clock set back %lld s", (long long)(-jump / 1000));
+            ts_rebind_request(&D.gate, "wall clock set back", now);
+        }
+    }
+#ifdef TS_TEST_HOOKS
+    if (got_test_wake) {
+        got_test_wake = 0;
+        logline("woke from sleep (test signal)");
+        ts_rebind_request(&D.gate, "woke from sleep", now);
+        D.rebind_reset = 1;
+    }
+    if (got_test_net) {
+        got_test_net = 0;
+        logline("network changed (test signal)");
+        ts_rebind_request(&D.gate, "network changed", now);
+    }
+#endif
+    if (now >= D.net_next) {
+        /* More than the fingerprint keeps: it sorts, then cuts. */
+        ts_ifaddr a[2 * TS_NET_MAX_ADDRS];
+        size_t n = 0;
+        uint32_t gw = 0;
+        char gw_if[16];
+        D.net_next = now + TS_NET_POLL_MS;
+        if (ts_net_snapshot(a, sizeof a / sizeof a[0], &n, &gw, gw_if) == 0) {
+            uint64_t fp = ts_net_fingerprint(a, n, gw, gw_if);
+            if (!D.net_primed) {
+                D.net_primed = 1;
+                D.net_fp = fp;
+            } else if (fp != D.net_fp) {
+                D.net_fp = fp;
+                logline("network changed");
+                ts_rebind_request(&D.gate, "network changed", now);
+            }
+        }
+    }
+    if (ts_rebind_due(&D.gate, now, why)) {
+        int reset = D.rebind_reset;
+        D.rebind_reset = 0;
+        /* Reconnect control now: a rebind's own close neither grows the
+         * backoff nor waits it out, and nor does a rebind while backing off. */
+        if (D.cphase != C_NONE) {
+            logline("closing the control connection (%s)", why);
+            conn_close();
+            if (D.sess) {
+                ts_sess_disconnected(D.sess, why);
+                ts_sess_retry_now(D.sess);
+            }
+        } else if (D.sess && ts_sess_get_state(D.sess) == TS_SESS_BACKOFF) {
+            logline("reconnecting to control now (%s)", why);
+            ts_sess_retry_now(D.sess);
+        }
+        ts_dpio_rebind(why, 1, reset);
+    }
+}
+
 static void log_state(void)
 {
     view v;
@@ -1095,6 +1221,41 @@ static int setup_control_host(void)
     return 0;
 }
 
+/* tsppcd --cleanup, for the uninstaller: with no daemon answering on the
+ * control socket, remove the route and the /etc/hosts block a crash left.
+ * Loads no state, keys or network. */
+static int run_cleanup(void)
+{
+    char buf[TS_IPC_RESP_MAX];
+    size_t len = 0;
+    ts_req_result rc;
+
+    mach_timebase_info(&tb);
+    t_start = now_ms();
+    /* Only "nothing there" (no socket, or a stale one) means no daemon. */
+    errno = 0;
+    rc = ts_ipc_request(ts_ipc_socket_path(), TS_IPC_STATUS, 3000, buf, sizeof buf, &len);
+    if (rc == TS_REQ_DENIED || rc == TS_REQ_FAILED) {
+        fprintf(stderr, "tsppcd: cannot check for a running tsppcd: %s; not cleaning up\n",
+                errno ? strerror(errno) : "failed");
+        return 1;
+    }
+    if (rc != TS_REQ_NO_DAEMON) {
+        fprintf(stderr, "tsppcd is running; stop it first\n");
+        return 1;
+    }
+    if (ts_dpio_init(logline, now_ms) != 0) {
+        fprintf(stderr, "tsppcd: out of memory\n");
+        return 1;
+    }
+    ts_dpio_cleanup_route();
+    ts_names_init(logline);
+    ts_names_cleanup();
+    ts_dpio_shutdown();
+    ts_names_shutdown();
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct sigaction sa;
@@ -1103,10 +1264,27 @@ int main(int argc, char **argv)
     int i, code = 0;
     gid_t gid = TS_IPC_GROUP_GID;
 
-    (void)argv;
-    if (argc != 1) {
-        fprintf(stderr, "usage: tsppcd (runs in the foreground)\n");
+    const char *logpath = NULL;
+    char log_err[256];
+    int cleanup = 0;
+
+    if (argc == 1) {
+    } else if (argc == 2 && strcmp(argv[1], "--cleanup") == 0) {
+        cleanup = 1;
+    } else if (argc == 3 && strcmp(argv[1], "-l") == 0 && argv[2][0]) {
+        logpath = argv[2];
+    } else {
+        fprintf(stderr, "usage: tsppcd [-l <logfile>] | --cleanup\n");
         return 2;
+    }
+    if (cleanup) return run_cleanup();
+    log_err[0] = 0;
+    if (logpath) {
+        /* Never fatal: a daemon without its log still serves the tailnet. */
+        if (ts_logfile_open(logpath, log_err, sizeof log_err) != 0)
+            fprintf(stderr, "tsppcd: cannot open the log file (%s); logging to stderr\n", log_err);
+        else
+            g_logfile = 1;
     }
     memset(&D, 0, sizeof D);
     D.fd = D.lfd = -1;
@@ -1115,6 +1293,7 @@ int main(int argc, char **argv)
     for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) D.cl[i].fd = -1;
     mach_timebase_info(&tb);
     t_start = now_ms();
+    if (log_err[0]) logline("cannot open the log file (%s); logging to stderr", log_err);
 
     signal(SIGPIPE, SIG_IGN);
     if (pipe(D.sigpipe) != 0 || ts_fd_nonblock(D.sigpipe[0]) != 0 || ts_fd_nonblock(D.sigpipe[1]) != 0) {
@@ -1126,6 +1305,11 @@ int main(int argc, char **argv)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
+#ifdef TS_TEST_HOOKS
+    sa.sa_handler = on_test_signal;
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGUSR2, &sa, NULL);
+#endif
 
     D.out = (uint8_t *)malloc(OUT_MAX);
     if (!D.out) {
@@ -1192,6 +1376,7 @@ int main(int argc, char **argv)
         kf_tick();
         conn_flush();
         ts_dpio_sync(D.sess, D.want_up, D.fed, now_ms());
+        check_conditions();
         finish_pings();
         {
             ts_dpio_view dv;

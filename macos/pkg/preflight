@@ -1,0 +1,92 @@
+#!/bin/sh
+# tsppc package preflight. Installer runs it as root before the payload, on
+# every install and upgrade, with $1 the package, $2 the install location,
+# $3 the target volume and $4 the system root.
+# It stops a running tsppcd, so an upgrade never replaces the files under a
+# running daemon. Uses only tools on both 10.4 and 10.5.
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+PLIST=/Library/LaunchDaemons/com.github.ajthom90.tsppcd.plist
+WAIT_SEC=30
+
+# The pids of root's processes named exactly tsppcd (another user's process
+# of that name is not the installed daemon). Not ps -p: on Tiger it succeeds
+# for a pid that is gone.
+tsppcd_pids() {
+    ps axc -o pid,uid,command | awk 'NR > 1 && $2 == 0 && $3 == "tsppcd" { printf "%s%s", s, $1; s = " " }'
+}
+
+if [ "${3:-}" != "/" ]; then
+    echo "tsppc installs only on the startup disk, not on ${3:-an unknown volume}." >&2
+    exit 1
+fi
+
+# unsafe_dir <dir> <group rule>: print why a directory the payload installs
+# into is unsafe, or nothing. A missing one is fine (the payload creates it
+# root:wheel 755). It must not be a symlink, must be a root-owned directory
+# and must not be writable by others. Group rule "none": not writable by its
+# group either; "system": writable by its group only when that group is wheel
+# (0) or admin (80).
+unsafe_dir() {
+    [ -L "$1" ] && { echo "$1 is a symlink"; return; }
+    [ -e "$1" ] || return
+    [ -d "$1" ] || { echo "$1 is not a directory"; return; }
+    info=$(stat -f '%u %g %Lp' "$1" 2>/dev/null)
+    set -- "$1" "$2" $info
+    [ $# = 5 ] || { echo "cannot stat $1"; return; }
+    [ "$3" = 0 ] || { echo "$1 is not owned by root"; return; }
+    case "$5" in ''|*[!0-7]*) echo "cannot read the mode of $1"; return ;; esac
+    m=$((0$5))
+    [ $((m & 2)) = 0 ] || { echo "$1 is writable by others"; return; }
+    if [ $((m & 16)) != 0 ]; then
+        if [ "$2" = none ] || { [ "$4" != 0 ] && [ "$4" != 80 ]; }; then
+            echo "$1 is writable by its group"
+        fi
+    fi
+}
+
+bad=0
+for d in /usr/local:none /usr/local/bin:none /usr/local/sbin:none \
+         /Library/LaunchDaemons:system /Library/Extensions:system; do
+    why=$(unsafe_dir "${d%:*}" "${d##*:}")
+    if [ -n "$why" ]; then
+        echo "tsppc cannot be installed safely: $why. Fix it and install again." >&2
+        bad=1
+    fi
+done
+# The payload also carries these. They are group-writable by default, so only
+# a symlink is refused: Installer does not follow links (IFPkgFlagFollowLinks
+# false) and would put a real directory in its place.
+for d in /Applications /Library /usr; do
+    if [ -L "$d" ]; then
+        echo "tsppc cannot be installed safely: $d is a symlink. Fix it and install again." >&2
+        bad=1
+    fi
+done
+[ "$bad" = 0 ] || exit 1
+
+unloaded=0
+if [ -f "$PLIST" ]; then
+    if launchctl unload "$PLIST"; then
+        unloaded=1
+    else
+        echo "preflight: launchctl unload $PLIST failed; checking for tsppcd anyway" >&2
+    fi
+fi
+
+waited=0
+while :; do
+    pids=$(tsppcd_pids)
+    [ -z "$pids" ] && break
+    if [ "$waited" -ge "$WAIT_SEC" ]; then
+        echo "tsppcd is still running (pid $pids) after ${WAIT_SEC}s; stop it and install again." >&2
+        # A failed upgrade leaves the old daemon as it was.
+        if [ "$unloaded" = 1 ]; then
+            launchctl load "$PLIST" || echo "preflight: could not load $PLIST again" >&2
+        fi
+        exit 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+done
+exit 0

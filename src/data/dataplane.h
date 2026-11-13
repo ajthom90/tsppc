@@ -153,6 +153,18 @@ void ts_dp_conn_up(ts_dp *dp, int slot);
 void ts_dp_conn_recv(ts_dp *dp, int slot, const uint8_t *p, size_t n);
 void ts_dp_conn_down(ts_dp *dp, int slot, const char *why);
 void ts_dp_tick(ts_dp *dp, int64_t now_ms);
+/* After a network change or a wake (the old streams are presumed dead):
+ * every relay slot that is dialing or up is closed through io->conn_close,
+ * and it and every slot waiting in backoff are dialed again at the next
+ * ts_dp_tick, with no delay and the backoff back at TS_DP_REDIAL_MIN_MS. A
+ * non-home slot is still closed TS_DP_IDLE_CLOSE_MS after its last write.
+ * With reset_sessions (a real sleep): WireGuard sessions are dropped
+ * (ts_wg_reset_sessions) and so are the WireGuard messages queued on every
+ * slot (stale ones would reach the peer ahead of the new handshake); queued
+ * disco frames stay. Without it (a network change, a clock stepped back)
+ * sessions and the whole queue are kept. Outstanding pings are left to
+ * finish or time out. Nothing if not running. */
+void ts_dp_rebind(ts_dp *dp, int64_t now_ms, int reset_sessions);
 /* Send a disco ping to the configured peer with tailnet address peer_ip, on
  * its home region. 0, or a TS_DP_PING_* error. On 0, io->ping_result reports
  * cookie exactly once: a pong, a timeout timeout_ms after now_ms (seen by

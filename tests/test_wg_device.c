@@ -1106,6 +1106,61 @@ static void test_wgdev_staging(void)
     teardown();
 }
 
+/* ts_wg_reset_sessions: keys and handshakes gone, peers and stats kept, the
+ * next packet starts a new handshake at once, and a retry that was queued
+ * never fires. */
+static void test_wgdev_reset_sessions(void)
+{
+    ts_wg_stats before, after;
+    int sent;
+    setup();
+    establish();
+    send_ip(0, 1, 0x61, 40);
+    pump();
+    run_until(1000);
+    t_true("reset: keys after the handshake", ts_wg_test_has_keys(N[0].d, N[1].pub) == 1 &&
+                                                  ts_wg_test_has_keys(N[1].d, N[0].pub) == 1);
+    ts_wg_peer_stats(N[0].d, N[1].pub, &before);
+    ts_wg_reset_sessions(N[0].d);
+    t_true("reset: no keys on the side that reset", ts_wg_test_has_keys(N[0].d, N[1].pub) == 0);
+    t_true("reset: the other side still has its session", ts_wg_test_has_keys(N[1].d, N[0].pub) == 1);
+    t_true("reset: no session in stats", stats_session(0, 1) == 0);
+    ts_wg_peer_stats(N[0].d, N[1].pub, &after);
+    t_true("reset: peer and stats survive",
+           after.tx_packets == before.tx_packets && after.rx_packets == before.rx_packets &&
+           after.tx_bytes == before.tx_bytes && after.last_handshake_ms == before.last_handshake_ms);
+    node_reset_counts(&N[0]);
+    node_reset_counts(&N[1]);
+    send_ip(0, 1, 0x62, 44);   /* 1 s after the last handshake: not held back */
+    t_true("reset: the next packet starts a handshake", N[0].nsent[1] == 1);
+    pump();
+    t_true("reset: packets flow again", N[1].ndeliv == 1 && N[1].delivn[0] == 44 && N[1].deliv[0][24] == 0x62);
+    send_ip(1, 0, 0x63, 36);
+    pump();
+    t_true("reset: and back", N[0].ndeliv == 1 && N[0].delivn[0] == 36);
+    t_true("reset: sessions again", stats_session(0, 1) == 1 && stats_session(1, 0) == 1);
+    ts_wg_peer_stats(N[0].d, N[1].pub, &after);
+    t_true("reset: stats keep counting", after.tx_packets == before.tx_packets + 1 &&
+                                             after.rx_packets == before.rx_packets + 1);
+    teardown();
+
+    /* A handshake in progress (its messages lost) is dropped with its retry. */
+    setup();
+    N[0].drop_out = 1;
+    send_ip(0, 1, 0x64, 28);
+    t_true("reset: initiation pending", N[0].nsent[1] == 1 && ts_wg_test_has_keys(N[0].d, N[1].pub) == 1);
+    run_until(1000);
+    ts_wg_reset_sessions(N[0].d);
+    t_true("reset: pending handshake wiped", ts_wg_test_has_keys(N[0].d, N[1].pub) == 0);
+    sent = N[0].nsent[1];
+    run_until(30000);
+    t_true("reset: no retry after the reset", N[0].nsent[1] == sent);
+    N[0].drop_out = 0;
+    t_true("reset: nothing staged is sent later", N[1].ndeliv == 0);
+    ts_wg_reset_sessions(N[2].d);   /* no peers: harmless */
+    teardown();
+}
+
 void test_wg_device(void)
 {
     test_wgdev_vector();
@@ -1121,4 +1176,5 @@ void test_wg_device(void)
     test_wgdev_cookie();
     test_wgdev_misc();
     test_wgdev_staging();
+    test_wgdev_reset_sessions();
 }

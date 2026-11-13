@@ -181,3 +181,22 @@ check.
 - Until direct paths (milestone 8), every byte goes through a relay round trip, about 45 ms on the test setup. Bulk copies are fine: 20 MB took 38 s each way over AFP, and 38 s for a write over SMB.
 - Reads by Tiger's SMB client (`mount_smbfs`) from Mac OS X's Samba ran at about 22 KB/s (20 MB in 924 s). The client asked for 1 KB per request, so each kilobyte cost a full round trip. That's the old SMB client, not tsppc. Prefer AFP between old Macs.
 - Tiger's AFP client did not mount from an SSH-only session; it needs a logged-in user. See `docs/services-check.md`.
+
+## Install and conditions (milestone 7)
+
+- **Sleep detection.**
+  - A sleep is noticed as the wall clock jumping ahead of the monotonic clock, so a sleep shorter than 15 s goes unnoticed. Connections that survive it carry on anyway.
+  - A clock set forward by hand or by NTP by 15 s or more looks like a sleep, and resets the WireGuard sessions once.
+  - A clock set back by 15 s or more reconnects control and the relays, but keeps the sessions.
+- **Network changes** are polled every 5 s, and reconnect at most once per 10 s.
+- **Real sleep untested.** It has only been simulated with the clock on the emulated VMs (see `docs/install-check.md`).
+- **Blocked relay region.** When the home relay region is unreachable, a new home is chosen after 3 failures. Peers whose own home is that region stay unreachable until it comes back, because relayed packets go to the peer's home region. The same is true of the official client without a direct path.
+- **Another tuntaposx already loaded.** tsppcd uses its `/dev/tunN` devices and never loads or unloads its own kext over it. If that other driver is later unloaded while tsppcd runs, the tunnel goes down until a device is available again.
+- **Another tuntaposx installed but not loaded.** When `tun.kext` is in `/Library/Extensions` or `/System/Library/Extensions`, or `/Library/StartupItems/tun` exists, tsppcd waits until the Mac has been up 2 minutes before loading its own driver, so that the other install's StartupItem can load its own first; until then the tunnel is down and status says "waiting for another tun driver to load". A StartupItem that runs later than that finds tsppc's driver already loaded.
+- **Install-folder checks.** The installer refuses to install when `/usr/local`, `/usr/local/bin` or `/usr/local/sbin` is a symlink, is not owned by root, or is writable by group or others (as some package managers leave it). It also refuses when `/Library/LaunchDaemons` or `/Library/Extensions` is unsafe, or when `/Applications`, `/Library` or `/usr` is a symlink. The reason goes to the installer log (`/var/log/install.log`); Installer.app itself shows only a generic failure.
+- **Login Items.**
+  - The uninstaller does not remove tsppc.app from users' Login Items: it would have to edit other users' preferences. A Login Item left pointing at the removed app does nothing.
+  - The first-launch "Start at Login" offer appears only for the copy in `/Applications`, and only once per user.
+  - A command-line install (`installer -pkg`) does not open the menu bar app. It starts at the next login once it is a Login Item, or when opened by hand.
+- **The uninstaller keeps `/var/db/tsppc`** (the node identity) unless given `--remove-state`. With `-y` as well, it deletes it without asking.
+- **Daemon log.** It is capped at 1 MiB plus one rotated copy. If rotation keeps failing, the log is emptied in place instead of growing. If the rename succeeds but the reopen fails, logging continues in `<path>.1`, still capped, until the daemon restarts.
