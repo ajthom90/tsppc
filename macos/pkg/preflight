@@ -18,6 +18,35 @@ if [ "${3:-}" != "/" ]; then
     exit 1
 fi
 
+# unsafe_dir <dir> <strict>: print why a directory the payload installs into is
+# unsafe, or nothing. A missing one is fine (the payload creates it root:wheel
+# 755). It must not be a symlink, must be root-owned, and must not be writable
+# by others; with strict = 1 not by its group either.
+unsafe_dir() {
+    [ -L "$1" ] && { echo "$1 is a symlink"; return; }
+    [ -e "$1" ] || return
+    [ -d "$1" ] || { echo "$1 is not a directory"; return; }
+    info=$(stat -f '%u %Lp' "$1" 2>/dev/null)
+    [ -n "$info" ] || { echo "cannot stat $1"; return; }
+    uid=${info% *}
+    mode=${info#* }
+    [ "$uid" = 0 ] || { echo "$1 is not owned by root"; return; }
+    case "$mode" in ''|*[!0-7]*) echo "cannot read the mode of $1"; return ;; esac
+    m=$((0$mode))
+    [ $((m & 2)) = 0 ] || { echo "$1 is writable by others"; return; }
+    if [ "$2" = 1 ] && [ $((m & 16)) != 0 ]; then echo "$1 is writable by its group"; fi
+}
+
+bad=0
+for d in /usr/local:1 /usr/local/bin:1 /usr/local/sbin:1 /Library/LaunchDaemons:0 /Library/Extensions:0; do
+    why=$(unsafe_dir "${d%:*}" "${d##*:}")
+    if [ -n "$why" ]; then
+        echo "tsppc cannot be installed safely: $why. Fix it and install again." >&2
+        bad=1
+    fi
+done
+[ "$bad" = 0 ] || exit 1
+
 if [ -f "$PLIST" ]; then
     launchctl unload "$PLIST" || echo "preflight: launchctl unload $PLIST failed; checking for tsppcd anyway" >&2
 fi

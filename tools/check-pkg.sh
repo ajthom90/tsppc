@@ -61,8 +61,8 @@ IFPkgFlagDefaultLocation <string>/</string>
 IFPkgFlagRelocatable <false/>
 IFPkgFlagRestartAction <string>None</string>
 IFPkgFlagRootVolumeOnly <true/>
-IFPkgFlagOverwritePermissions <false/>
-IFPkgFlagFollowLinks <true/>
+IFPkgFlagOverwritePermissions <true/>
+IFPkgFlagFollowLinks <false/>
 IFPkgFormatVersion <real>0.1</real>
 EOF
 if command -v plutil >/dev/null 2>&1; then
@@ -73,7 +73,9 @@ fi
 # The payload. Every path, with its type, permission bits, uid and gid
 # (0 = root or wheel, 80 = admin). Existing system directories (/, /Library,
 # /Applications, /usr, /Library/LaunchDaemons) carry the owner and mode they
-# already have on 10.4 and 10.5, so the install can never change them.
+# already have on 10.4 and 10.5: with IFPkgFlagOverwritePermissions true,
+# Installer applies these to existing directories, so they must be the
+# system's own values.
 cat >"$tmp/want" <<'EOF'
 . d 1775 0 80
 ./Applications d 775 0 80

@@ -13,13 +13,13 @@
 	<key>IFPkgFlagDefaultLocation</key>
 	<string>/</string>
 	<key>IFPkgFlagFollowLinks</key>
-	<true/>
+	<false/>
 	<key>IFPkgFlagInstalledSize</key>
 	<integer>@SIZE_KB@</integer>
 	<key>IFPkgFlagIsRequired</key>
 	<false/>
 	<key>IFPkgFlagOverwritePermissions</key>
-	<false/>
+	<true/>
 	<key>IFPkgFlagRelocatable</key>
 	<false/>
 	<key>IFPkgFlagRestartAction</key>

@@ -107,12 +107,48 @@ if ! wait_gone tsppcd_pids "$WAIT_SEC"; then
     exit 1
 fi
 
-# 2. The route and /etc/hosts block a crashed daemon may have left.
-if [ -x "$DAEMON" ]; then
+# unsafe_path <path> <type f|d>: print why a path is not safe to run as root,
+# or nothing: it must exist with that type, not be a symlink, be owned by
+# root, and not be writable by its group or others.
+unsafe_path() {
+    [ -L "$1" ] && { echo "$1 is a symlink"; return; }
+    case "$2" in
+    f) [ -f "$1" ] ;;
+    *) [ -d "$1" ] ;;
+    esac || { echo "$1 is missing or of the wrong type"; return; }
+    info=$(stat -f '%u %Lp' "$1" 2>/dev/null)
+    uid=${info% *}
+    mode=${info#* }
+    case "$mode" in ''|*[!0-7]*) echo "cannot read the mode of $1"; return ;; esac
+    [ "$uid" = 0 ] || { echo "$1 is not owned by root"; return; }
+    m=$((0$mode))
+    [ $((m & 18)) = 0 ] || echo "$1 is writable by its group or others"
+}
+
+# route_on_tun: 0 if the 100.64/10 route points at a tun interface.
+route_on_tun() {
+    netstat -rn -f inet | awk '$1 == "100.64/10" { for (i = 2; i <= NF; i++) if ($i ~ /^tun[0-9]+$/) f = 1 } END { exit !f }'
+}
+
+# 2. The route and /etc/hosts block a crashed daemon may have left. tsppcd
+# runs as root here, so only a binary nobody but root could have replaced.
+why=
+for p in "$DAEMON:f" /usr/local/sbin:d /usr/local:d /usr:d; do
+    why=$(unsafe_path "${p%:*}" "${p##*:}")
+    [ -n "$why" ] && break
+done
+if [ -z "$why" ]; then
     "$DAEMON" --cleanup && echo "Removed any leftover tsppc route and /etc/hosts block." ||
         echo "tsppcd --cleanup failed; checked again below" >&2
 else
-    echo "$DAEMON is missing; cannot run its cleanup; checked again below" >&2
+    echo "Not running $DAEMON --cleanup: $why." >&2
+    if route_on_tun; then
+        route -n delete -net 100.64.0.0/10 >/dev/null && echo "Removed the 100.64.0.0/10 route." ||
+            echo "route delete 100.64.0.0/10 failed" >&2
+    fi
+    if grep -q "^$HOSTS_BEGIN" /etc/hosts 2>/dev/null; then
+        echo "/etc/hosts still has tsppc's names: delete the lines from \"# tsppc begin\" to \"# tsppc end\" by hand." >&2
+    fi
 fi
 
 # 3. Quit the menu bar app.
@@ -177,7 +213,7 @@ if [ -n "$(tsppcd_pids)" ]; then
     echo "check failed: tsppcd is running (pid $(tsppcd_pids))" >&2
     failed=1
 fi
-if netstat -rn -f inet | awk '$1 == "100.64/10" { for (i = 2; i <= NF; i++) if ($i ~ /^tun[0-9]+$/) f = 1 } END { exit !f }'; then
+if route_on_tun; then
     echo "check failed: the 100.64/10 route still points at a tun interface" >&2
     failed=1
 fi
