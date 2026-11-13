@@ -326,7 +326,9 @@ static int run_cli(const char *arg, char *out, size_t cap)
  * appended to logpath. */
 static int g_ctl_port = 1;
 
-static pid_t start_daemon(const char *statedir, const char *sock, const char *logpath, const char *key)
+/* larg: when set, tsppcd runs with -l larg. */
+static pid_t start_daemon_l(const char *statedir, const char *sock, const char *logpath, const char *key,
+                            const char *larg)
 {
     char ctl[64], hosts[128];
     pid_t pid = fork();
@@ -350,10 +352,16 @@ static pid_t start_daemon(const char *statedir, const char *sock, const char *lo
         setenv("TSPPC_HOSTS_FILE", hosts, 1);
         if (key) setenv("TSPPC_CONTROL_KEY", key, 1);
         else unsetenv("TSPPC_CONTROL_KEY");
-        execl(TS_BIN_DIR "/tsppcd", "tsppcd", (char *)NULL);
+        if (larg) execl(TS_BIN_DIR "/tsppcd", "tsppcd", "-l", larg, (char *)NULL);
+        else execl(TS_BIN_DIR "/tsppcd", "tsppcd", (char *)NULL);
         _exit(127);
     }
     return pid;
+}
+
+static pid_t start_daemon(const char *statedir, const char *sock, const char *logpath, const char *key)
+{
+    return start_daemon_l(statedir, sock, logpath, key, NULL);
 }
 
 /* Wait for a socket at sock other than inode old (0: any). */
@@ -1432,6 +1440,18 @@ static void test_daemon(void)
     t_true("daemon: refuses a socket path held by a file", wait_exit(pid, 60000) == 1);
     t_true("daemon: the file is kept", lstat(sock, &sb) == 0 && S_ISREG(sb.st_mode));
     unlink(sock);
+
+    /* A log file that cannot be opened (a directory): the reason goes to
+     * stderr, before the log and again as its first line, and the daemon
+     * keeps running with stderr. */
+    pid = start_daemon_l(statedir, sock, logpath, NULL, tmpdir);
+    t_true("daemon: -l unusable: keeps running", wait_socket(sock, pid, 120000) == 0);
+    t_true("daemon: -l unusable: says why on stderr",
+           file_has(logpath, "tsppcd: cannot open the log file (") && file_has(logpath, "); logging to stderr\n"));
+    t_true("daemon: -l unusable: and as the first log line", file_has(logpath, "] cannot open the log file ("));
+    kill(pid, SIGTERM);
+    t_true("daemon: -l unusable: exits on SIGTERM", wait_exit(pid, 60000) == 0);
+    unlink(logpath);
 
     /* The key fetch resolves localhost and is refused on 443: BACKOFF. */
     pid = start_daemon(statedir, sock, logpath, NULL);

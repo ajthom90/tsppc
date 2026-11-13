@@ -25,7 +25,10 @@ static int ignored(const ts_ifaddr *e)
         if (strncmp(e->name, pre[i], strlen(pre[i])) == 0)
             return 1;
     /* 100.64.0.0/10: the tailnet's own addresses (and CGNAT) */
-    return (e->addr & 0xFFC00000u) == 0x64400000u;
+    if ((e->addr & 0xFFC00000u) == 0x64400000u)
+        return 1;
+    /* 169.254.0.0/16: link-local, self-assigned while DHCP has no answer */
+    return (e->addr & 0xFFFF0000u) == 0xA9FE0000u;
 }
 
 static int cmp(const void *x, const void *y)

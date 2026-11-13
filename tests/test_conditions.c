@@ -63,6 +63,12 @@ static void fp_tests(void)
     t_true("fingerprint: ignores tun0", base == ts_net_fingerprint(c, 4, IP(192, 168, 1, 1), "en0"));
     set(&c[3], "en1", IP(100, 64, 0, 5), IP(255, 255, 255, 0));
     t_true("fingerprint: ignores 100.64/10", base == ts_net_fingerprint(c, 4, IP(192, 168, 1, 1), "en0"));
+    /* A link-local address (self-assigned while DHCP is pending) comes and
+     * goes without the network changing. */
+    set(&c[3], "en1", IP(169, 254, 12, 34), IP(255, 255, 0, 0));
+    t_true("fingerprint: ignores 169.254/16", base == ts_net_fingerprint(c, 4, IP(192, 168, 1, 1), "en0"));
+    set(&c[3], "en1", IP(169, 255, 0, 1), IP(255, 255, 0, 0));
+    t_true("fingerprint: 169.255 is not link-local", base != ts_net_fingerprint(c, 4, IP(192, 168, 1, 1), "en0"));
     set(&c[3], "utun1", IP(10, 9, 9, 9), IP(255, 0, 0, 0));
     t_true("fingerprint: ignores utun", base == ts_net_fingerprint(c, 4, IP(192, 168, 1, 1), "en0"));
     set(&c[3], "gif0", IP(10, 9, 9, 9), IP(255, 0, 0, 0));

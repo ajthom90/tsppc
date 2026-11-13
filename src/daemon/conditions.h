@@ -27,8 +27,8 @@ typedef struct {
  * back); else 0. The first call only primes. Every call re-primes. */
 int64_t ts_wake_check(ts_wake *w, int64_t wall_ms, int64_t mono_ms);
 
-/* FNV-1a 64 over the entries (without lo*, tun*, tap*, utun*, gif* and
- * 100.64.0.0/10), sorted by name and address and cut at TS_NET_MAX_ADDRS,
+/* FNV-1a 64 over the entries (without lo*, tun*, tap*, utun*, gif*,
+ * 100.64.0.0/10 and 169.254.0.0/16), sorted by name and address and cut at TS_NET_MAX_ADDRS,
  * plus the default gateway and its interface. Independent of entry order. */
 uint64_t ts_net_fingerprint(const ts_ifaddr *a, size_t n, uint32_t gw, const char *gw_if);
 

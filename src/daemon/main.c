@@ -1,5 +1,6 @@
 /* tsppcd: the daemon. Runs in the foreground as root (launchd runs it with
- * -l <logfile>: stderr goes to that file, capped by logfile.c; tsppcd --cleanup
+ * -l <logfile>: stderr goes to that file, capped by logfile.c, or stays
+ * stderr, with the reason first, if it cannot be opened; tsppcd --cleanup
  * removes what a crash left, and exits 1 if a daemon is running).
  *
  * One select() loop over the control connection, the DNS helper's pipe, the
@@ -1091,11 +1092,11 @@ static void check_conditions(void)
         /* Forward: a sleep (the monotonic clock stops while asleep). Back: the
          * clock was set back; the sessions are kept (see Amendments). */
         if (jump > 0) {
-            logline("woke from sleep (wall clock jumped %ld s)", (long)(jump / 1000));
+            logline("woke from sleep (wall clock jumped %lld s)", (long long)(jump / 1000));
             ts_rebind_request(&D.gate, "woke from sleep", now);
             D.rebind_reset = 1;
         } else {
-            logline("wall clock set back %ld s", (long)(-jump / 1000));
+            logline("wall clock set back %lld s", (long long)(-jump / 1000));
             ts_rebind_request(&D.gate, "wall clock set back", now);
         }
     }
@@ -1264,6 +1265,7 @@ int main(int argc, char **argv)
     gid_t gid = TS_IPC_GROUP_GID;
 
     const char *logpath = NULL;
+    char log_err[256];
     int cleanup = 0;
 
     if (argc == 1) {
@@ -1276,12 +1278,13 @@ int main(int argc, char **argv)
         return 2;
     }
     if (cleanup) return run_cleanup();
+    log_err[0] = 0;
     if (logpath) {
-        if (ts_logfile_open(logpath, err, sizeof err) != 0) {
-            fprintf(stderr, "tsppcd: %s\n", err);
-            return 1;
-        }
-        g_logfile = 1;
+        /* Never fatal: a daemon without its log still serves the tailnet. */
+        if (ts_logfile_open(logpath, log_err, sizeof log_err) != 0)
+            fprintf(stderr, "tsppcd: cannot open the log file (%s); logging to stderr\n", log_err);
+        else
+            g_logfile = 1;
     }
     memset(&D, 0, sizeof D);
     D.fd = D.lfd = -1;
@@ -1290,6 +1293,7 @@ int main(int argc, char **argv)
     for (i = 0; i < TS_IPC_MAX_CLIENTS; i++) D.cl[i].fd = -1;
     mach_timebase_info(&tb);
     t_start = now_ms();
+    if (log_err[0]) logline("cannot open the log file (%s); logging to stderr", log_err);
 
     signal(SIGPIPE, SIG_IGN);
     if (pipe(D.sigpipe) != 0 || ts_fd_nonblock(D.sigpipe[0]) != 0 || ts_fd_nonblock(D.sigpipe[1]) != 0) {

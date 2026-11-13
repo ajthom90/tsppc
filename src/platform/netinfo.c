@@ -145,7 +145,7 @@ int ts_net_snapshot(ts_ifaddr *out, size_t cap, size_t *n, uint32_t *gw, char gw
         return -1;
     for (p = list; p != NULL; p = p->ifa_next) {
         struct sockaddr_in a, k;
-        if (!(p->ifa_flags & IFF_UP) || (p->ifa_flags & IFF_LOOPBACK))
+        if ((p->ifa_flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING) || (p->ifa_flags & IFF_LOOPBACK))
             continue;
         if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET || p->ifa_name == NULL)
             continue;
@@ -153,8 +153,12 @@ int ts_net_snapshot(ts_ifaddr *out, size_t cap, size_t *n, uint32_t *gw, char gw
             break;
         memset(&k, 0, sizeof(k));
         memcpy(&a, p->ifa_addr, sizeof(a));
-        if (p->ifa_netmask != NULL)
-            memcpy(&k, p->ifa_netmask, sizeof(k));
+        /* BSD trims trailing zero bytes off netmask sockaddrs (sa_len can be
+         * shorter than a sockaddr_in): copy only what is there. */
+        if (p->ifa_netmask != NULL) {
+            size_t kl = p->ifa_netmask->sa_len;
+            memcpy(&k, p->ifa_netmask, kl < sizeof(k) ? kl : sizeof(k));
+        }
         copy_name(out[m].name, p->ifa_name, strlen(p->ifa_name));
         out[m].addr = ntohl(a.sin_addr.s_addr);
         out[m].mask = ntohl(k.sin_addr.s_addr);

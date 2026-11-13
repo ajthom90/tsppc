@@ -11,7 +11,7 @@ typedef struct {
     uint32_t addr, mask;        /* host byte order */
 } ts_ifaddr;
 
-/* Up AF_INET interfaces (not loopback) into out[0..*n), at most cap, via
+/* Up and running AF_INET interfaces (not loopback) into out[0..*n), at most cap, via
  * getifaddrs; the default gateway (host byte order) and its interface name
  * via an RTM_GET for 0.0.0.0/0 on a PF_ROUTE socket. No default route gives
  * *gw = 0 and gw_if = "" (and 0 is returned). -1 when getifaddrs fails or
