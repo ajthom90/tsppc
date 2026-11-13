@@ -22,6 +22,10 @@ logs to /var/log/tsppcd.log and keeps its state (this Mac's node identity) in
 To sign in, run "tsppc up" in Terminal, or use the menu bar app, and open the
 login link it gives you.
 
+If another tun driver (tuntaposx) is already installed, tsppc uses it. Two
+tuntaposx drivers can't both be loaded: one installed after tsppc's fails to
+load until tsppc's is unloaded or the Mac restarts.
+
 Upgrading: install a newer package over this one. The running daemon is
 stopped first, and the new one keeps the same identity.
 

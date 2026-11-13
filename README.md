@@ -25,7 +25,9 @@ startup disk of a Mac running 10.4 or 10.5:
   `/usr/local/sbin/tsppc-uninstall`;
 - `/Library/Extensions/tsppc-tun.kext`, the tun driver (bundle ID
   `com.github.ajthom90.tsppc.tun`), which tsppcd loads only when no tun device
-  exists, so another tuntaposx install is used as it is;
+  exists, so another tuntaposx install is used as it is. Two tuntaposx
+  drivers can't both be loaded: one installed after tsppc's fails to load
+  until tsppc's is unloaded or the Mac restarts;
 - `/Library/LaunchDaemons/com.github.ajthom90.tsppcd.plist`, which starts the
   daemon now and at every boot;
 - `/Applications/tsppc.app`, the menu bar app.

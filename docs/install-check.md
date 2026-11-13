@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-12.
 
-**Verdict: PASS on Leopard and Tiger, with one row pending.**
+**Verdict: PASS on Leopard and Tiger, pending the node key expiry row and an install through Installer.app.** Both need the owner (an admin console action, and the admin password that Installer.app asks for).
 - Installing from the package, launchd at boot, reboot with no login, and uninstall with nothing left behind all pass on both systems.
 - Each row of the conditions table passes on both, except node key expiry. That row needs the owner to expire a key in the admin console and is not done yet; see "Node key expired".
 - A real sleep was not attempted; see "Sleep and wake".
@@ -11,9 +11,16 @@
 - `tsppc-0.1.0.dmg` `7bec10cea6f6be1d16968da56e996084a7b70689a7d20459957f2b020bd4267e`
 - `tsppc-uninstall` `20ede36d2e4bcfe501654093deb755d0805049cc31d224fa7b1e84cdf52033e5`
 
-Two log and output changes made after this run (`7ae879a`) are not in this build:
-- A backward clock step is logged as `wall clock set back <n> s`, not `woke from sleep`.
-- The uninstaller no longer prints Leopard `pkgutil`'s "No receipt" line.
+These hashes are of test builds, not a release.
+
+After the final review, the branch head `7cc7f24` was packaged the same way (dmg SHA-256 `877ec8143a4d1da3fc508c2179ffbe7a16d6bc1a37afc7882887dcfa1ff41a22`, uninstaller `37dca8cfcac767179396fca4cf80bd5e120fe4691c45f71abdfe9617bd81e95c`). It was installed over the running install on both VMs, and the crash-then-uninstall row was repeated with it (see "Head package"). The changes since `c223ae9` are:
+- `7ae879a`: log wording for a backward clock step; the uninstaller's quieter `pkgutil` output.
+- `173d82b`: a wake or network change also cuts short control's backoff wait.
+- `f8c7ea0`: the wait for another tuntaposx install.
+- `4c31019`: netmask length, 64-bit log values, a bad `-l` path no longer stops the daemon, self-assigned addresses ignored.
+- `7cc7f24`: check-release covers the new test hooks.
+
+The rows below were run with `c223ae9`. CI passed at `432a907`; host and VM suites passed at `7cc7f24` (3872 checks; Tiger 3681).
 
 **Machines:** as in `docs/tunnel-check.md`, emulated G4s in UTM with shared (NAT) networking, Mac OS X 10.5.8 and 10.4.11. Placeholders: `<leopard>`, `<tiger>`, `100.x.y.z`. Both VMs used the persistent tailnet identities from earlier milestones; no new login or approval was needed at any point.
 
@@ -59,6 +66,8 @@ Postflight's own "open the app for the console user" branch was **not** exercise
 | Node key expired | the owner expires the VM's key in the admin console | **pending** | **pending** |
 | Upgrade | the same package installed over a running install | preflight stopped the old daemon (new PID). The new one came up `RUNNING` with the state file unchanged (same SHA-1) and no login | same |
 
+Pings in these rows are ICMP `ping` to the other VM's tailnet address, with `tsppc status` showing `tunnel: tun0` and the `100.64/10` route on `tun0`, so they went through tsppc and not through UTM's NAT (see `docs/tunnel-check.md`).
+
 In the "Relay unreachable" row, pings from `<leopard>` to `<tiger>` failed while blocked: `<tiger>`'s home was the blocked region, and relayed packets go to the peer's home region. That is how relay-only Tailscale works, not a fault: the official client behaves the same with no direct path. Pings recovered when the rules were removed. When `<tiger>`'s turn came, `<leopard>`'s home had already moved, so `<tiger>`'s pings kept working. Home stays on the new region until the next measurement round (every 30 minutes).
 
 The first control-block attempt dropped only outgoing packets. Control's keepalives still arrived, so the session never saw silence and stayed `RUNNING`, which is correct behaviour for that test. The rows above use the run that dropped both directions.
@@ -89,6 +98,23 @@ Before the uninstaller ran, no `tsppcd` was running, the hosts block was present
 On Tiger, the first crash attempt was not a valid test. The hand-started daemon did not come up, so there was no block to clean, and that result is not counted. The run above waited for the launchd copy to exit first.
 
 Both VMs were reinstalled from the package afterwards and are running it.
+
+"Nothing left" means nothing of tsppc's own:
+- The folders the package created (`/usr/local`, `/usr/local/bin`, `/usr/local/sbin`, `/Library/Extensions`) are kept. They are shared folders.
+- After the crash variant, a stale `/var/run/tsppc.sock` socket file stays until the next restart. Nothing listens on it, and the next tsppcd replaces it.
+
+## Head package
+
+Both VMs, with `7cc7f24`:
+- Installed over the running install: `RUNNING` with the same node, no login.
+- Crash then uninstall, as above: before it, no `tsppcd`, a hosts block and an `lo0` route; the uninstaller exited 0 and removed both, with no "No receipt" line; afterwards nothing of tsppc's was left.
+- Reinstalled: `RUNNING`, the route on `tun0`.
+
+## Another tuntaposx loaded after tsppc's
+
+On both VMs, with `tsppc-tun` loaded by tsppcd, the development build of tuntaposx under its own bundle ID (`foo.tun`) was loaded with `kextload`. It failed: the kernel logged `tun: could not register PF_INET protocol family: 17`. tsppc's driver stayed loaded and the node stayed `RUNNING` with the tunnel up. Two tuntaposx drivers cannot be loaded at once, whichever comes first.
+
+Since `f8c7ea0`, tsppcd waits until the Mac has been up 2 minutes before loading its driver when another tuntaposx is installed but not loaded, so that one's StartupItem can load first at boot (host tests only). See `docs/known-limits.md`.
 
 ## Sleep and wake
 
