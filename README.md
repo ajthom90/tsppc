@@ -16,6 +16,40 @@ New source files under `src/` are picked up automatically. A new test suite is
 added by defining `void test_x(void)` in `tests/` and listing it in
 `tests/main.c`.
 
+## Install
+
+Open `tsppc-<version>.dmg` and run `tsppc-<version>.pkg`. It installs on the
+startup disk of a Mac running 10.4 or 10.5:
+
+- `/usr/local/sbin/tsppcd` (the daemon), `/usr/local/bin/tsppc` (the CLI) and
+  `/usr/local/sbin/tsppc-uninstall`;
+- `/Library/Extensions/tsppc-tun.kext`, the tun driver (bundle ID
+  `com.github.ajthom90.tsppc.tun`), which tsppcd loads only when no tun device
+  exists, so another tuntaposx install is used as it is;
+- `/Library/LaunchDaemons/com.github.ajthom90.tsppcd.plist`, which starts the
+  daemon now and at every boot;
+- `/Applications/tsppc.app`, the menu bar app.
+
+The daemon logs to `/var/log/tsppcd.log` and keeps its state in
+`/var/db/tsppc`. Sign in with `tsppc up` or from the menu bar app. Installing a
+newer package stops the running daemon first; the new one keeps the identity.
+
+To build the package, run `make package` on a PowerPC Mac or the Leopard VM
+(gcc-4.0 and the 10.4u SDK); `tools/check-pkg.sh` checks it. A release is
+built with `tools/release.sh <tag>` from a clean checkout at the tag; it
+writes `build/release/SHA256SUMS` and neither signs nor uploads.
+
+## Uninstall
+
+    sudo /usr/local/sbin/tsppc-uninstall
+
+It stops the daemon, removes its route and `/etc/hosts` entries (even after a
+crash), quits the menu bar app, unloads tsppc's own driver (never another
+one), and removes the installed files, the log and the receipt. `-y` skips the
+questions. `--remove-state` also deletes `/var/db/tsppc`; the node then stays
+in your tailnet's admin console until you remove it there. It exits 1 if the
+daemon, the route or the `/etc/hosts` block is still there afterwards.
+
 ## License
 
 BSD-3-Clause. Vendored BearSSL keeps its own (MIT) license in

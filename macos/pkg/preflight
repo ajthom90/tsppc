@@ -1,0 +1,36 @@
+#!/bin/sh
+# tsppc package preflight. Installer runs it as root before the payload, on
+# every install and upgrade, with $1 the package, $2 the install location,
+# $3 the target volume and $4 the system root.
+# It stops a running tsppcd, so an upgrade never replaces the files under a
+# running daemon. Uses only tools on both 10.4 and 10.5.
+PLIST=/Library/LaunchDaemons/com.github.ajthom90.tsppcd.plist
+WAIT_SEC=30
+
+# The pids of processes named exactly tsppcd. Not ps -p: on Tiger it
+# succeeds for a pid that is gone.
+tsppcd_pids() {
+    ps axc -o pid,command | awk 'NR > 1 && $2 == "tsppcd" { printf "%s%s", s, $1; s = " " }'
+}
+
+if [ "${3:-}" != "/" ]; then
+    echo "tsppc installs only on the startup disk, not on ${3:-an unknown volume}." >&2
+    exit 1
+fi
+
+if [ -f "$PLIST" ]; then
+    launchctl unload "$PLIST" || echo "preflight: launchctl unload $PLIST failed; checking for tsppcd anyway" >&2
+fi
+
+waited=0
+while :; do
+    pids=$(tsppcd_pids)
+    [ -z "$pids" ] && break
+    if [ "$waited" -ge "$WAIT_SEC" ]; then
+        echo "tsppcd is still running (pid $pids) after ${WAIT_SEC}s; stop it and install again." >&2
+        exit 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+done
+exit 0
