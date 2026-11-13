@@ -1,4 +1,5 @@
 #import "TSMenuController.h"
+#import "TSLoginItem.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +82,7 @@ static NSString *capped(NSString *s)
 - (BOOL)alert:(NSString *)message info:(NSString *)info first:(NSString *)b1 second:(NSString *)b2;
 - (BOOL)send:(ts_ipc_cmd)cmd failure:(NSString *)failure;
 - (void)copyString:(NSString *)s;
+- (void)offerLoginItem;
 @end
 
 @implementation TSMenuController (Private)
@@ -264,6 +266,25 @@ static NSString *capped(NSString *s)
     return rc == NSAlertFirstButtonReturn;
 }
 
+/* The first time the installed app runs, offer to start it at login. Never
+ * from another path (a development build), never twice, never if the item is
+ * already there. */
+- (void)offerLoginItem
+{
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSString *path = [[NSBundle mainBundle] bundlePath];
+
+    if ([d objectForKey:@"TSLoginItemOffered"] != nil) return;
+    if (path == nil || ![path isEqualToString:@"/Applications/tsppc.app"]) return;
+    if ([TSLoginItem isEnabledForPath:path]) return;
+    if ([self alert:@"Start tsppc when you log in?"
+               info:@"tsppc's menu shows your tailnet connection. You can change this later in System Preferences > Accounts > Login Items."
+              first:@"Start at Login" second:@"Not Now"])
+        [TSLoginItem setEnabled:YES forPath:path];
+    [d setBool:YES forKey:@"TSLoginItemOffered"];
+    [d synchronize];
+}
+
 - (void)copyString:(NSString *)s
 {
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
@@ -375,6 +396,7 @@ static NSString *capped(NSString *s)
     [statusItem setImage:icons[TS_ICON_BUSY]];
     [statusItem setAlternateImage:altIcons[TS_ICON_BUSY]];
     [self pollNow];
+    [self offerLoginItem];
 }
 
 /* ---- the menu's target ---- */
