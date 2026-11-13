@@ -470,6 +470,10 @@ static void fk_handler(fake *f, fk_req *r)
     }
 }
 
+/* While a file is at this path (when set), the fake control closes every
+ * connection as soon as it is accepted, without counting it. */
+static char g_refuse_path[128];
+
 /* The server child: one connection at a time on lfd, each answered by the
  * fake (plain TCP: the daemon uses TLS only on port 443). Every accepted
  * connection appends a byte to countpath. */
@@ -490,6 +494,10 @@ static void fake_server(int lfd, fake *f, const char *countpath)
             return;
         }
         if (getppid() == 1) return;
+        if (g_refuse_path[0] && access(g_refuse_path, F_OK) == 0) {
+            close(fd);
+            continue;
+        }
         cf = open(countpath, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (cf >= 0) {
             (void)write(cf, "x", 1);
@@ -1670,6 +1678,7 @@ static void test_daemon_wake(void)
     snprintf(g_lites_path, sizeof g_lites_path, "%s/lites", tmpdir);
     snprintf(g_maps_path, sizeof g_maps_path, "%s/maps", tmpdir);
     snprintf(g_relay_keys_path, sizeof g_relay_keys_path, "%s/keys", tmpdir);
+    snprintf(g_refuse_path, sizeof g_refuse_path, "%s/refuse", tmpdir);
     setenv("TSPPC_SOCKET", sock, 1);
 
     rc = load_state(statedir, &st);
@@ -1772,6 +1781,40 @@ static void test_daemon_wake(void)
     t_true("wake: RUNNING after the network change", wait_status(sock, "state RUNNING\n", out, sizeof out, 30000));
     t_true("wake: still the same relay client key", same_lines(g_relay_keys_path, &same) > k1 && same);
 
+    /* A rebind while waiting in a grown backoff reconnects at once: control
+     * closes every connection until the backoff is several seconds long, then
+     * answers again, and a network change brings RUNNING back within 2 s. */
+    {
+        int fd = open(g_refuse_path, O_WRONLY | O_CREAT, 0600);
+        long left = -1;
+        int nreb = count_in_file(logpath, "rebinding relays (");
+        if (fd >= 0) close(fd);
+        kill(pid, SIGUSR2);
+        /* The gate may hold it until TS_REBIND_MIN_GAP_MS after the last. */
+        t0 = mono_ms();
+        while (count_in_file(logpath, "rebinding relays (") == nreb && mono_ms() - t0 < 15000) nap_ms(50);
+        t_true("wake: the refused-control rebind happened", count_in_file(logpath, "rebinding relays (") == nreb + 1);
+        t0 = mono_ms();
+        /* At least TS_REBIND_MIN_GAP_MS since that rebind, and at least 8 s
+         * left of the backoff's wait (1, 2, 4, 8 s, then 16 s less jitter). */
+        while (mono_ms() - t0 < 60000) {
+            const char *p;
+            left = -1;
+            if (wait_status(sock, "retrying in ", out, sizeof out, 200) && (p = strstr(out, "retrying in ")) != NULL)
+                left = strtol(p + 12, NULL, 10);
+            if (mono_ms() - t0 >= 10500 && left >= 8) break;
+            nap_ms(100);
+        }
+        t_true("wake: control's closes grew the backoff past 8 s", left >= 8);
+        unlink(g_refuse_path);
+        t0 = mono_ms();
+        kill(pid, SIGUSR2);
+        t_true("wake: a network change during the backoff reconnects within 2 s",
+               wait_status(sock, "state RUNNING\n", out, sizeof out, 2000));
+        t_true("wake: the log says reconnecting to control now",
+               file_has(logpath, "reconnecting to control now (network changed)"));
+    }
+
     kill(pid, SIGTERM);
     t_true("wake: daemon exits", wait_exit(pid, 60000) == 0);
     {
@@ -1792,6 +1835,8 @@ static void test_daemon_wake(void)
     unlink(g_maps_path);
     unlink(g_relay_keys_path);
     g_relay_keys_path[0] = 0;
+    unlink(g_refuse_path);
+    g_refuse_path[0] = 0;
     remove_test_files(statedir, sock, logpath, countpath);
 }
 

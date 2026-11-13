@@ -1204,6 +1204,15 @@ void ts_sess_tick(ts_sess *s, uint64_t now_ms)
     settle(s);
 }
 
+void ts_sess_retry_now(ts_sess *s)
+{
+    if (s->phase != PH_NONE || !s->retry_armed) return;
+    s->backoff_ms = 0;
+    s->retry_at = s->now;
+    s->retry_armed = 0;   /* due now: drive reconnects */
+    settle(s);
+}
+
 void ts_sess_up(ts_sess *s)
 {
     if (!s->nm_ok || !s->hostinfo) return;   /* out of memory at init: stays FAILED */

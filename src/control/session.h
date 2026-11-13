@@ -258,6 +258,11 @@ void ts_sess_disconnected(ts_sess *s, const char *why);
  * before any other call after init (the session's time starts at 0 until
  * then), and then at least every second. */
 void ts_sess_tick(ts_sess *s, uint64_t now_ms);
+/* Waiting in BACKOFF to reconnect: start the reconnect backoff over (1 s)
+ * and reconnect now. For a rebind (a wake or a network change), whose own
+ * close of the connection must neither wait out nor grow the backoff. A
+ * no-op in any other state. */
+void ts_sess_retry_now(ts_sess *s);
 
 /* Log in and stay connected (also leaves FAILED and NEED_LOGIN; after a node
  * expiry or removal the next register uses a new node key). A saved down is

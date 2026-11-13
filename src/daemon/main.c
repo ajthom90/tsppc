@@ -1134,10 +1134,18 @@ static void check_conditions(void)
     if (ts_rebind_due(&D.gate, now, why)) {
         int reset = D.rebind_reset;
         D.rebind_reset = 0;
+        /* Reconnect control now: a rebind's own close neither grows the
+         * backoff nor waits it out, and nor does a rebind while backing off. */
         if (D.cphase != C_NONE) {
             logline("closing the control connection (%s)", why);
             conn_close();
-            if (D.sess) ts_sess_disconnected(D.sess, why);
+            if (D.sess) {
+                ts_sess_disconnected(D.sess, why);
+                ts_sess_retry_now(D.sess);
+            }
+        } else if (D.sess && ts_sess_get_state(D.sess) == TS_SESS_BACKOFF) {
+            logline("reconnecting to control now (%s)", why);
+            ts_sess_retry_now(D.sess);
         }
         ts_dpio_rebind(why, 1, reset);
     }
