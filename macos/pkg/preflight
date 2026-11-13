@@ -45,6 +45,15 @@ for d in /usr/local:1 /usr/local/bin:1 /usr/local/sbin:1 /Library/LaunchDaemons:
         bad=1
     fi
 done
+# The payload also carries these. They are group-writable by default, so only
+# a symlink is refused: Installer does not follow links (IFPkgFlagFollowLinks
+# false) and would put a real directory in its place.
+for d in /Applications /Library /usr; do
+    if [ -L "$d" ]; then
+        echo "tsppc cannot be installed safely: $d is a symlink. Fix it and install again." >&2
+        bad=1
+    fi
+done
 [ "$bad" = 0 ] || exit 1
 
 if [ -f "$PLIST" ]; then
