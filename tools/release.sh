@@ -9,9 +9,11 @@
 #    exists and HEAD is at it.
 # 2. Ships git archive <tag> to a fresh ~/tsppc-release/<tag> on the VM
 #    (removed and recreated each run) and runs there, in order: the PowerPC
-#    suite (make ppc-test, as tools/vm-test.sh does), make release ppc (each
-#    checked by tools/check-release.sh), tools/check-ct.sh, make menubar with
-#    tools/check-app.sh, tools/driver.sh build and tools/package.sh <version>.
+#    suite (make ppc-test, as tools/vm-test.sh does), make ppc (the PowerPC
+#    release programs, checked by tools/check-release.sh; make release is the
+#    host-flag build and does not compile on PowerPC, see src/crypto/aead.c),
+#    tools/check-ct.sh, make menubar with tools/check-app.sh,
+#    tools/driver.sh build and tools/package.sh <version>.
 # 3. Copies the .dmg and the standalone uninstaller to build/release/ here,
 #    checks they arrived intact, and writes build/release/SHA256SUMS with
 #    shasum -a 256.
@@ -76,7 +78,7 @@ vmssh "rm -rf $RDIR && mkdir -p $RDIR && cd $RDIR && tar -xf -" <"$arc" || die "
 echo "=== building on the VM"
 vmssh "cd $RDIR &&
     echo '=== make ppc-test' && make ppc-test CC=gcc-4.0 &&
-    echo '=== make release ppc' && make release ppc CC=gcc-4.0 &&
+    echo '=== make ppc' && make ppc &&
     echo '=== check-ct' && sh tools/check-ct.sh &&
     if sh tools/check-app.sh /bin/ls >/dev/null 2>&1; then echo 'check-app.sh passed /bin/ls' >&2; exit 1; fi &&
     echo '=== make menubar' && make menubar CC=gcc-4.0 && sh tools/check-app.sh build/ppc/tsppc.app &&
